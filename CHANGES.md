@@ -303,3 +303,84 @@ match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().a
 **Note:** The `as i64` cast is safe - microseconds since Unix epoch won't overflow i64 until year 294,247.
 
 **Impact:** Each record now has a unique, high-resolution timestamp. Enables precise ordering and latency analysis for downstream data processing.
+
+---
+
+### Improved: Multi-Exchange Schema with Deduplication (Problem #7 from PLAN.md)
+
+**Files changed:** `src/main.rs` (extensive changes to schema, structs, and functions)
+
+**Problem:** The original schema was Binance-specific (`lastUpdateId`, `bids`, `asks`). To support multiple exchanges (Coinbase, Bybit, OKX, Upbit) and multiple data types (orderbook, trades), a generalized schema was needed. Additionally, there was no deduplication mechanism to prevent duplicate records from WebSocket reconnections.
+
+**Rationale:**
+- Different exchanges have different ID fields (`lastUpdateId`, `sequence`, `seqId`, etc.)
+- Different data types have different structures
+- A multi-column unique constraint is the most robust deduplication approach
+- Storing raw JSON payload provides flexibility for any data structure
+
+**Solution:** Generalized schema with multi-column unique constraint:
+
+1. **New SnapshotData struct:**
+   ```rust
+   struct SnapshotData {
+       exchange: String,              // "binance", "coinbase", etc.
+       symbol: String,                // "btcusdt", "BTC-USD", etc.
+       data_type: String,             // "orderbook", "trade"
+       exchange_sequence_id: String,  // Exchange-specific ID
+       timestamp: i64,                // Our receipt time (microseconds)
+       data: String,                  // Raw JSON payload
+   }
+   ```
+
+2. **New database schema:**
+   ```sql
+   CREATE TABLE IF NOT EXISTS snapshots (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       exchange TEXT NOT NULL,
+       symbol TEXT NOT NULL,
+       data_type TEXT NOT NULL,
+       exchange_sequence_id TEXT NOT NULL,
+       timestamp INTEGER NOT NULL,
+       data TEXT NOT NULL,
+       UNIQUE(exchange, symbol, data_type, exchange_sequence_id)
+   )
+   ```
+
+3. **Deduplication via INSERT OR IGNORE:**
+   ```rust
+   sqlx::query(
+       "INSERT OR IGNORE INTO snapshots (exchange, symbol, data_type, exchange_sequence_id, timestamp, data) VALUES (?, ?, ?, ?, ?, ?)"
+   )
+   ```
+
+4. **Updated save_snapshot signature:**
+   ```rust
+   fn save_snapshot(
+       db_tx: &Sender<SnapshotData>,
+       exchange: &str,
+       symbol: &str,
+       data_type: &str,
+       exchange_sequence_id: &str,
+       raw_data: &str,
+   )
+   ```
+
+5. **Updated Parquet output columns:**
+   - `exchange`, `symbol`, `data_type`, `exchange_sequence_id`, `timestamp`, `data`
+
+**Why multi-column unique constraint over composite string key:**
+- No delimiter collision issues (e.g., symbols containing underscores)
+- SQLite handles uniqueness natively and efficiently
+- More readable schema
+- Better query flexibility
+
+**Benefits:**
+- Supports any exchange with any ID scheme
+- Supports any data type (orderbook, trades, funding rates, etc.)
+- Automatic deduplication on WebSocket reconnection
+- Raw JSON preserves all exchange-specific fields
+- Future-proof for adding new exchanges/data types
+
+**Breaking change:** Existing databases with the old schema are incompatible. Delete the old `.db` file before running the updated code.
+
+**Impact:** System is now ready for multi-exchange, multi-data-type collection with built-in deduplication.

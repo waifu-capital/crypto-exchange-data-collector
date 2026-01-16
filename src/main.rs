@@ -30,10 +30,12 @@ static DROPPED_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
 
 // Data structure for snapshot messages sent through the channel
 struct SnapshotData {
-    timestamp: i64,  // Microseconds since Unix epoch
-    last_update_id: String,
-    bids: String,
-    asks: String,
+    exchange: String,              // "binance", "coinbase", "bybit", etc.
+    symbol: String,                // "btcusdt", "BTC-USD", etc.
+    data_type: String,             // "orderbook", "trade"
+    exchange_sequence_id: String,  // Exchange-specific ID for deduplication
+    timestamp: i64,                // Microseconds since Unix epoch (our receipt time)
+    data: String,                  // JSON payload
 }
 
 async fn init_database(db_pool: &SqlitePool) {
@@ -47,10 +49,13 @@ async fn init_database(db_pool: &SqlitePool) {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            data_type TEXT NOT NULL,
+            exchange_sequence_id TEXT NOT NULL,
             timestamp INTEGER NOT NULL,
-            lastUpdateId INTEGER NOT NULL,
-            bids TEXT NOT NULL,
-            asks TEXT NOT NULL
+            data TEXT NOT NULL,
+            UNIQUE(exchange, symbol, data_type, exchange_sequence_id)
         )"
     )
     .execute(db_pool)
@@ -162,13 +167,16 @@ async fn db_worker(db_pool: SqlitePool, db_rx: &mut tokio::sync::mpsc::Receiver<
                     let mut tx = db_pool.begin().await.unwrap();
 
                     for snapshot in batch.drain(..) {
+                        // INSERT OR IGNORE skips duplicates based on UNIQUE constraint
                         sqlx::query(
-                            "INSERT INTO snapshots (timestamp, lastUpdateId, bids, asks) VALUES (?, ?, ?, ?)"
+                            "INSERT OR IGNORE INTO snapshots (exchange, symbol, data_type, exchange_sequence_id, timestamp, data) VALUES (?, ?, ?, ?, ?, ?)"
                         )
+                        .bind(&snapshot.exchange)
+                        .bind(&snapshot.symbol)
+                        .bind(&snapshot.data_type)
+                        .bind(&snapshot.exchange_sequence_id)
                         .bind(snapshot.timestamp)
-                        .bind(&snapshot.last_update_id)
-                        .bind(&snapshot.bids)
-                        .bind(&snapshot.asks)
+                        .bind(&snapshot.data)
                         .execute(&mut *tx)
                         .await
                         .unwrap();
@@ -206,7 +214,15 @@ async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
                                 }
                                 let text = msg.into_text().unwrap();
                                 let snapshot: Value = serde_json::from_str(&text).unwrap();
-                                save_snapshot(&db_tx, snapshot);
+                                let exchange_sequence_id = snapshot["lastUpdateId"].to_string();
+                                save_snapshot(
+                                    &db_tx,
+                                    "binance",
+                                    &market_symbol,
+                                    "orderbook",
+                                    &exchange_sequence_id,
+                                    &text,
+                                );
                             } else if msg.is_ping() {
                                 println_with_timestamp!("Received ping frame: {:?}", msg);
                                 let pong = tokio_tungstenite::tungstenite::Message::Pong(msg.into_data());
@@ -238,12 +254,21 @@ async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
     }
 }
 
-fn save_snapshot(db_tx: &Sender<SnapshotData>, snapshot: Value) {
+fn save_snapshot(
+    db_tx: &Sender<SnapshotData>,
+    exchange: &str,
+    symbol: &str,
+    data_type: &str,
+    exchange_sequence_id: &str,
+    raw_data: &str,
+) {
     let data = SnapshotData {
+        exchange: exchange.to_string(),
+        symbol: symbol.to_string(),
+        data_type: data_type.to_string(),
+        exchange_sequence_id: exchange_sequence_id.to_string(),
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64,
-        last_update_id: snapshot["lastUpdateId"].to_string(),
-        bids: serde_json::to_string(&snapshot["bids"]).unwrap(),
-        asks: serde_json::to_string(&snapshot["asks"]).unwrap(),
+        data: raw_data.to_string(),
     };
 
     // Non-blocking send - never stall WebSocket even under backpressure
@@ -271,29 +296,33 @@ async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf,
     let home_server_name = env::var("HOME_SERVER_NAME").expect("HOME_SERVER_NAME must be set");
 
     // Fetch all snapshots using sqlx
-    let rows = sqlx::query("SELECT timestamp, lastUpdateId, bids, asks FROM snapshots")
+    let rows = sqlx::query("SELECT exchange, symbol, data_type, exchange_sequence_id, timestamp, data FROM snapshots")
         .fetch_all(&db_pool)
         .await
         .unwrap();
 
-    let snapshots: Vec<(i64, i64, String, String)> = rows
+    let snapshots: Vec<(String, String, String, String, i64, String)> = rows
         .iter()
         .map(|row| {
             (
+                row.get::<String, _>("exchange"),
+                row.get::<String, _>("symbol"),
+                row.get::<String, _>("data_type"),
+                row.get::<String, _>("exchange_sequence_id"),
                 row.get::<i64, _>("timestamp"),
-                row.get::<i64, _>("lastUpdateId"),
-                row.get::<String, _>("bids"),
-                row.get::<String, _>("asks"),
+                row.get::<String, _>("data"),
             )
         })
         .collect();
 
     if !snapshots.is_empty() {
         let mut df = DataFrame::new(vec![
-            Series::new("timestamp".into(), snapshots.iter().map(|s| s.0).collect::<Vec<i64>>()).into(),
-            Series::new("lastUpdateId".into(), snapshots.iter().map(|s| s.1).collect::<Vec<i64>>()).into(),
-            Series::new("bids".into(), snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>()).into(),
-            Series::new("asks".into(), snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>()).into(),
+            Series::new("exchange".into(), snapshots.iter().map(|s| s.0.clone()).collect::<Vec<String>>()).into(),
+            Series::new("symbol".into(), snapshots.iter().map(|s| s.1.clone()).collect::<Vec<String>>()).into(),
+            Series::new("data_type".into(), snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>()).into(),
+            Series::new("exchange_sequence_id".into(), snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>()).into(),
+            Series::new("timestamp".into(), snapshots.iter().map(|s| s.4).collect::<Vec<i64>>()).into(),
+            Series::new("data".into(), snapshots.iter().map(|s| s.5.clone()).collect::<Vec<String>>()).into(),
         ]).unwrap();
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
