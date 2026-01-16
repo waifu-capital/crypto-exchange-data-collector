@@ -569,3 +569,55 @@ async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, region:
 **Note:** `us-east-1` is AWS's default region and requires no location constraint. Specifying one for us-east-1 actually causes an error.
 
 **Impact:** Buckets are now created in the correct region as specified by `AWS_REGION` environment variable.
+
+---
+
+### Refactored: Module-Per-Concern Code Structure
+
+**Files changed:** `src/main.rs` split into multiple modules
+
+**Problem:** All code (~500 lines) was in a single `main.rs` file, mixing concerns:
+- Configuration loading
+- Database operations
+- WebSocket handling
+- S3/Archive operations
+- Data models
+- Utility functions
+
+This made the code harder to navigate, test, and maintain.
+
+**Solution:** Split into flat module structure following the Module-Per-Concern pattern:
+
+```
+src/
+├── main.rs       # Entry point, orchestration only (~110 lines)
+├── config.rs     # Configuration loading from environment
+├── db.rs         # SQLite operations (init, worker, queries)
+├── websocket.rs  # WebSocket connection and message handling
+├── archive.rs    # Parquet creation, S3 upload, scheduling
+├── models.rs     # SnapshotData struct
+└── utils.rs      # println_with_timestamp macro, counters
+```
+
+**Module responsibilities:**
+
+| Module | Responsibility |
+|--------|----------------|
+| `main.rs` | Application entry point, spawns workers, wires dependencies |
+| `config.rs` | `Config` struct, loads all env vars, creates directories |
+| `db.rs` | `create_pool`, `init_database`, `db_worker`, `fetch_all_snapshots`, `delete_all_snapshots` |
+| `websocket.rs` | `websocket_worker`, `save_snapshot`, Binance-specific handling |
+| `archive.rs` | `create_bucket_if_not_exists`, `run_archive_scheduler`, `archive_snapshots`, `upload_to_s3` |
+| `models.rs` | `SnapshotData` struct definition |
+| `utils.rs` | `println_with_timestamp!` macro, `DROPPED_SNAPSHOTS` counter |
+
+**Benefits:**
+- Clear separation of concerns
+- Easier to locate and modify specific functionality
+- Each module can be understood in isolation
+- Prepares codebase for adding more exchanges (new files in same structure)
+- Enables future unit testing per module
+
+**Breaking changes:** None - same functionality, just reorganized.
+
+**Impact:** Codebase is now organized for maintainability and future growth. Main.rs reduced from ~485 lines to ~110 lines.
