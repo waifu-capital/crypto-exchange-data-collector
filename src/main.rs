@@ -59,9 +59,9 @@ async fn main() {
     {
         let db_conn = db_conn.clone();
         let batch_interval = env::var("BATCH_INTERVAL")
-            .unwrap_or("60".to_string())
+            .unwrap_or("5".to_string())
             .parse::<u64>()
-            .unwrap_or(60);
+            .unwrap_or(5);
 
         tokio::spawn(async move {
             db_worker(db_conn, &mut db_rx, batch_interval).await;
@@ -104,8 +104,12 @@ async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str) {
 
 async fn db_worker(db_conn: Arc<Mutex<Connection>>, db_rx: &mut tokio::sync::mpsc::Receiver<(String, Vec<String>)>, batch_interval: u64) {
     {
-        // Ensure the snapshots table exists
         let conn = db_conn.lock().unwrap();
+
+        // Enable WAL mode for better crash recovery and write performance
+        conn.execute("PRAGMA journal_mode=WAL", []).unwrap();
+
+        // Ensure the snapshots table exists
         conn.execute(
             "CREATE TABLE IF NOT EXISTS snapshots (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
