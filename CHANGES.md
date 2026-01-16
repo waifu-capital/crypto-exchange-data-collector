@@ -541,3 +541,31 @@ match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().a
 - Clones file path, bucket, and key strings on each retry (negligible overhead)
 
 **Impact:** S3 uploads are now resilient to transient failures. Most network hiccups will be automatically recovered without operator intervention.
+
+---
+
+### Fixed: Hardcoded Region in Bucket Creation (Problem #10 from PLAN.md)
+
+**Files changed:** `src/main.rs` (create_bucket_if_not_exists function)
+
+**Problem:** Bucket creation used hardcoded `UsWest2` region despite `AWS_REGION` environment variable being available.
+
+**Solution:** Updated `create_bucket_if_not_exists` to accept region as parameter and handle the us-east-1 special case:
+
+```rust
+async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, region: &str) {
+    // us-east-1 is the default region and doesn't use location constraint
+    let create_bucket_config = if region == "us-east-1" {
+        None
+    } else {
+        Some(CreateBucketConfiguration::builder()
+            .location_constraint(BucketLocationConstraint::from(region))
+            .build())
+    };
+    // ...
+}
+```
+
+**Note:** `us-east-1` is AWS's default region and requires no location constraint. Specifying one for us-east-1 actually causes an error.
+
+**Impact:** Buckets are now created in the correct region as specified by `AWS_REGION` environment variable.

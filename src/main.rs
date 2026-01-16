@@ -94,7 +94,7 @@ async fn main() {
         .await;
     let client = Client::new(&shared_config);
 
-    create_bucket_if_not_exists(&client, &bucket_name).await;
+    create_bucket_if_not_exists(&client, &bucket_name, &aws_region).await;
 
     // Create SQLite connection pool
     let db_url = format!("sqlite:{}?mode=rwc", database_path.display());
@@ -134,22 +134,26 @@ async fn main() {
     schedule_daily_task(db_pool, archive_dir, bucket_name, client).await;
 }
 
-async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str) {
+async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, region: &str) {
     match client.head_bucket().bucket(bucket_name).send().await {
         Ok(_) => println_with_timestamp!("Bucket {} already exists.", bucket_name),
         Err(_) => {
-            let create_bucket_config = aws_sdk_s3::types::CreateBucketConfiguration::builder()
-                // TODO: this needs to be env AWS Region
-                .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::UsWest2)
-                .build();
+            // us-east-1 is the default region and doesn't use location constraint
+            let create_bucket_config = if region == "us-east-1" {
+                None
+            } else {
+                Some(aws_sdk_s3::types::CreateBucketConfiguration::builder()
+                    .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::from(region))
+                    .build())
+            };
 
-            match client.create_bucket()
-                .bucket(bucket_name)
-                .create_bucket_configuration(create_bucket_config)
-                .send()
-                .await
-            {
-                Ok(_) => println_with_timestamp!("Bucket {} created.", bucket_name),
+            let mut request = client.create_bucket().bucket(bucket_name);
+            if let Some(config) = create_bucket_config {
+                request = request.create_bucket_configuration(config);
+            }
+
+            match request.send().await {
+                Ok(_) => println_with_timestamp!("Bucket {} created in region {}.", bucket_name, region),
                 Err(e) => println_with_timestamp!("WARNING: Failed to create bucket {}: {}. Will retry on next upload.", bucket_name, e),
             }
         }
