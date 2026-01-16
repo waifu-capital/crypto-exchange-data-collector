@@ -44,7 +44,7 @@ async fn main() {
 
     let region_provider = RegionProviderChain::first_try(Region::new(aws_region.clone())).or_else(Region::new("us-west-2"));
     let credentials_provider = aws_sdk_s3::config::Credentials::new(aws_access_key, aws_secret_key, None, None, "custom");
-    let shared_config = aws_config::defaults(BehaviorVersion::v2024_03_28())
+    let shared_config = aws_config::defaults(BehaviorVersion::v2026_01_12())
         .region(region_provider)
         .credentials_provider(credentials_provider)
         .load()
@@ -253,10 +253,10 @@ async fn archive_snapshots(db_conn: Arc<Mutex<Connection>>, archive_dir: std::pa
 
     if !snapshots.is_empty() {
         let mut df = DataFrame::new(vec![
-            Series::new("timestamp", snapshots.iter().map(|s| s.0.clone()).collect::<Vec<String>>()),
-            Series::new("lastUpdateId", snapshots.iter().map(|s| s.1).collect::<Vec<i64>>()),
-            Series::new("bids", snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>()),
-            Series::new("asks", snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>()),
+            Series::new("timestamp".into(), snapshots.iter().map(|s| s.0.clone()).collect::<Vec<String>>()).into(),
+            Series::new("lastUpdateId".into(), snapshots.iter().map(|s| s.1).collect::<Vec<i64>>()).into(),
+            Series::new("bids".into(), snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>()).into(),
+            Series::new("asks".into(), snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>()).into(),
         ]).unwrap();
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
