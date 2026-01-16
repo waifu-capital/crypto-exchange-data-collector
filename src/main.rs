@@ -1,9 +1,9 @@
 use std::env;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::SinkExt;
-use rusqlite::Connection;
+use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
+use sqlx::Row;
 use aws_sdk_s3::Client;
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::primitives::ByteStream;
@@ -22,6 +22,38 @@ macro_rules! println_with_timestamp {
         print!("[{}] ", now.to_rfc3339());
         println!($($arg)*);
     }}
+}
+
+// Data structure for snapshot messages sent through the channel
+struct SnapshotData {
+    timestamp: String,
+    last_update_id: String,
+    bids: String,
+    asks: String,
+}
+
+async fn init_database(db_pool: &SqlitePool) {
+    // Enable WAL mode for better crash recovery and write performance
+    sqlx::query("PRAGMA journal_mode=WAL")
+        .execute(db_pool)
+        .await
+        .unwrap();
+
+    // Ensure the snapshots table exists
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT NOT NULL,
+            lastUpdateId INTEGER NOT NULL,
+            bids TEXT NOT NULL,
+            asks TEXT NOT NULL
+        )"
+    )
+    .execute(db_pool)
+    .await
+    .unwrap();
+
+    println_with_timestamp!("Database initialized with WAL mode");
 }
 
 #[tokio::main]
@@ -53,18 +85,28 @@ async fn main() {
 
     create_bucket_if_not_exists(&client, &bucket_name).await;
 
-    let (db_tx, mut db_rx) = channel(100);
-    let db_conn = Arc::new(Mutex::new(Connection::open(&database_path).unwrap()));
+    // Create SQLite connection pool
+    let db_url = format!("sqlite:{}?mode=rwc", database_path.display());
+    let db_pool = SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await
+        .expect("Failed to create SQLite pool");
+
+    // Initialize database schema
+    init_database(&db_pool).await;
+
+    let (db_tx, mut db_rx) = channel::<SnapshotData>(100);
 
     {
-        let db_conn = db_conn.clone();
+        let db_pool = db_pool.clone();
         let batch_interval = env::var("BATCH_INTERVAL")
             .unwrap_or("5".to_string())
             .parse::<u64>()
             .unwrap_or(5);
 
         tokio::spawn(async move {
-            db_worker(db_conn, &mut db_rx, batch_interval).await;
+            db_worker(db_pool, &mut db_rx, batch_interval).await;
         });
     }
 
@@ -78,7 +120,7 @@ async fn main() {
         print_liveness_probe().await;
     });
 
-    schedule_daily_task(db_conn, archive_dir, bucket_name, client).await;
+    schedule_daily_task(db_pool, archive_dir, bucket_name, client).await;
 }
 
 async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str) {
@@ -102,45 +144,33 @@ async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str) {
     }
 }
 
-async fn db_worker(db_conn: Arc<Mutex<Connection>>, db_rx: &mut tokio::sync::mpsc::Receiver<(String, Vec<String>)>, batch_interval: u64) {
-    {
-        let conn = db_conn.lock().unwrap();
-
-        // Enable WAL mode for better crash recovery and write performance
-        conn.execute("PRAGMA journal_mode=WAL", []).unwrap();
-
-        // Ensure the snapshots table exists
-        conn.execute(
-            "CREATE TABLE IF NOT EXISTS snapshots (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT NOT NULL,
-                lastUpdateId INTEGER NOT NULL,
-                bids TEXT NOT NULL,
-                asks TEXT NOT NULL
-            )",
-            [],
-        ).unwrap();
-    }
-
-    let mut batch: Vec<(String, Vec<String>)> = Vec::new();
+async fn db_worker(db_pool: SqlitePool, db_rx: &mut tokio::sync::mpsc::Receiver<SnapshotData>, batch_interval: u64) {
+    let mut batch: Vec<SnapshotData> = Vec::new();
     let mut interval = interval(Duration::from_secs(batch_interval));
 
     loop {
         tokio::select! {
-            Some((query, params)) = db_rx.recv() => {
-                batch.push((query, params));
+            Some(snapshot) = db_rx.recv() => {
+                batch.push(snapshot);
             },
             _ = interval.tick() => {
                 if !batch.is_empty() {
-                    let mut conn = db_conn.lock().unwrap();
-                    let tx = conn.transaction().unwrap();
+                    let mut tx = db_pool.begin().await.unwrap();
 
-                    for (query, params) in batch.drain(..) {
-                        let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
-                        tx.execute(&query, params_refs.as_slice()).unwrap();
+                    for snapshot in batch.drain(..) {
+                        sqlx::query(
+                            "INSERT INTO snapshots (timestamp, lastUpdateId, bids, asks) VALUES (?, ?, ?, ?)"
+                        )
+                        .bind(&snapshot.timestamp)
+                        .bind(&snapshot.last_update_id)
+                        .bind(&snapshot.bids)
+                        .bind(&snapshot.asks)
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
                     }
 
-                    tx.commit().unwrap();
+                    tx.commit().await.unwrap();
                 }
             }
         }
@@ -154,7 +184,7 @@ async fn print_liveness_probe() {
     }
 }
 
-async fn websocket_worker(db_tx: Sender<(String, Vec<String>)>, market_symbol: String) {
+async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
     let url = format!("wss://stream.binance.com:9443/ws/{}@depth20@100ms", market_symbol.to_lowercase());
     let retry_delay = Duration::from_secs(5);
 
@@ -204,56 +234,48 @@ async fn websocket_worker(db_tx: Sender<(String, Vec<String>)>, market_symbol: S
     }
 }
 
-async fn save_snapshot(db_tx: Sender<(String, Vec<String>)>, snapshot: Value) {
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
-    let last_update_id = snapshot["lastUpdateId"].to_string();
-    let bids = serde_json::to_string(&snapshot["bids"]).unwrap();
-    let asks = serde_json::to_string(&snapshot["asks"]).unwrap();
+async fn save_snapshot(db_tx: Sender<SnapshotData>, snapshot: Value) {
+    let data = SnapshotData {
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
+        last_update_id: snapshot["lastUpdateId"].to_string(),
+        bids: serde_json::to_string(&snapshot["bids"]).unwrap(),
+        asks: serde_json::to_string(&snapshot["asks"]).unwrap(),
+    };
 
-    let query = "INSERT INTO snapshots (timestamp, lastUpdateId, bids, asks) VALUES (?, ?, ?, ?)".to_string();
-    let params = vec![timestamp, last_update_id, bids, asks];
-
-    db_tx.send((query, params)).await.unwrap();
+    db_tx.send(data).await.unwrap();
 }
 
-async fn schedule_daily_task(db_conn: Arc<Mutex<Connection>>, archive_dir: std::path::PathBuf, bucket_name: String, client: Client) {
+async fn schedule_daily_task(db_pool: SqlitePool, archive_dir: std::path::PathBuf, bucket_name: String, client: Client) {
     loop {
         let sleep_hour = 3600;
         println_with_timestamp!("Sleeping for {} seconds (hour).", sleep_hour);
         sleep(Duration::from_secs(sleep_hour)).await;
 
-        archive_snapshots(db_conn.clone(), archive_dir.clone(), bucket_name.clone(), client.clone()).await;
+        archive_snapshots(db_pool.clone(), archive_dir.clone(), bucket_name.clone(), client.clone()).await;
     }
 }
 
-async fn archive_snapshots(db_conn: Arc<Mutex<Connection>>, archive_dir: std::path::PathBuf, bucket_name: String, client: Client) {
+async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf, bucket_name: String, client: Client) {
     use polars::prelude::*;
     let home_server_name = env::var("HOME_SERVER_NAME").expect("HOME_SERVER_NAME must be set");
 
-    let snapshots = {
-        let conn = db_conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT timestamp, lastUpdateId, bids, asks FROM snapshots").unwrap();
-        let snapshot_iter = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        }).unwrap();
+    // Fetch all snapshots using sqlx
+    let rows = sqlx::query("SELECT timestamp, lastUpdateId, bids, asks FROM snapshots")
+        .fetch_all(&db_pool)
+        .await
+        .unwrap();
 
-        let mut snapshots = Vec::new();
-        for snapshot in snapshot_iter {
-            let (timestamp, last_update_id, bids, asks) = snapshot.unwrap();
-            snapshots.push((
-                timestamp,
-                last_update_id,
-                bids,
-                asks,
-            ));
-        }
-        snapshots
-    };
+    let snapshots: Vec<(String, i64, String, String)> = rows
+        .iter()
+        .map(|row| {
+            (
+                row.get::<String, _>("timestamp"),
+                row.get::<i64, _>("lastUpdateId"),
+                row.get::<String, _>("bids"),
+                row.get::<String, _>("asks"),
+            )
+        })
+        .collect();
 
     if !snapshots.is_empty() {
         let mut df = DataFrame::new(vec![
@@ -272,9 +294,22 @@ async fn archive_snapshots(db_conn: Arc<Mutex<Connection>>, archive_dir: std::pa
 
         upload_to_s3(&archive_file_path, &bucket_name, &archive_file_name, &client).await;
 
-        let conn = db_conn.lock().unwrap();
-        conn.execute("DELETE FROM snapshots", []).unwrap();
-        std::fs::remove_file(&archive_file_path).unwrap();
+        // Verify upload succeeded before deleting local data
+        match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().await {
+            Ok(_) => {
+                println_with_timestamp!("Verified S3 upload: s3://{}/{}", bucket_name, archive_file_name);
+                sqlx::query("DELETE FROM snapshots")
+                    .execute(&db_pool)
+                    .await
+                    .unwrap();
+                std::fs::remove_file(&archive_file_path).unwrap();
+                println_with_timestamp!("Deleted local data after verified upload");
+            },
+            Err(e) => {
+                println_with_timestamp!("ERROR: Failed to verify S3 upload, keeping local data: {}", e);
+                // Don't delete SQLite data or local file - will retry next cycle
+            }
+        }
     }
 }
 
