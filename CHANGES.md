@@ -192,3 +192,55 @@ match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().a
 - Database URL format change (`sqlite:path?mode=rwc`)
 
 **Impact:** Eliminates potential thread starvation and deadlock issues. The Tokio runtime can now efficiently manage database I/O alongside WebSocket and S3 operations without blocking worker threads.
+
+---
+
+### Improved: Backpressure Handling (Problem #4 from PLAN.md)
+
+**Files changed:** `src/main.rs` (lines 2, 28-29, 103, 241-257)
+
+**Problem:** If WebSocket data arrives faster than it can be processed, the channel fills up, the sender blocks, and WebSocket reads stall. This could cause the WebSocket connection to be dropped by Binance.
+
+**Rationale:** A data collection system should prioritize connection stability over perfect data capture. Orderbook snapshots arrive every 100ms - missing one is recoverable since the next snapshot provides a complete state. Blocking the WebSocket is worse than dropping a message.
+
+**Solution:** Defense-in-depth approach combining three strategies:
+
+1. **Increased channel buffer (100 → 1000):**
+   ```rust
+   let (db_tx, db_rx) = channel::<SnapshotData>(1000);  // Large buffer for burst absorption
+   ```
+   - Handles temporary bursts without dropping
+   - At 10 msg/sec, buffer holds ~100 seconds of data
+
+2. **Non-blocking sends with `try_send`:**
+   ```rust
+   match db_tx.try_send(data) {
+       Ok(_) => {},
+       Err(_) => {
+           // Log and continue - never block WebSocket
+       }
+   }
+   ```
+   - WebSocket loop never stalls waiting for channel space
+   - Connection remains healthy under all conditions
+
+3. **Atomic counter for dropped messages:**
+   ```rust
+   static DROPPED_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
+
+   // On drop:
+   let count = DROPPED_SNAPSHOTS.fetch_add(1, Ordering::Relaxed) + 1;
+   println_with_timestamp!("WARNING: Channel full, dropped snapshot (total dropped: {})", count);
+   ```
+   - Visibility into backpressure events
+   - Logged warnings for monitoring/alerting
+   - Running total for debugging
+
+**Additional change:** `save_snapshot` converted from `async fn` to `fn` since `try_send` is synchronous.
+
+**Trade-offs:**
+- Accepts possibility of data loss under extreme load
+- For continuous streaming data (orderbook snapshots), this is acceptable
+- If drops occur frequently, it signals a need to investigate performance
+
+**Impact:** System remains stable under load. WebSocket connection never stalls due to internal backpressure. Operators have visibility into any dropped data through logs and counters.

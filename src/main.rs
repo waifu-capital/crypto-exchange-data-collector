@@ -1,4 +1,5 @@
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::SinkExt;
@@ -23,6 +24,9 @@ macro_rules! println_with_timestamp {
         println!($($arg)*);
     }}
 }
+
+// Counter for dropped snapshots due to channel backpressure
+static DROPPED_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
 
 // Data structure for snapshot messages sent through the channel
 struct SnapshotData {
@@ -96,7 +100,7 @@ async fn main() {
     // Initialize database schema
     init_database(&db_pool).await;
 
-    let (db_tx, mut db_rx) = channel::<SnapshotData>(100);
+    let (db_tx, mut db_rx) = channel::<SnapshotData>(1000);  // Large buffer for burst absorption
 
     {
         let db_pool = db_pool.clone();
@@ -202,7 +206,7 @@ async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
                                 }
                                 let text = msg.into_text().unwrap();
                                 let snapshot: Value = serde_json::from_str(&text).unwrap();
-                                save_snapshot(db_tx.clone(), snapshot).await;
+                                save_snapshot(&db_tx, snapshot);
                             } else if msg.is_ping() {
                                 println_with_timestamp!("Received ping frame: {:?}", msg);
                                 let pong = tokio_tungstenite::tungstenite::Message::Pong(msg.into_data());
@@ -234,7 +238,7 @@ async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
     }
 }
 
-async fn save_snapshot(db_tx: Sender<SnapshotData>, snapshot: Value) {
+fn save_snapshot(db_tx: &Sender<SnapshotData>, snapshot: Value) {
     let data = SnapshotData {
         timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
         last_update_id: snapshot["lastUpdateId"].to_string(),
@@ -242,7 +246,14 @@ async fn save_snapshot(db_tx: Sender<SnapshotData>, snapshot: Value) {
         asks: serde_json::to_string(&snapshot["asks"]).unwrap(),
     };
 
-    db_tx.send(data).await.unwrap();
+    // Non-blocking send - never stall WebSocket even under backpressure
+    match db_tx.try_send(data) {
+        Ok(_) => {},
+        Err(_) => {
+            let count = DROPPED_SNAPSHOTS.fetch_add(1, Ordering::Relaxed) + 1;
+            println_with_timestamp!("WARNING: Channel full, dropped snapshot (total dropped: {})", count);
+        }
+    }
 }
 
 async fn schedule_daily_task(db_pool: SqlitePool, archive_dir: std::path::PathBuf, bucket_name: String, client: Client) {
