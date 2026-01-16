@@ -244,3 +244,62 @@ match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().a
 - If drops occur frequently, it signals a need to investigate performance
 
 **Impact:** System remains stable under load. WebSocket connection never stalls due to internal backpressure. Operators have visibility into any dropped data through logs and counters.
+
+---
+
+### Improved: Microsecond Timestamp Resolution (Problem #5 from PLAN.md)
+
+**Files changed:** `src/main.rs` (lines 33, 50, 168, 243, 279-293)
+
+**Problem:** Timestamps used second-level granularity for data arriving at 100ms intervals. This meant ~10 records shared the same timestamp, making it impossible to reconstruct exact event ordering or measure latency accurately.
+
+**Rationale:** Microsecond resolution provides 1,000,000x finer granularity than seconds, enabling:
+- Precise event ordering within batches
+- Accurate latency measurement between receipt and processing
+- Future-proofing for higher-frequency data collection
+- Better analysis capabilities in downstream tools
+
+**Solution:** Changed timestamp from TEXT (seconds) to INTEGER (microseconds):
+
+1. **Updated SnapshotData struct:**
+   ```rust
+   struct SnapshotData {
+       timestamp: i64,  // Microseconds since Unix epoch
+       // ...
+   }
+   ```
+
+2. **Updated schema to INTEGER:**
+   ```sql
+   timestamp INTEGER NOT NULL,  -- was TEXT
+   ```
+
+3. **Changed timestamp capture to microseconds:**
+   ```rust
+   // Before
+   .as_secs().to_string()
+
+   // After
+   .as_micros() as i64
+   ```
+
+4. **Updated archive query to read i64:**
+   ```rust
+   let snapshots: Vec<(i64, i64, String, String)> = rows
+       .iter()
+       .map(|row| (
+           row.get::<i64, _>("timestamp"),
+           // ...
+       ))
+       .collect();
+   ```
+
+**Benefits:**
+- INTEGER storage is more efficient than TEXT (8 bytes vs ~10-13 bytes)
+- Faster comparisons and sorting in SQLite
+- Parquet stores i64 timestamps natively (efficient columnar storage)
+- Tools like Polars/Pandas handle microsecond timestamps directly
+
+**Note:** The `as i64` cast is safe - microseconds since Unix epoch won't overflow i64 until year 294,247.
+
+**Impact:** Each record now has a unique, high-resolution timestamp. Enables precise ordering and latency analysis for downstream data processing.

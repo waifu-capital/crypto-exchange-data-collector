@@ -30,7 +30,7 @@ static DROPPED_SNAPSHOTS: AtomicU64 = AtomicU64::new(0);
 
 // Data structure for snapshot messages sent through the channel
 struct SnapshotData {
-    timestamp: String,
+    timestamp: i64,  // Microseconds since Unix epoch
     last_update_id: String,
     bids: String,
     asks: String,
@@ -47,7 +47,7 @@ async fn init_database(db_pool: &SqlitePool) {
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS snapshots (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT NOT NULL,
+            timestamp INTEGER NOT NULL,
             lastUpdateId INTEGER NOT NULL,
             bids TEXT NOT NULL,
             asks TEXT NOT NULL
@@ -165,7 +165,7 @@ async fn db_worker(db_pool: SqlitePool, db_rx: &mut tokio::sync::mpsc::Receiver<
                         sqlx::query(
                             "INSERT INTO snapshots (timestamp, lastUpdateId, bids, asks) VALUES (?, ?, ?, ?)"
                         )
-                        .bind(&snapshot.timestamp)
+                        .bind(snapshot.timestamp)
                         .bind(&snapshot.last_update_id)
                         .bind(&snapshot.bids)
                         .bind(&snapshot.asks)
@@ -240,7 +240,7 @@ async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
 
 fn save_snapshot(db_tx: &Sender<SnapshotData>, snapshot: Value) {
     let data = SnapshotData {
-        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string(),
+        timestamp: SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_micros() as i64,
         last_update_id: snapshot["lastUpdateId"].to_string(),
         bids: serde_json::to_string(&snapshot["bids"]).unwrap(),
         asks: serde_json::to_string(&snapshot["asks"]).unwrap(),
@@ -276,11 +276,11 @@ async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf,
         .await
         .unwrap();
 
-    let snapshots: Vec<(String, i64, String, String)> = rows
+    let snapshots: Vec<(i64, i64, String, String)> = rows
         .iter()
         .map(|row| {
             (
-                row.get::<String, _>("timestamp"),
+                row.get::<i64, _>("timestamp"),
                 row.get::<i64, _>("lastUpdateId"),
                 row.get::<String, _>("bids"),
                 row.get::<String, _>("asks"),
@@ -290,7 +290,7 @@ async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf,
 
     if !snapshots.is_empty() {
         let mut df = DataFrame::new(vec![
-            Series::new("timestamp".into(), snapshots.iter().map(|s| s.0.clone()).collect::<Vec<String>>()).into(),
+            Series::new("timestamp".into(), snapshots.iter().map(|s| s.0).collect::<Vec<i64>>()).into(),
             Series::new("lastUpdateId".into(), snapshots.iter().map(|s| s.1).collect::<Vec<i64>>()).into(),
             Series::new("bids".into(), snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>()).into(),
             Series::new("asks".into(), snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>()).into(),
