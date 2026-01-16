@@ -477,3 +477,67 @@ match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().a
 - Some edge cases might silently fail (logged but not acted upon)
 
 **Impact:** System is now resilient to transient failures. Process stays running through recoverable errors, only panicking on truly unrecoverable startup failures. All errors are logged for monitoring and debugging.
+
+---
+
+### Improved: S3 Upload Retry with Exponential Backoff (Problem #9 from PLAN.md)
+
+**Files changed:** `Cargo.toml`, `src/main.rs` (upload_to_s3 function)
+
+**Problem:** S3 upload had no retry logic. Transient network failures (DNS issues, temporary S3 unavailability, network hiccups) would cause the upload to fail immediately, even though retrying would likely succeed.
+
+**Rationale:** S3 is highly reliable but network operations can fail transiently. AWS best practices recommend exponential backoff for retrying failed requests. The `tokio-retry` crate provides a battle-tested implementation.
+
+**Solution:** Added `tokio-retry` with exponential backoff strategy:
+
+1. **New dependency:**
+   ```toml
+   tokio-retry = "0.3"
+   ```
+
+2. **Retry strategy configuration:**
+   ```rust
+   let retry_strategy = ExponentialBackoff::from_millis(1000)
+       .factor(2)
+       .max_delay(Duration::from_secs(30))
+       .take(5);
+   ```
+
+   This produces delays: 1s → 2s → 4s → 8s → 16s (5 attempts total, ~31s max wait)
+
+3. **Retry wrapper around S3 operations:**
+   ```rust
+   let result = Retry::spawn(retry_strategy, || {
+       async move {
+           let body = ByteStream::from_path(&file_path).await?;
+           client.put_object().bucket(&bucket).key(&s3_key).body(body).send().await?;
+           Ok(())
+       }
+   }).await;
+   ```
+
+4. **Logging for visibility:**
+   - Logs retry attempts (attempt 2+)
+   - Logs success with attempt count if retries occurred
+   - Logs final failure with total attempts
+
+**Retry behavior:**
+
+| Attempt | Delay Before | Cumulative Time |
+|---------|--------------|-----------------|
+| 1 | 0s | 0s |
+| 2 | 1s | 1s |
+| 3 | 2s | 3s |
+| 4 | 4s | 7s |
+| 5 | 8s | 15s |
+
+**What gets retried:**
+- File read errors (ByteStream creation)
+- S3 put_object errors (network, throttling, 5xx)
+
+**Trade-offs:**
+- New dependency (`tokio-retry`)
+- Maximum 31 seconds delay before final failure (acceptable for hourly archive)
+- Clones file path, bucket, and key strings on each retry (negligible overhead)
+
+**Impact:** S3 uploads are now resilient to transient failures. Most network hiccups will be automatically recovered without operator intervention.

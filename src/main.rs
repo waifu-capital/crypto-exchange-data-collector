@@ -16,6 +16,8 @@ use futures_util::StreamExt;
 use tokio::time::{sleep, interval};
 use aws_sdk_s3::config::BehaviorVersion;
 use rand;
+use tokio_retry::strategy::ExponentialBackoff;
+use tokio_retry::Retry;
 
 macro_rules! println_with_timestamp {
     ($($arg:tt)*) => {{
@@ -426,8 +428,53 @@ async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf,
 }
 
 async fn upload_to_s3(file_path: &std::path::Path, bucket: &str, s3_key: &str, client: &Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let body = ByteStream::from_path(file_path).await?;
-    client.put_object().bucket(bucket).key(s3_key).body(body).send().await?;
-    println_with_timestamp!("Successfully uploaded {} to s3://{}/{}", file_path.display(), bucket, s3_key);
-    Ok(())
+    // Exponential backoff: 1s, 2s, 4s, 8s, 16s (capped at 30s), 5 attempts total
+    let retry_strategy = ExponentialBackoff::from_millis(1000)
+        .factor(2)
+        .max_delay(Duration::from_secs(30))
+        .take(5);
+
+    let file_path_owned = file_path.to_path_buf();
+    let bucket_owned = bucket.to_string();
+    let s3_key_owned = s3_key.to_string();
+
+    let mut attempt = 0u32;
+    let result = Retry::spawn(retry_strategy, || {
+        let file_path = file_path_owned.clone();
+        let bucket = bucket_owned.clone();
+        let s3_key = s3_key_owned.clone();
+        let client = client.clone();
+        attempt += 1;
+
+        async move {
+            if attempt > 1 {
+                println_with_timestamp!("S3 upload attempt {} for {}", attempt, s3_key);
+            }
+
+            let body = ByteStream::from_path(&file_path).await
+                .map_err(|e| format!("Failed to read file: {}", e))?;
+
+            client.put_object()
+                .bucket(&bucket)
+                .key(&s3_key)
+                .body(body)
+                .send()
+                .await
+                .map_err(|e| format!("S3 put_object failed: {}", e))?;
+
+            Ok::<(), String>(())
+        }
+    }).await;
+
+    match result {
+        Ok(_) => {
+            if attempt > 1 {
+                println_with_timestamp!("Successfully uploaded {} to s3://{}/{} after {} attempts", file_path.display(), bucket, s3_key, attempt);
+            } else {
+                println_with_timestamp!("Successfully uploaded {} to s3://{}/{}", file_path.display(), bucket, s3_key);
+            }
+            Ok(())
+        }
+        Err(e) => Err(format!("S3 upload failed after {} attempts: {}", attempt, e).into())
+    }
 }
