@@ -384,3 +384,96 @@ match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().a
 **Breaking change:** Existing databases with the old schema are incompatible. Delete the old `.db` file before running the updated code.
 
 **Impact:** System is now ready for multi-exchange, multi-data-type collection with built-in deduplication.
+
+---
+
+### Improved: Hybrid Error Handling (Problem #8 from PLAN.md)
+
+**Files changed:** `src/main.rs` (throughout)
+
+**Problem:** Extensive use of `.unwrap()` throughout the codebase meant any error would cause a panic, potentially losing buffered data and crashing the entire process.
+
+**Rationale:** Different error scenarios require different responses:
+- Startup failures (missing env vars, DB connection) → should panic with clear message (unrecoverable)
+- Per-message processing errors → log and skip, continue processing (don't let one bad message crash everything)
+- Batch/transaction errors → log, data stays in buffer for next attempt
+- Archive errors → log and return, will retry next cycle (data safe in SQLite)
+- S3 upload errors → return Result to caller for handling
+
+**Solution:** Hybrid approach matching error handling to context:
+
+1. **Startup errors** - `.expect()` with descriptive messages:
+   ```rust
+   let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
+   let db_pool = SqlitePoolOptions::new()
+       .connect(&db_url)
+       .await
+       .expect("Failed to create SQLite pool");
+   ```
+
+2. **Per-message processing** - log and skip:
+   ```rust
+   let text = match msg.into_text() {
+       Ok(t) => t,
+       Err(e) => {
+           println_with_timestamp!("ERROR: Failed to extract text: {}", e);
+           continue;  // Skip this message, process next
+       }
+   };
+   ```
+
+3. **Database worker** - graceful transaction handling:
+   ```rust
+   let tx = match db_pool.begin().await {
+       Ok(tx) => tx,
+       Err(e) => {
+           println_with_timestamp!("ERROR: Failed to begin transaction: {}", e);
+           continue;  // Data stays in batch, retry next interval
+       }
+   };
+   // Track insert errors but continue batch
+   if let Err(e) = sqlx::query(...).execute(&mut *tx).await {
+       insert_errors += 1;
+       println_with_timestamp!("ERROR: Failed to insert: {}", e);
+   }
+   ```
+
+4. **Archive process** - log and return early:
+   ```rust
+   let mut file = match std::fs::File::create(&path) {
+       Ok(f) => f,
+       Err(e) => {
+           println_with_timestamp!("ERROR: Failed to create archive: {}", e);
+           return;  // Data safe in SQLite, retry next cycle
+       }
+   };
+   ```
+
+5. **S3 upload** - return Result for caller handling:
+   ```rust
+   async fn upload_to_s3(...) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+       let body = ByteStream::from_path(file_path).await?;
+       client.put_object()...send().await?;
+       Ok(())
+   }
+   ```
+
+**Error categories and their handling:**
+
+| Context | Strategy | Rationale |
+|---------|----------|-----------|
+| Startup | Panic with message | Unrecoverable, better to fail fast |
+| WebSocket message | Log, skip | One bad message shouldn't crash collector |
+| Channel send | Log, drop | Backpressure - already handled |
+| DB transaction | Log, retry next interval | Data stays buffered |
+| DB insert | Log, count errors | Continue batch, commit what we can |
+| Archive file ops | Log, return | Data safe in SQLite |
+| S3 upload | Return Result | Let caller decide (retry logic) |
+| Post-upload cleanup | Log warning | Not critical, can clean manually |
+
+**Trade-offs:**
+- Slightly more verbose code
+- Error messages need to be maintained
+- Some edge cases might silently fail (logged but not acted upon)
+
+**Impact:** System is now resilient to transient failures. Process stays running through recoverable errors, only panicking on truly unrecoverable startup failures. All errors are logged for monitoring and debugging.

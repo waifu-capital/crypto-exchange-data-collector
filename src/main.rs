@@ -43,7 +43,7 @@ async fn init_database(db_pool: &SqlitePool) {
     sqlx::query("PRAGMA journal_mode=WAL")
         .execute(db_pool)
         .await
-        .unwrap();
+        .expect("Failed to enable WAL mode");
 
     // Ensure the snapshots table exists
     sqlx::query(
@@ -60,7 +60,7 @@ async fn init_database(db_pool: &SqlitePool) {
     )
     .execute(db_pool)
     .await
-    .unwrap();
+    .expect("Failed to create snapshots table");
 
     println_with_timestamp!("Database initialized with WAL mode");
 }
@@ -73,15 +73,15 @@ async fn main() {
     let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
     let aws_region = env::var("AWS_REGION").unwrap_or("us-west-2".to_string());
 
-    let curr_dir = std::env::current_dir().unwrap();
+    let curr_dir = std::env::current_dir().expect("Failed to get current directory");
     let base_path = curr_dir.join("orderbookdata");
     let market_symbol = env::var("MARKET_SYMBOL").unwrap_or("bnbusdt".to_string());
     let bucket_name = format!("binance-spot-{}", market_symbol.to_lowercase());
     let database_path = base_path.join(format!("snapshots-binance-spot-{}.db", market_symbol.to_lowercase()));
     let archive_dir = base_path.join(format!("archive-{}", market_symbol.to_lowercase()));
 
-    std::fs::create_dir_all(&base_path).unwrap();
-    std::fs::create_dir_all(&archive_dir).unwrap();
+    std::fs::create_dir_all(&base_path).expect("Failed to create base data directory");
+    std::fs::create_dir_all(&archive_dir).expect("Failed to create archive directory");
 
     let region_provider = RegionProviderChain::first_try(Region::new(aws_region.clone())).or_else(Region::new("us-west-2"));
     let credentials_provider = aws_sdk_s3::config::Credentials::new(aws_access_key, aws_secret_key, None, None, "custom");
@@ -141,14 +141,15 @@ async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str) {
                 .location_constraint(aws_sdk_s3::types::BucketLocationConstraint::UsWest2)
                 .build();
 
-            client.create_bucket()
+            match client.create_bucket()
                 .bucket(bucket_name)
                 .create_bucket_configuration(create_bucket_config)
                 .send()
                 .await
-                .unwrap();
-
-            println_with_timestamp!("Bucket {} created.", bucket_name);
+            {
+                Ok(_) => println_with_timestamp!("Bucket {} created.", bucket_name),
+                Err(e) => println_with_timestamp!("WARNING: Failed to create bucket {}: {}. Will retry on next upload.", bucket_name, e),
+            }
         }
     }
 }
@@ -164,11 +165,21 @@ async fn db_worker(db_pool: SqlitePool, db_rx: &mut tokio::sync::mpsc::Receiver<
             },
             _ = interval.tick() => {
                 if !batch.is_empty() {
-                    let mut tx = db_pool.begin().await.unwrap();
+                    let batch_size = batch.len();
 
+                    let tx = match db_pool.begin().await {
+                        Ok(tx) => tx,
+                        Err(e) => {
+                            println_with_timestamp!("ERROR: Failed to begin transaction: {}. Retrying next interval.", e);
+                            continue;
+                        }
+                    };
+                    let mut tx = tx;
+
+                    let mut insert_errors = 0;
                     for snapshot in batch.drain(..) {
                         // INSERT OR IGNORE skips duplicates based on UNIQUE constraint
-                        sqlx::query(
+                        if let Err(e) = sqlx::query(
                             "INSERT OR IGNORE INTO snapshots (exchange, symbol, data_type, exchange_sequence_id, timestamp, data) VALUES (?, ?, ?, ?, ?, ?)"
                         )
                         .bind(&snapshot.exchange)
@@ -178,11 +189,17 @@ async fn db_worker(db_pool: SqlitePool, db_rx: &mut tokio::sync::mpsc::Receiver<
                         .bind(snapshot.timestamp)
                         .bind(&snapshot.data)
                         .execute(&mut *tx)
-                        .await
-                        .unwrap();
+                        .await {
+                            insert_errors += 1;
+                            println_with_timestamp!("ERROR: Failed to insert snapshot: {}", e);
+                        }
                     }
 
-                    tx.commit().await.unwrap();
+                    if let Err(e) = tx.commit().await {
+                        println_with_timestamp!("ERROR: Failed to commit transaction: {}. {} snapshots may be lost.", e, batch_size);
+                    } else if insert_errors > 0 {
+                        println_with_timestamp!("WARNING: Committed batch with {} insert errors out of {} snapshots", insert_errors, batch_size);
+                    }
                 }
             }
         }
@@ -210,10 +227,25 @@ async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
                         Ok(msg) => {
                             if msg.is_text() {
                                 if rand::random::<u32>() % 1000 == 0 {
-                                    println_with_timestamp!("Received orderbook message: {:?}...", &msg.to_text().unwrap()[..50]);
+                                    if let Ok(preview) = msg.to_text() {
+                                        let preview_len = preview.len().min(50);
+                                        println_with_timestamp!("Received orderbook message: {:?}...", &preview[..preview_len]);
+                                    }
                                 }
-                                let text = msg.into_text().unwrap();
-                                let snapshot: Value = serde_json::from_str(&text).unwrap();
+                                let text = match msg.into_text() {
+                                    Ok(t) => t,
+                                    Err(e) => {
+                                        println_with_timestamp!("ERROR: Failed to extract text from message: {}", e);
+                                        continue;
+                                    }
+                                };
+                                let snapshot: Value = match serde_json::from_str(&text) {
+                                    Ok(v) => v,
+                                    Err(e) => {
+                                        println_with_timestamp!("ERROR: Failed to parse JSON: {}", e);
+                                        continue;
+                                    }
+                                };
                                 let exchange_sequence_id = snapshot["lastUpdateId"].to_string();
                                 save_snapshot(
                                     &db_tx,
@@ -293,13 +325,25 @@ async fn schedule_daily_task(db_pool: SqlitePool, archive_dir: std::path::PathBu
 
 async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf, bucket_name: String, client: Client) {
     use polars::prelude::*;
-    let home_server_name = env::var("HOME_SERVER_NAME").expect("HOME_SERVER_NAME must be set");
+    let home_server_name = match env::var("HOME_SERVER_NAME") {
+        Ok(name) => name,
+        Err(_) => {
+            println_with_timestamp!("ERROR: HOME_SERVER_NAME not set, skipping archive");
+            return;
+        }
+    };
 
     // Fetch all snapshots using sqlx
-    let rows = sqlx::query("SELECT exchange, symbol, data_type, exchange_sequence_id, timestamp, data FROM snapshots")
+    let rows = match sqlx::query("SELECT exchange, symbol, data_type, exchange_sequence_id, timestamp, data FROM snapshots")
         .fetch_all(&db_pool)
         .await
-        .unwrap();
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            println_with_timestamp!("ERROR: Failed to fetch snapshots for archive: {}", e);
+            return;
+        }
+    };
 
     let snapshots: Vec<(String, String, String, String, i64, String)> = rows
         .iter()
@@ -316,33 +360,61 @@ async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf,
         .collect();
 
     if !snapshots.is_empty() {
-        let mut df = DataFrame::new(vec![
+        let mut df = match DataFrame::new(vec![
             Series::new("exchange".into(), snapshots.iter().map(|s| s.0.clone()).collect::<Vec<String>>()).into(),
             Series::new("symbol".into(), snapshots.iter().map(|s| s.1.clone()).collect::<Vec<String>>()).into(),
             Series::new("data_type".into(), snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>()).into(),
             Series::new("exchange_sequence_id".into(), snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>()).into(),
             Series::new("timestamp".into(), snapshots.iter().map(|s| s.4).collect::<Vec<i64>>()).into(),
             Series::new("data".into(), snapshots.iter().map(|s| s.5.clone()).collect::<Vec<String>>()).into(),
-        ]).unwrap();
+        ]) {
+            Ok(df) => df,
+            Err(e) => {
+                println_with_timestamp!("ERROR: Failed to create DataFrame: {}", e);
+                return;
+            }
+        };
 
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis();
+        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).expect("System time before Unix epoch").as_millis();
         let archive_file_name = format!("snapshots_{}_{}.parquet", home_server_name, timestamp);
         let archive_file_path = archive_dir.join(&archive_file_name);
-        let mut file = std::fs::File::create(&archive_file_path).unwrap();
-        ParquetWriter::new(&mut file).finish(&mut df).unwrap();
+
+        let mut file = match std::fs::File::create(&archive_file_path) {
+            Ok(f) => f,
+            Err(e) => {
+                println_with_timestamp!("ERROR: Failed to create archive file {}: {}", archive_file_path.display(), e);
+                return;
+            }
+        };
+
+        if let Err(e) = ParquetWriter::new(&mut file).finish(&mut df) {
+            println_with_timestamp!("ERROR: Failed to write Parquet file {}: {}", archive_file_path.display(), e);
+            // Try to clean up the partial file
+            let _ = std::fs::remove_file(&archive_file_path);
+            return;
+        }
         println_with_timestamp!("Written {} snapshots to {}", snapshots.len(), archive_file_path.display());
 
-        upload_to_s3(&archive_file_path, &bucket_name, &archive_file_name, &client).await;
+        if let Err(e) = upload_to_s3(&archive_file_path, &bucket_name, &archive_file_name, &client).await {
+            println_with_timestamp!("ERROR: Failed to upload to S3: {}. Will retry next cycle.", e);
+            return;
+        }
 
         // Verify upload succeeded before deleting local data
         match client.head_object().bucket(&bucket_name).key(&archive_file_name).send().await {
             Ok(_) => {
                 println_with_timestamp!("Verified S3 upload: s3://{}/{}", bucket_name, archive_file_name);
-                sqlx::query("DELETE FROM snapshots")
+                if let Err(e) = sqlx::query("DELETE FROM snapshots")
                     .execute(&db_pool)
                     .await
-                    .unwrap();
-                std::fs::remove_file(&archive_file_path).unwrap();
+                {
+                    println_with_timestamp!("ERROR: Failed to delete snapshots from database: {}", e);
+                    // Data is safe in S3, but duplicates may occur next cycle
+                }
+                if let Err(e) = std::fs::remove_file(&archive_file_path) {
+                    println_with_timestamp!("WARNING: Failed to remove local archive file: {}", e);
+                    // Not critical - file can be cleaned up manually
+                }
                 println_with_timestamp!("Deleted local data after verified upload");
             },
             Err(e) => {
@@ -353,8 +425,9 @@ async fn archive_snapshots(db_pool: SqlitePool, archive_dir: std::path::PathBuf,
     }
 }
 
-async fn upload_to_s3(file_path: &std::path::Path, bucket: &str, s3_key: &str, client: &Client) {
-    let body = ByteStream::from_path(file_path).await.unwrap();
-    client.put_object().bucket(bucket).key(s3_key).body(body).send().await.unwrap();
+async fn upload_to_s3(file_path: &std::path::Path, bucket: &str, s3_key: &str, client: &Client) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let body = ByteStream::from_path(file_path).await?;
+    client.put_object().bucket(bucket).key(s3_key).body(body).send().await?;
     println_with_timestamp!("Successfully uploaded {} to s3://{}/{}", file_path.display(), bucket, s3_key);
+    Ok(())
 }
