@@ -609,7 +609,7 @@ src/
 | `websocket.rs` | `websocket_worker`, `save_snapshot`, Binance-specific handling |
 | `archive.rs` | `create_bucket_if_not_exists`, `run_archive_scheduler`, `archive_snapshots`, `upload_to_s3` |
 | `models.rs` | `SnapshotData` struct definition |
-| `utils.rs` | `println_with_timestamp!` macro, `DROPPED_SNAPSHOTS` counter |
+| `utils.rs` | `DROPPED_SNAPSHOTS` counter (macro removed after tracing migration) |
 
 **Benefits:**
 - Clear separation of concerns
@@ -621,3 +621,134 @@ src/
 **Breaking changes:** None - same functionality, just reorganized.
 
 **Impact:** Codebase is now organized for maintainability and future growth. Main.rs reduced from ~485 lines to ~110 lines.
+
+---
+
+### Improved: Structured Logging with Tracing
+
+**Files changed:** `Cargo.toml`, `src/main.rs`, `src/db.rs`, `src/websocket.rs`, `src/archive.rs`, `src/utils.rs`
+
+**Problem:** The codebase used a custom `println_with_timestamp!` macro for logging. While functional, this approach had limitations:
+- Plain text output not suitable for log aggregation tools
+- No log levels (info, warn, error, debug)
+- No structured fields for filtering/searching
+- Output only to stdout
+- No way to control verbosity at runtime
+
+**Rationale:** Production systems need structured logging for:
+- Log aggregation (ELK, Loki, Datadog)
+- Filtering by severity and fields
+- Performance analysis via structured spans
+- Multiple output destinations (stdout for humans, files for aggregation)
+
+**Solution:** Implemented `tracing` with multiple outputs:
+
+1. **New dependencies:**
+   ```toml
+   tracing = "0.1"
+   tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+   tracing-appender = "0.2"
+   ```
+
+2. **Dual-output tracing initialization in `main.rs`:**
+   ```rust
+   fn init_tracing() {
+       std::fs::create_dir_all("logs").expect("Failed to create logs directory");
+
+       // Rolling file appender - rotates daily
+       let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "collector.log");
+
+       // Stdout layer - pretty format for humans
+       let stdout_layer = fmt::layer()
+           .with_target(true)
+           .with_thread_ids(false)
+           .with_file(false);
+
+       // File layer - JSON format for log aggregation
+       let file_layer = fmt::layer()
+           .json()
+           .with_writer(file_appender);
+
+       // Environment filter - default to info, configurable via RUST_LOG
+       let env_filter = EnvFilter::try_from_default_env()
+           .unwrap_or_else(|_| EnvFilter::new("info"));
+
+       tracing_subscriber::registry()
+           .with(env_filter)
+           .with(stdout_layer)
+           .with(file_layer)
+           .init();
+   }
+   ```
+
+3. **Replaced all `println_with_timestamp!` calls with tracing macros:**
+   ```rust
+   // Before
+   println_with_timestamp!("Connected to Binance WebSocket for {}", market_symbol);
+
+   // After
+   info!(symbol = %market_symbol, "Connected to Binance WebSocket");
+   ```
+
+4. **Structured fields throughout:**
+   ```rust
+   // Structured key-value pairs
+   info!(
+       snapshot_count = snapshots.len(),
+       path = %archive_file_path.display(),
+       "Written snapshots to Parquet file"
+   );
+
+   warn!(
+       total_dropped = count,
+       "Channel full, dropped snapshot"
+   );
+
+   error!(
+       error = %e,
+       bucket = bucket_name,
+       "Failed to create bucket"
+   );
+   ```
+
+5. **Log levels used:**
+   - `error!` - Failures requiring attention
+   - `warn!` - Degraded behavior (dropped messages, retries)
+   - `info!` - Normal operations (connections, archives, startup)
+   - `debug!` - Verbose details (sampled message previews, pings/pongs)
+
+6. **Removed old macro from `utils.rs`** - Only counters remain.
+
+**Output formats:**
+
+Stdout (human-readable):
+```
+2026-01-16T10:30:00.123Z  INFO crypto_collector::websocket: Connected to Binance WebSocket symbol=BTCUSDT
+```
+
+File (JSON for aggregation):
+```json
+{"timestamp":"2026-01-16T10:30:00.123Z","level":"INFO","target":"crypto_collector::websocket","fields":{"symbol":"BTCUSDT","message":"Connected to Binance WebSocket"}}
+```
+
+**Runtime configuration via RUST_LOG:**
+```bash
+RUST_LOG=debug ./collector          # All debug logs
+RUST_LOG=warn ./collector           # Warnings and errors only
+RUST_LOG=crypto_collector=debug     # Debug for this crate only
+```
+
+**Benefits:**
+- Structured fields enable filtering (`symbol=BTCUSDT`)
+- JSON output integrates with log aggregation pipelines
+- Daily log rotation prevents disk exhaustion
+- Runtime-configurable verbosity via RUST_LOG
+- Pretty stdout format for local development
+- Industry-standard tracing ecosystem
+
+**Trade-offs:**
+- Three new dependencies (~200KB compiled)
+- Creates `logs/` directory and writes files
+- Slight overhead for JSON serialization (negligible)
+
+**Impact:** Production-ready logging infrastructure. Operators can now aggregate logs, filter by fields, and adjust verbosity without code changes.

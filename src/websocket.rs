@@ -5,10 +5,10 @@ use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
+use tracing::{debug, error, info, warn};
 
 use crate::models::SnapshotData;
 use crate::utils::increment_dropped_snapshots;
-use crate::println_with_timestamp;
 
 /// WebSocket worker that connects to Binance and streams orderbook data
 pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
@@ -21,20 +21,20 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
     loop {
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
-                println_with_timestamp!("Connected to Binance WebSocket for {}", market_symbol);
+                info!(symbol = %market_symbol, "Connected to Binance WebSocket");
                 let (mut write, mut read) = ws_stream.split();
 
                 while let Some(message) = read.next().await {
                     match message {
                         Ok(msg) => {
                             if msg.is_text() {
-                                // Sample log ~0.1% of messages
+                                // Sample log ~0.1% of messages at debug level
                                 if rand::random::<u32>() % 1000 == 0 {
                                     if let Ok(preview) = msg.to_text() {
                                         let preview_len = preview.len().min(50);
-                                        println_with_timestamp!(
-                                            "Received orderbook message: {:?}...",
-                                            &preview[..preview_len]
+                                        debug!(
+                                            preview = &preview[..preview_len],
+                                            "Received orderbook message"
                                         );
                                     }
                                 }
@@ -42,10 +42,7 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                                 let text = match msg.into_text() {
                                     Ok(t) => t,
                                     Err(e) => {
-                                        println_with_timestamp!(
-                                            "ERROR: Failed to extract text from message: {}",
-                                            e
-                                        );
+                                        error!(error = %e, "Failed to extract text from message");
                                         continue;
                                     }
                                 };
@@ -53,7 +50,7 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                                 let snapshot: Value = match serde_json::from_str(&text) {
                                     Ok(v) => v,
                                     Err(e) => {
-                                        println_with_timestamp!("ERROR: Failed to parse JSON: {}", e);
+                                        error!(error = %e, "Failed to parse JSON");
                                         continue;
                                     }
                                 };
@@ -68,33 +65,36 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                                     &text,
                                 );
                             } else if msg.is_ping() {
-                                println_with_timestamp!("Received ping frame: {:?}", msg);
+                                debug!("Received ping frame");
                                 let pong =
                                     tokio_tungstenite::tungstenite::Message::Pong(msg.into_data());
                                 if let Err(e) = write.send(pong).await {
-                                    println_with_timestamp!("Failed to send pong frame: {}", e);
+                                    error!(error = %e, "Failed to send pong frame");
                                     break;
                                 }
-                                println_with_timestamp!("Sent pong frame in response to ping.");
+                                debug!("Sent pong frame in response to ping");
                             } else if msg.is_pong() {
-                                println_with_timestamp!("Received pong frame: {:?}", msg);
+                                debug!("Received pong frame");
                             } else {
-                                println_with_timestamp!("Received other message: {:?}", msg);
+                                debug!(?msg, "Received other message");
                             }
                         }
                         Err(e) => {
-                            println_with_timestamp!("WebSocket error: {}", e);
+                            error!(error = %e, "WebSocket error");
                             break;
                         }
                     }
                 }
             }
             Err(e) => {
-                println_with_timestamp!("Failed to connect to WebSocket: {}", e);
+                error!(error = %e, "Failed to connect to WebSocket");
             }
         }
 
-        println_with_timestamp!("Reconnecting in {} seconds...", retry_delay.as_secs());
+        info!(
+            delay_secs = retry_delay.as_secs(),
+            "Reconnecting to WebSocket"
+        );
         sleep(retry_delay).await;
     }
 }
@@ -125,9 +125,9 @@ fn save_snapshot(
         Ok(_) => {}
         Err(_) => {
             let count = increment_dropped_snapshots();
-            println_with_timestamp!(
-                "WARNING: Channel full, dropped snapshot (total dropped: {})",
-                count
+            warn!(
+                total_dropped = count,
+                "Channel full, dropped snapshot"
             );
         }
     }

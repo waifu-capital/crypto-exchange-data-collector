@@ -17,3 +17,6 @@ polars = { version = "0.52.0", features = ["parquet"] }
 rand = "0.9.2"
 chrono = "0.4.43"
 tokio-retry = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"

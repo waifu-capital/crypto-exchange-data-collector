@@ -8,14 +8,14 @@ use sqlx::sqlite::SqlitePool;
 use tokio::time::sleep;
 use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::Retry;
+use tracing::{error, info, warn};
 
 use crate::db::{delete_all_snapshots, fetch_all_snapshots};
-use crate::println_with_timestamp;
 
 /// Create S3 bucket if it doesn't exist
 pub async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, region: &str) {
     match client.head_bucket().bucket(bucket_name).send().await {
-        Ok(_) => println_with_timestamp!("Bucket {} already exists.", bucket_name),
+        Ok(_) => info!(bucket = bucket_name, "Bucket already exists"),
         Err(_) => {
             // us-east-1 is the default region and doesn't use location constraint
             let create_bucket_config = if region == "us-east-1" {
@@ -36,13 +36,11 @@ pub async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, reg
             }
 
             match request.send().await {
-                Ok(_) => {
-                    println_with_timestamp!("Bucket {} created in region {}.", bucket_name, region)
-                }
-                Err(e) => println_with_timestamp!(
-                    "WARNING: Failed to create bucket {}: {}. Will retry on next upload.",
-                    bucket_name,
-                    e
+                Ok(_) => info!(bucket = bucket_name, region, "Bucket created"),
+                Err(e) => warn!(
+                    bucket = bucket_name,
+                    error = %e,
+                    "Failed to create bucket, will retry on next upload"
                 ),
             }
         }
@@ -59,7 +57,7 @@ pub async fn run_archive_scheduler(
 ) {
     loop {
         let sleep_duration = 3600;
-        println_with_timestamp!("Sleeping for {} seconds (1 hour).", sleep_duration);
+        info!(sleep_secs = sleep_duration, "Sleeping until next archive");
         sleep(Duration::from_secs(sleep_duration)).await;
 
         archive_snapshots(
@@ -84,7 +82,7 @@ pub async fn archive_snapshots(
     let home_server_name = match home_server_name {
         Some(name) => name,
         None => {
-            println_with_timestamp!("ERROR: HOME_SERVER_NAME not set, skipping archive");
+            error!("HOME_SERVER_NAME not set, skipping archive");
             return;
         }
     };
@@ -93,13 +91,13 @@ pub async fn archive_snapshots(
     let snapshots = match fetch_all_snapshots(db_pool).await {
         Ok(s) => s,
         Err(e) => {
-            println_with_timestamp!("ERROR: Failed to fetch snapshots for archive: {}", e);
+            error!(error = %e, "Failed to fetch snapshots for archive");
             return;
         }
     };
 
     if snapshots.is_empty() {
-        println_with_timestamp!("No snapshots to archive");
+        info!("No snapshots to archive");
         return;
     }
 
@@ -138,7 +136,7 @@ pub async fn archive_snapshots(
     ]) {
         Ok(df) => df,
         Err(e) => {
-            println_with_timestamp!("ERROR: Failed to create DataFrame: {}", e);
+            error!(error = %e, "Failed to create DataFrame");
             return;
         }
     };
@@ -154,35 +152,35 @@ pub async fn archive_snapshots(
     let mut file = match std::fs::File::create(&archive_file_path) {
         Ok(f) => f,
         Err(e) => {
-            println_with_timestamp!(
-                "ERROR: Failed to create archive file {}: {}",
-                archive_file_path.display(),
-                e
+            error!(
+                error = %e,
+                path = %archive_file_path.display(),
+                "Failed to create archive file"
             );
             return;
         }
     };
 
     if let Err(e) = ParquetWriter::new(&mut file).finish(&mut df) {
-        println_with_timestamp!(
-            "ERROR: Failed to write Parquet file {}: {}",
-            archive_file_path.display(),
-            e
+        error!(
+            error = %e,
+            path = %archive_file_path.display(),
+            "Failed to write Parquet file"
         );
         // Try to clean up the partial file
         let _ = std::fs::remove_file(&archive_file_path);
         return;
     }
-    println_with_timestamp!(
-        "Written {} snapshots to {}",
-        snapshots.len(),
-        archive_file_path.display()
+    info!(
+        snapshot_count = snapshots.len(),
+        path = %archive_file_path.display(),
+        "Written snapshots to Parquet file"
     );
 
     // Upload to S3
     if let Err(e) = upload_to_s3(&archive_file_path, bucket_name, &archive_file_name, client).await
     {
-        println_with_timestamp!("ERROR: Failed to upload to S3: {}. Will retry next cycle.", e);
+        error!(error = %e, "Failed to upload to S3, will retry next cycle");
         return;
     }
 
@@ -195,21 +193,29 @@ pub async fn archive_snapshots(
         .await
     {
         Ok(_) => {
-            println_with_timestamp!("Verified S3 upload: s3://{}/{}", bucket_name, archive_file_name);
+            info!(
+                bucket = bucket_name,
+                key = archive_file_name,
+                "Verified S3 upload"
+            );
             if let Err(e) = delete_all_snapshots(db_pool).await {
-                println_with_timestamp!("ERROR: Failed to delete snapshots from database: {}", e);
+                error!(error = %e, "Failed to delete snapshots from database");
                 // Data is safe in S3, but duplicates may occur next cycle
             }
             if let Err(e) = std::fs::remove_file(&archive_file_path) {
-                println_with_timestamp!("WARNING: Failed to remove local archive file: {}", e);
+                warn!(
+                    error = %e,
+                    path = %archive_file_path.display(),
+                    "Failed to remove local archive file"
+                );
                 // Not critical - file can be cleaned up manually
             }
-            println_with_timestamp!("Deleted local data after verified upload");
+            info!("Deleted local data after verified upload");
         }
         Err(e) => {
-            println_with_timestamp!(
-                "ERROR: Failed to verify S3 upload, keeping local data: {}",
-                e
+            error!(
+                error = %e,
+                "Failed to verify S3 upload, keeping local data"
             );
             // Don't delete SQLite data or local file - will retry next cycle
         }
@@ -243,7 +249,7 @@ pub async fn upload_to_s3(
 
         async move {
             if attempt > 1 {
-                println_with_timestamp!("S3 upload attempt {} for {}", attempt, s3_key);
+                info!(attempt, key = %s3_key, "Retrying S3 upload");
             }
 
             let body = ByteStream::from_path(&file_path)
@@ -266,22 +272,13 @@ pub async fn upload_to_s3(
 
     match result {
         Ok(_) => {
-            if attempt > 1 {
-                println_with_timestamp!(
-                    "Successfully uploaded {} to s3://{}/{} after {} attempts",
-                    file_path.display(),
-                    bucket,
-                    s3_key,
-                    attempt
-                );
-            } else {
-                println_with_timestamp!(
-                    "Successfully uploaded {} to s3://{}/{}",
-                    file_path.display(),
-                    bucket,
-                    s3_key
-                );
-            }
+            info!(
+                path = %file_path.display(),
+                bucket,
+                key = s3_key,
+                attempts = attempt,
+                "Successfully uploaded to S3"
+            );
             Ok(())
         }
         Err(e) => Err(format!("S3 upload failed after {} attempts: {}", attempt, e).into()),

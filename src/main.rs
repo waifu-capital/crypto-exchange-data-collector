@@ -12,6 +12,9 @@ use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::Client;
 use tokio::sync::mpsc::channel;
 use tokio::time::sleep;
+use tracing::info;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::archive::{create_bucket_if_not_exists, run_archive_scheduler};
 use crate::config::Config;
@@ -19,12 +22,53 @@ use crate::db::{create_pool, db_worker, init_database};
 use crate::models::SnapshotData;
 use crate::websocket::websocket_worker;
 
+/// Initialize tracing with multiple outputs:
+/// - Pretty format to stdout (for humans)
+/// - JSON format to rolling log files (for aggregation)
+fn init_tracing() {
+    // Create logs directory
+    std::fs::create_dir_all("logs").expect("Failed to create logs directory");
+
+    // Rolling file appender - rotates daily
+    let file_appender = RollingFileAppender::new(Rotation::DAILY, "logs", "collector.log");
+
+    // Stdout layer - pretty format for humans
+    let stdout_layer = fmt::layer()
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_file(false);
+
+    // File layer - JSON format for log aggregation
+    let file_layer = fmt::layer()
+        .json()
+        .with_writer(file_appender);
+
+    // Environment filter - default to info, configurable via RUST_LOG
+    let env_filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stdout_layer)
+        .with(file_layer)
+        .init();
+}
+
 #[tokio::main]
 async fn main() {
     dotenv::dotenv().ok();
 
+    // Initialize structured logging
+    init_tracing();
+
     // Load configuration
     let config = Config::from_env();
+
+    info!(
+        market_symbol = %config.market_symbol,
+        aws_region = %config.aws_region,
+        "Starting crypto exchange data collector"
+    );
 
     // Initialize AWS client
     let client = create_s3_client(&config).await;
@@ -59,7 +103,7 @@ async fn main() {
 
     // Spawn liveness probe
     tokio::spawn(async move {
-        print_liveness_probe().await;
+        run_liveness_probe().await;
     });
 
     // Run archive scheduler (blocks main task)
@@ -95,16 +139,14 @@ async fn create_s3_client(config: &Config) -> Client {
     Client::new(&shared_config)
 }
 
-/// Print liveness probe at regular intervals
-async fn print_liveness_probe() {
+/// Log liveness probe at regular intervals
+async fn run_liveness_probe() {
     loop {
-        println_with_timestamp!(
-            "Liveness probe: {}",
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs()
-        );
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        info!(timestamp, "Liveness probe");
         sleep(Duration::from_secs(60)).await;
     }
 }

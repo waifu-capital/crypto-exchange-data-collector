@@ -4,9 +4,9 @@ use std::time::Duration;
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use tokio::time::interval;
+use tracing::{error, info, warn};
 
 use crate::models::SnapshotData;
-use crate::println_with_timestamp;
 
 /// Create a SQLite connection pool
 pub async fn create_pool(database_path: &Path) -> SqlitePool {
@@ -43,7 +43,7 @@ pub async fn init_database(db_pool: &SqlitePool) {
     .await
     .expect("Failed to create snapshots table");
 
-    println_with_timestamp!("Database initialized with WAL mode");
+    info!("Database initialized with WAL mode");
 }
 
 /// Background worker that batches and writes snapshots to the database
@@ -76,7 +76,7 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
     let tx = match db_pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
-            println_with_timestamp!("ERROR: Failed to begin transaction: {}. Retrying next interval.", e);
+            error!(error = %e, "Failed to begin transaction, retrying next interval");
             return;
         }
     };
@@ -97,14 +97,22 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
         .execute(&mut *tx)
         .await {
             insert_errors += 1;
-            println_with_timestamp!("ERROR: Failed to insert snapshot: {}", e);
+            error!(error = %e, "Failed to insert snapshot");
         }
     }
 
     if let Err(e) = tx.commit().await {
-        println_with_timestamp!("ERROR: Failed to commit transaction: {}. {} snapshots may be lost.", e, batch_size);
+        error!(
+            error = %e,
+            batch_size,
+            "Failed to commit transaction, snapshots may be lost"
+        );
     } else if insert_errors > 0 {
-        println_with_timestamp!("WARNING: Committed batch with {} insert errors out of {} snapshots", insert_errors, batch_size);
+        warn!(
+            insert_errors,
+            batch_size,
+            "Committed batch with insert errors"
+        );
     }
 }
 
