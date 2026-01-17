@@ -139,3 +139,171 @@ pub fn create_exchange(name: &str) -> Option<Box<dyn Exchange>> {
 pub fn supported_exchanges() -> &'static [&'static str] {
     &["binance", "coinbase", "upbit", "okx", "bybit"]
 }
+
+#[cfg(test)]
+mod smoke_tests {
+    use super::*;
+    use futures_util::{SinkExt, StreamExt};
+    use std::time::{Duration, Instant};
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    /// Connect to an exchange, receive messages, and verify parsing works.
+    ///
+    /// This helper connects to the exchange WebSocket, subscribes to the given
+    /// feeds, receives `message_count` data messages, and verifies all parse correctly.
+    async fn run_smoke_test(
+        exchange: &dyn Exchange,
+        symbol: &str,
+        message_count: usize,
+    ) -> Result<(), String> {
+        let url = exchange.websocket_url(symbol);
+        println!("Connecting to {} at {}", exchange.name(), url);
+
+        let (ws_stream, _) = connect_async(&url)
+            .await
+            .map_err(|e| format!("Connection failed: {}", e))?;
+
+        let (mut write, mut read) = ws_stream.split();
+
+        // Send subscription messages
+        let feeds = vec![FeedType::Orderbook, FeedType::Trades];
+        for msg in exchange.build_subscribe_messages(symbol, &feeds) {
+            println!("Sending subscription: {}", &msg[..msg.len().min(100)]);
+            write
+                .send(Message::Text(msg.into()))
+                .await
+                .map_err(|e| format!("Send failed: {}", e))?;
+        }
+
+        // Receive and parse messages
+        let timeout = Duration::from_secs(30);
+        let mut received = 0;
+        let mut data_messages = 0;
+        let deadline = Instant::now() + timeout;
+
+        println!("Waiting for {} data messages...", message_count);
+
+        while data_messages < message_count && Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_secs(5), read.next()).await {
+                Ok(Some(Ok(msg))) => {
+                    // Handle both text and binary messages
+                    let text = if msg.is_text() {
+                        msg.into_text().unwrap().to_string()
+                    } else if msg.is_binary() {
+                        // Try to decode binary as UTF-8 (some exchanges send JSON as binary)
+                        match String::from_utf8(msg.into_data().to_vec()) {
+                            Ok(s) => s,
+                            Err(_) => continue, // Skip non-UTF8 binary
+                        }
+                    } else {
+                        continue; // Skip ping/pong/close frames
+                    };
+
+                    received += 1;
+
+                    match exchange.parse_message(&text) {
+                            Ok(ExchangeMessage::Orderbook { symbol, .. }) => {
+                                data_messages += 1;
+                                if data_messages <= 3 {
+                                    println!("  [{}] Orderbook for {}", data_messages, symbol);
+                                }
+                            }
+                            Ok(ExchangeMessage::Trade { symbol, .. }) => {
+                                data_messages += 1;
+                                if data_messages <= 3 {
+                                    println!("  [{}] Trade for {}", data_messages, symbol);
+                                }
+                            }
+                            Ok(ExchangeMessage::Other(_)) => {
+                                // Subscription confirmations, heartbeats, etc.
+                            }
+                            Ok(ExchangeMessage::Pong) => {}
+                            Ok(ExchangeMessage::Ping(_)) => {}
+                            Err(e) => {
+                                return Err(format!(
+                                    "Parse failed on message {}: {}\nRaw: {}",
+                                    received,
+                                    e,
+                                    &text[..text.len().min(200)]
+                                ));
+                            }
+                        }
+                }
+                Ok(Some(Err(e))) => return Err(format!("WebSocket error: {}", e)),
+                Ok(None) => return Err("Connection closed unexpectedly".to_string()),
+                Err(_) => {
+                    // Timeout on single message read, continue waiting
+                }
+            }
+        }
+
+        if data_messages < message_count {
+            return Err(format!(
+                "Only received {}/{} data messages (total messages: {})",
+                data_messages, message_count, received
+            ));
+        }
+
+        println!(
+            "Success: received {} data messages ({} total)",
+            data_messages, received
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test -- --ignored
+    async fn live_binance_smoke_test() {
+        let exchange = binance::Binance::new();
+        let result = run_smoke_test(&exchange, "btcusdt", 10).await;
+        assert!(
+            result.is_ok(),
+            "Binance smoke test failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test -- --ignored
+    async fn live_coinbase_smoke_test() {
+        let exchange = coinbase::Coinbase::new();
+        let result = run_smoke_test(&exchange, "BTC-USD", 10).await;
+        assert!(
+            result.is_ok(),
+            "Coinbase smoke test failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test -- --ignored
+    async fn live_upbit_smoke_test() {
+        let exchange = upbit::Upbit::new();
+        let result = run_smoke_test(&exchange, "KRW-BTC", 10).await;
+        assert!(
+            result.is_ok(),
+            "Upbit smoke test failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test -- --ignored
+    async fn live_okx_smoke_test() {
+        let exchange = okx::Okx::new();
+        let result = run_smoke_test(&exchange, "BTC-USDT", 10).await;
+        assert!(result.is_ok(), "OKX smoke test failed: {:?}", result.err());
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test -- --ignored
+    async fn live_bybit_smoke_test() {
+        let exchange = bybit::Bybit::new();
+        let result = run_smoke_test(&exchange, "BTCUSDT", 10).await;
+        assert!(
+            result.is_ok(),
+            "Bybit smoke test failed: {:?}",
+            result.err()
+        );
+    }
+}

@@ -2,6 +2,32 @@
 
 ## 2026-01-17
 
+### Added: Live WebSocket Smoke Tests
+
+**Files changed:** `src/exchanges/mod.rs`, `src/exchanges/upbit.rs`
+
+**Purpose:** Validate that exchange WebSocket connections and message parsing work with real API data.
+
+**Implementation:**
+- Added `run_smoke_test()` helper in `src/exchanges/mod.rs`
+- 5 smoke tests (one per exchange) marked with `#[ignore]`
+- Tests connect, subscribe to orderbook+trades, receive 10 messages, verify parsing
+
+**Usage:**
+```bash
+cargo test                            # 16 unit tests (smoke tests skipped)
+cargo test -- --ignored               # Run all 5 smoke tests
+cargo test live_binance -- --ignored  # Run single exchange test
+```
+
+**Fixes included:**
+- Upbit: Changed subscription format from "DEFAULT" to "SIMPLE" (binary → JSON text)
+- Smoke test handles both text and binary WebSocket frames (Upbit sends binary)
+
+**Verified working:** Binance, Coinbase, Upbit, OKX, Bybit
+
+---
+
 ### Improved: S3 Bucket Organization with Hierarchical Prefixes
 
 **Files changed:** `src/config.rs`, `src/archive.rs`, `src/main.rs`

@@ -45,10 +45,11 @@ impl Exchange for Upbit {
             };
 
             // Upbit uses array format for subscription
+            // Note: "SIMPLE" format sends JSON text; "DEFAULT" sends binary
             let msg = serde_json::json!([
                 {"ticket": ticket},
                 {"type": type_name, "codes": [normalized]},
-                {"format": "DEFAULT"}
+                {"format": "SIMPLE"}
             ]);
             messages.push(msg.to_string());
         }
