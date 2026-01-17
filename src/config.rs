@@ -27,6 +27,13 @@ pub struct Config {
 impl Config {
     /// Load configuration from environment variables
     pub fn from_env() -> Self {
+        let config = Self::load_from_env();
+        config.validate();
+        config
+    }
+
+    /// Internal: Load values without validation
+    fn load_from_env() -> Self {
         let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
         let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY must be set");
         let aws_region = env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
@@ -118,6 +125,47 @@ impl Config {
             ws_initial_retry_delay_secs,
             ws_max_retry_delay_secs,
             archive_interval_secs,
+        }
+    }
+
+    /// Validate configuration for conflicting or invalid values
+    fn validate(&self) {
+        // WS timeout should be > batch interval to avoid false reconnects
+        if self.ws_message_timeout_secs < self.batch_interval_secs {
+            panic!(
+                "Configuration error: WS_MESSAGE_TIMEOUT_SECS ({}) must be >= BATCH_INTERVAL ({}) to avoid false timeouts",
+                self.ws_message_timeout_secs, self.batch_interval_secs
+            );
+        }
+
+        // Archive interval should be reasonable (1 min to 24 hours)
+        if self.archive_interval_secs < 60 {
+            panic!(
+                "Configuration error: ARCHIVE_INTERVAL_SECS ({}) must be at least 60 seconds",
+                self.archive_interval_secs
+            );
+        }
+        if self.archive_interval_secs > 86400 {
+            panic!(
+                "Configuration error: ARCHIVE_INTERVAL_SECS ({}) must be at most 86400 seconds (24 hours)",
+                self.archive_interval_secs
+            );
+        }
+
+        // Retry delay should be < message timeout
+        if self.ws_initial_retry_delay_secs >= self.ws_message_timeout_secs {
+            panic!(
+                "Configuration error: WS_INITIAL_RETRY_DELAY_SECS ({}) must be < WS_MESSAGE_TIMEOUT_SECS ({})",
+                self.ws_initial_retry_delay_secs, self.ws_message_timeout_secs
+            );
+        }
+
+        // Max retry delay should be >= initial delay
+        if self.ws_max_retry_delay_secs < self.ws_initial_retry_delay_secs {
+            panic!(
+                "Configuration error: WS_MAX_RETRY_DELAY_SECS ({}) must be >= WS_INITIAL_RETRY_DELAY_SECS ({})",
+                self.ws_max_retry_delay_secs, self.ws_initial_retry_delay_secs
+            );
         }
     }
 }

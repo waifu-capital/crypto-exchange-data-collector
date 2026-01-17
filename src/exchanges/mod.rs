@@ -37,14 +37,14 @@ pub enum ExchangeMessage {
     Orderbook {
         symbol: String,
         sequence_id: String,
-        timestamp_exchange: i64, // Exchange event time in milliseconds
+        timestamp_exchange_us: i64, // Exchange event time in microseconds
         data: String,
     },
     /// Trade execution
     Trade {
         symbol: String,
         sequence_id: String,
-        timestamp_exchange: i64, // Exchange event time in milliseconds
+        timestamp_exchange_us: i64, // Exchange event time in microseconds
         data: String,
     },
     /// Ping frame that needs a pong response
@@ -204,32 +204,32 @@ mod smoke_tests {
                     received += 1;
 
                     match exchange.parse_message(&text) {
-                            Ok(ExchangeMessage::Orderbook { symbol, .. }) => {
-                                data_messages += 1;
-                                if data_messages <= 3 {
-                                    println!("  [{}] Orderbook for {}", data_messages, symbol);
-                                }
-                            }
-                            Ok(ExchangeMessage::Trade { symbol, .. }) => {
-                                data_messages += 1;
-                                if data_messages <= 3 {
-                                    println!("  [{}] Trade for {}", data_messages, symbol);
-                                }
-                            }
-                            Ok(ExchangeMessage::Other(_)) => {
-                                // Subscription confirmations, heartbeats, etc.
-                            }
-                            Ok(ExchangeMessage::Pong) => {}
-                            Ok(ExchangeMessage::Ping(_)) => {}
-                            Err(e) => {
-                                return Err(format!(
-                                    "Parse failed on message {}: {}\nRaw: {}",
-                                    received,
-                                    e,
-                                    &text[..text.len().min(200)]
-                                ));
+                        Ok(ExchangeMessage::Orderbook { symbol, .. }) => {
+                            data_messages += 1;
+                            if data_messages <= 3 {
+                                println!("  [{}] Orderbook for {}", data_messages, symbol);
                             }
                         }
+                        Ok(ExchangeMessage::Trade { symbol, .. }) => {
+                            data_messages += 1;
+                            if data_messages <= 3 {
+                                println!("  [{}] Trade for {}", data_messages, symbol);
+                            }
+                        }
+                        Ok(ExchangeMessage::Other(_)) => {
+                            // Subscription confirmations, heartbeats, etc.
+                        }
+                        Ok(ExchangeMessage::Pong) => {}
+                        Ok(ExchangeMessage::Ping(_)) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "Parse failed on message {}: {}\nRaw: {}",
+                                received,
+                                e,
+                                &text[..text.len().min(200)]
+                            ));
+                        }
+                    }
                 }
                 Ok(Some(Err(e))) => return Err(format!("WebSocket error: {}", e)),
                 Ok(None) => return Err("Connection closed unexpectedly".to_string()),

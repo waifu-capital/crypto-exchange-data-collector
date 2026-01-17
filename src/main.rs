@@ -211,17 +211,35 @@ async fn main() {
     // Signal all workers to stop
     shutdown_tx.send(()).ok();
 
-    // Wait for workers with timeout
-    let shutdown_timeout = Duration::from_secs(30);
-    match tokio::time::timeout(
-        shutdown_timeout,
+    // Per-worker timeouts (prioritize data workers)
+    let ws_timeout = Duration::from_secs(10);
+    let db_timeout = Duration::from_secs(15);  // More time to flush pending data
+    let archive_timeout = Duration::from_secs(5);  // Least priority
+
+    // Wait for workers with individual timeouts
+    let (_, _, _) = tokio::join!(
         async {
-            let _ = tokio::join!(ws_handle, db_handle, archive_handle);
+            match tokio::time::timeout(ws_timeout, ws_handle).await {
+                Ok(Ok(_)) => info!("WebSocket worker stopped cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "WebSocket worker panicked"),
+                Err(_) => warn!(timeout_secs = ws_timeout.as_secs(), "WebSocket worker shutdown timed out"),
+            }
+        },
+        async {
+            match tokio::time::timeout(db_timeout, db_handle).await {
+                Ok(Ok(_)) => info!("DB worker stopped cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "DB worker panicked"),
+                Err(_) => warn!(timeout_secs = db_timeout.as_secs(), "DB worker shutdown timed out"),
+            }
+        },
+        async {
+            match tokio::time::timeout(archive_timeout, archive_handle).await {
+                Ok(Ok(_)) => info!("Archive worker stopped cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "Archive worker panicked"),
+                Err(_) => warn!(timeout_secs = archive_timeout.as_secs(), "Archive worker shutdown timed out"),
+            }
         }
-    ).await {
-        Ok(_) => info!("All workers stopped cleanly"),
-        Err(_) => warn!("Shutdown timed out after 30 seconds, some workers may not have finished"),
-    }
+    );
 
     info!("Collector shutdown complete");
 }

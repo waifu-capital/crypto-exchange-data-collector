@@ -46,16 +46,17 @@ async fn metrics_handler() -> impl IntoResponse {
 
 /// Handler for /health endpoint - returns JSON health status
 async fn health_handler(State(conn_state): State<ConnectionState>) -> impl IntoResponse {
+    // Use integer seconds to avoid floating-point precision loss
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs_f64();
+        .as_secs();
 
-    let start_time = APP_START_TIMESTAMP.get();
-    let uptime_secs = if start_time > 0.0 {
-        now - start_time
+    let start_time = APP_START_TIMESTAMP.get() as u64;
+    let uptime_secs = if start_time > 0 {
+        now.saturating_sub(start_time)
     } else {
-        0.0
+        0
     };
 
     // Check WebSocket connections from shared state
@@ -66,25 +67,28 @@ async fn health_handler(State(conn_state): State<ConnectionState>) -> impl IntoR
 
     let messages_dropped = MESSAGES_DROPPED.get() as u64;
 
-    // Determine overall health status
-    let status = if connections_total > 0 && connections_up == connections_total {
-        "healthy"
-    } else if connections_up > 0 {
-        "degraded"
-    } else if connections_total == 0 {
-        "starting"
+    // Determine overall health status and degraded reason
+    let (status, degraded_reason) = if connections_total == 0 {
+        ("starting", None)
+    } else if connections_up == 0 {
+        ("unhealthy", None)
+    } else if connections_up < connections_total {
+        ("degraded", Some("partial_connections"))
+    } else if messages_dropped > 0 {
+        ("degraded", Some("backpressure"))
     } else {
-        "unhealthy"
+        ("healthy", None)
     };
 
     let health = json!({
         "status": status,
-        "uptime_seconds": uptime_secs as u64,
+        "uptime_seconds": uptime_secs,
         "connections": {
             "up": connections_up,
             "total": connections_total
         },
-        "messages_dropped": messages_dropped
+        "messages_dropped": messages_dropped,
+        "degraded_reason": degraded_reason
     });
 
     let status_code = match status {

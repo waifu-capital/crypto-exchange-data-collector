@@ -1,10 +1,14 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+
+/// Track last successfully archived max timestamp to prevent duplicates
+static LAST_ARCHIVE_MAX_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 use chrono::Utc;
 use itertools::multiunzip;
 use polars::prelude::*;
@@ -175,6 +179,24 @@ pub async fn archive_snapshots(
         Vec<String>,
     ) = multiunzip(snapshots);
 
+    // Get max timestamp from this batch for duplicate prevention
+    let max_collector_ts = timestamps_collector.iter().copied().max().unwrap_or(0);
+    let last_archived = LAST_ARCHIVE_MAX_TIMESTAMP.load(Ordering::SeqCst);
+
+    // Check if this data was already archived (retry scenario after failed verification)
+    if max_collector_ts > 0 && max_collector_ts <= last_archived {
+        warn!(
+            last_archived,
+            current_max = max_collector_ts,
+            "Skipping archive - data appears to already be archived (retry scenario)"
+        );
+        // Delete from DB since data is already in S3
+        if let Err(e) = delete_all_snapshots(db_pool).await {
+            error!(error = %e, "Failed to clean up already-archived snapshots from database");
+        }
+        return;
+    }
+
     // Create DataFrame from extracted columns
     let mut df = match DataFrame::new(vec![
         Column::new("exchange".into(), exchanges),
@@ -305,6 +327,10 @@ pub async fn archive_snapshots(
             if let Err(e) = delete_all_snapshots(db_pool).await {
                 error!(error = %e, "Failed to delete snapshots from database");
                 // Data is safe in S3, but duplicates may occur next cycle
+            } else {
+                // Only update last archived timestamp after successful DB delete
+                // This prevents the same data from being skipped if delete fails
+                LAST_ARCHIVE_MAX_TIMESTAMP.store(max_collector_ts, Ordering::SeqCst);
             }
             if let Err(e) = std::fs::remove_file(&archive_file_path) {
                 warn!(

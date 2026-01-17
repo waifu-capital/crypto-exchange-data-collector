@@ -81,17 +81,18 @@ impl Exchange for Upbit {
                     .or_else(|| json.get("timestamp"))
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "0".to_string());
-                // tms = timestamp in milliseconds
-                let timestamp_exchange = json
+                // tms = timestamp in milliseconds, convert to μs
+                let timestamp_exchange_us = json
                     .get("tms")
                     .or_else(|| json.get("timestamp"))
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    * 1000;
 
                 Ok(ExchangeMessage::Orderbook {
                     symbol,
                     sequence_id,
-                    timestamp_exchange,
+                    timestamp_exchange_us,
                     data: msg.to_string(),
                 })
             }
@@ -113,17 +114,18 @@ impl Exchange for Upbit {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "0".to_string())
                     });
-                // ttms = trade timestamp in milliseconds
-                let timestamp_exchange = json
+                // ttms = trade timestamp in milliseconds, convert to μs
+                let timestamp_exchange_us = json
                     .get("ttms")
                     .or_else(|| json.get("trade_timestamp"))
                     .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                    .unwrap_or(0)
+                    * 1000;
 
                 Ok(ExchangeMessage::Trade {
                     symbol,
                     sequence_id,
-                    timestamp_exchange,
+                    timestamp_exchange_us,
                     data: msg.to_string(),
                 })
             }
@@ -195,9 +197,9 @@ mod tests {
         let msg = r#"{"ty":"orderbook","cd":"KRW-BTC","tms":1672515782136,"tas":12.345,"tbs":23.456,"obu":[{"ap":50000000,"as":0.1,"bp":49999000,"bs":0.2}]}"#;
         let result = upbit.parse_message(msg).unwrap();
         match result {
-            ExchangeMessage::Orderbook { symbol, timestamp_exchange, .. } => {
+            ExchangeMessage::Orderbook { symbol, timestamp_exchange_us, .. } => {
                 assert_eq!(symbol, "KRW-BTC");
-                assert_eq!(timestamp_exchange, 1672515782136);
+                assert_eq!(timestamp_exchange_us, 1672515782136000); // microseconds
             }
             _ => panic!("Expected Orderbook message"),
         }
@@ -212,12 +214,12 @@ mod tests {
             ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
-                timestamp_exchange,
+                timestamp_exchange_us,
                 ..
             } => {
                 assert_eq!(symbol, "KRW-BTC");
                 assert_eq!(sequence_id, "12345");
-                assert_eq!(timestamp_exchange, 1672515782136);
+                assert_eq!(timestamp_exchange_us, 1672515782136000); // microseconds
             }
             _ => panic!("Expected Trade message"),
         }

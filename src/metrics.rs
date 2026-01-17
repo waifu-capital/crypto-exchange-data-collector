@@ -74,10 +74,11 @@ lazy_static! {
         "Total snapshots successfully written to database"
     ).expect("Failed to register DB_SNAPSHOTS_WRITTEN");
 
-    /// Database insert errors
-    pub static ref DB_INSERT_ERRORS: Counter = register_counter!(
+    /// Database insert errors by type
+    pub static ref DB_INSERT_ERRORS: CounterVec = register_counter_vec!(
         "collector_db_insert_errors_total",
-        "Total database insert errors"
+        "Database insert errors by type",
+        &["error_type"]  // "duplicate", "constraint", "io", "other"
     ).expect("Failed to register DB_INSERT_ERRORS");
 
     // ===================
@@ -117,7 +118,7 @@ lazy_static! {
     ).expect("Failed to register S3_UPLOAD_RETRIES");
 
     // ===================
-    // Sequence Gap Metrics
+    // Sequence Metrics
     // ===================
 
     /// Total sequence gaps detected
@@ -134,6 +135,31 @@ lazy_static! {
         &["exchange", "symbol", "data_type"],
         vec![1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
     ).expect("Failed to register SEQUENCE_GAP_SIZE");
+
+    /// Out-of-order messages detected
+    pub static ref SEQUENCE_OUT_OF_ORDER: CounterVec = register_counter_vec!(
+        "collector_sequence_out_of_order_total",
+        "Out-of-order messages detected",
+        &["exchange", "symbol", "data_type"]
+    ).expect("Failed to register SEQUENCE_OUT_OF_ORDER");
+
+    /// Duplicate sequence IDs detected
+    pub static ref SEQUENCE_DUPLICATES: CounterVec = register_counter_vec!(
+        "collector_sequence_duplicates_total",
+        "Duplicate sequence IDs detected",
+        &["exchange", "symbol", "data_type"]
+    ).expect("Failed to register SEQUENCE_DUPLICATES");
+
+    // ===================
+    // Parse Metrics
+    // ===================
+
+    /// Parse error circuit breaker activations
+    pub static ref PARSE_CIRCUIT_BREAKS: CounterVec = register_counter_vec!(
+        "collector_parse_circuit_breaks_total",
+        "Parse error circuit breaker activations",
+        &["exchange"]
+    ).expect("Failed to register PARSE_CIRCUIT_BREAKS");
 
     // ===================
     // Latency Metrics
@@ -173,10 +199,11 @@ lazy_static! {
 pub fn init_metrics() {
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    // Use integer seconds to avoid floating-point precision loss
     let start_time = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("System time before Unix epoch")
-        .as_secs_f64();
+        .as_secs() as f64;
 
     APP_START_TIMESTAMP.set(start_time);
 }

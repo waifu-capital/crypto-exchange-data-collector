@@ -119,8 +119,12 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
         .execute(&mut *tx)
         .await {
             insert_errors += 1;
-            DB_INSERT_ERRORS.inc();
-            error!(error = %e, "Failed to insert snapshot");
+            let error_type = categorize_sqlx_error(&e);
+            DB_INSERT_ERRORS.with_label_values(&[error_type]).inc();
+            // Only log non-duplicate errors (duplicates are expected with INSERT OR IGNORE)
+            if error_type != "duplicate" {
+                error!(error = %e, error_type, "Failed to insert snapshot");
+            }
         }
     }
 
@@ -182,4 +186,18 @@ pub async fn delete_all_snapshots(db_pool: &SqlitePool) -> Result<(), sqlx::Erro
         .execute(db_pool)
         .await?;
     Ok(())
+}
+
+/// Categorize a SQLx error for metrics tracking
+fn categorize_sqlx_error(e: &sqlx::Error) -> &'static str {
+    let msg = e.to_string().to_lowercase();
+    if msg.contains("unique constraint") || msg.contains("duplicate") {
+        "duplicate"
+    } else if msg.contains("constraint") {
+        "constraint"
+    } else if msg.contains("i/o") || msg.contains("disk") || msg.contains("readonly") {
+        "io"
+    } else {
+        "other"
+    }
 }

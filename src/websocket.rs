@@ -1,6 +1,7 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
+use rand::Rng;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
@@ -10,9 +11,10 @@ use tracing::{debug, error, info, warn};
 use crate::exchanges::{Exchange, ExchangeMessage, FeedType};
 use crate::metrics::{
     LAST_MESSAGE_TIMESTAMP, LATENCY_EXCHANGE_TO_COLLECTOR, MESSAGES_DROPPED, MESSAGES_RECEIVED,
-    MESSAGE_TIMEOUTS, SEQUENCE_GAPS, SEQUENCE_GAP_SIZE, WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
+    MESSAGE_TIMEOUTS, PARSE_CIRCUIT_BREAKS, SEQUENCE_DUPLICATES, SEQUENCE_GAPS, SEQUENCE_GAP_SIZE,
+    SEQUENCE_OUT_OF_ORDER, WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
 };
-use crate::models::{ConnectionState, SequenceTracker, SnapshotData};
+use crate::models::{ConnectionState, SequenceCheckResult, SequenceTracker, SnapshotData};
 
 /// WebSocket connection configuration
 #[derive(Clone)]
@@ -25,7 +27,7 @@ pub struct WsConfig {
     pub max_retry_delay_secs: u64,
 }
 
-/// Exponential backoff helper for connection retries.
+/// Exponential backoff helper for connection retries with jitter.
 struct ExponentialBackoff {
     current_delay: Duration,
     max_delay: Duration,
@@ -41,16 +43,79 @@ impl ExponentialBackoff {
         }
     }
 
-    /// Returns the next delay and doubles it for the next call (capped at max_delay).
+    /// Returns the next delay with jitter (±25%) and doubles it for the next call.
     fn next_delay(&mut self) -> Duration {
-        let delay = self.current_delay;
+        let base_delay = self.current_delay;
         self.current_delay = (self.current_delay * 2).min(self.max_delay);
-        delay
+
+        // Add jitter: 75% to 125% of base delay to prevent thundering herd
+        let jitter_factor = rand::rng().random_range(0.75..1.25);
+        Duration::from_secs_f64(base_delay.as_secs_f64() * jitter_factor)
     }
 
     /// Resets the backoff to the initial delay (call after successful connection).
     fn reset(&mut self) {
         self.current_delay = self.initial_delay;
+    }
+}
+
+/// Tracks parse error rate for circuit breaker functionality.
+/// If error rate exceeds threshold, triggers a reconnect.
+struct ParseErrorTracker {
+    /// Errors in current window
+    window_errors: u32,
+    /// Total messages in current window
+    window_total: u32,
+    /// When current window started
+    window_start: Instant,
+    /// Window duration before reset
+    window_duration: Duration,
+    /// Error ratio threshold to trip circuit (e.g., 0.5 = 50%)
+    threshold_ratio: f64,
+    /// Minimum sample size before checking ratio
+    min_samples: u32,
+}
+
+impl ParseErrorTracker {
+    fn new() -> Self {
+        Self {
+            window_errors: 0,
+            window_total: 0,
+            window_start: Instant::now(),
+            window_duration: Duration::from_secs(60),
+            threshold_ratio: 0.5,
+            min_samples: 100,
+        }
+    }
+
+    /// Reset window if expired
+    fn maybe_reset_window(&mut self) {
+        if self.window_start.elapsed() > self.window_duration {
+            self.window_errors = 0;
+            self.window_total = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    /// Record a successful parse
+    fn record_success(&mut self) {
+        self.maybe_reset_window();
+        self.window_total += 1;
+    }
+
+    /// Record a parse error. Returns true if circuit should trip.
+    fn record_error(&mut self) -> bool {
+        self.maybe_reset_window();
+        self.window_total += 1;
+        self.window_errors += 1;
+
+        // Only check ratio after minimum samples
+        if self.window_total >= self.min_samples {
+            let error_rate = self.window_errors as f64 / self.window_total as f64;
+            error_rate >= self.threshold_ratio
+        } else {
+            false
+        }
     }
 }
 
@@ -89,6 +154,8 @@ pub async fn websocket_worker(
 
     // Sequence tracker for gap detection
     let mut seq_tracker = SequenceTracker::new();
+    // Parse error tracker for circuit breaker
+    let mut parse_tracker = ParseErrorTracker::new();
 
     info!(
         exchange = exchange_name,
@@ -192,10 +259,11 @@ pub async fn websocket_worker(
                                     Ok(ExchangeMessage::Orderbook {
                                         symbol: sym,
                                         sequence_id,
-                                        timestamp_exchange,
+                                        timestamp_exchange_us,
                                         data,
                                     }) => {
-                                        let collector_time_ms = now_millis();
+                                        // Use same timestamp for collector and latency calculation
+                                        let collector_time_us = now_micros();
                                         MESSAGES_RECEIVED
                                             .with_label_values(&[
                                                 exchange_name,
@@ -208,39 +276,67 @@ pub async fn websocket_worker(
                                             &normalized_symbol,
                                         );
 
-                                        // Record latency (only positive values, clock skew can cause negative)
-                                        if timestamp_exchange > 0 {
-                                            let latency = collector_time_ms - timestamp_exchange;
-                                            if latency > 0 {
+                                        // Record latency in ms (only positive values, clock skew can cause negative)
+                                        if timestamp_exchange_us > 0 {
+                                            let latency_us = collector_time_us - timestamp_exchange_us;
+                                            if latency_us > 0 {
+                                                // Report latency in milliseconds for readability
                                                 LATENCY_EXCHANGE_TO_COLLECTOR
                                                     .with_label_values(&[exchange_name, &normalized_symbol, "orderbook"])
-                                                    .observe(latency as f64);
+                                                    .observe((latency_us / 1000) as f64);
                                             }
                                         }
 
-                                        // Check for sequence gaps
-                                        if let Some(gap) = seq_tracker.check(
+                                        // Check for sequence anomalies
+                                        match seq_tracker.check(
                                             exchange_name,
                                             &sym,
                                             "orderbook",
                                             &sequence_id,
-                                            collector_time_ms,
+                                            collector_time_us,
                                         ) {
-                                            SEQUENCE_GAPS
-                                                .with_label_values(&[exchange_name, &sym, "orderbook"])
-                                                .inc();
-                                            SEQUENCE_GAP_SIZE
-                                                .with_label_values(&[exchange_name, &sym, "orderbook"])
-                                                .observe(gap.gap_size as f64);
-                                            warn!(
-                                                exchange = exchange_name,
-                                                symbol = %sym,
-                                                data_type = "orderbook",
-                                                expected = gap.expected,
-                                                received = gap.received,
-                                                gap_size = gap.gap_size,
-                                                "Sequence gap detected"
-                                            );
+                                            SequenceCheckResult::Gap(gap) => {
+                                                SEQUENCE_GAPS
+                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
+                                                    .inc();
+                                                SEQUENCE_GAP_SIZE
+                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
+                                                    .observe(gap.gap_size as f64);
+                                                warn!(
+                                                    exchange = exchange_name,
+                                                    symbol = %sym,
+                                                    data_type = "orderbook",
+                                                    expected = gap.expected,
+                                                    received = gap.received,
+                                                    gap_size = gap.gap_size,
+                                                    "Sequence gap detected"
+                                                );
+                                            }
+                                            SequenceCheckResult::OutOfOrder { expected, received } => {
+                                                SEQUENCE_OUT_OF_ORDER
+                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
+                                                    .inc();
+                                                warn!(
+                                                    exchange = exchange_name,
+                                                    symbol = %sym,
+                                                    data_type = "orderbook",
+                                                    expected,
+                                                    received,
+                                                    "Out-of-order sequence detected"
+                                                );
+                                            }
+                                            SequenceCheckResult::Duplicate { seq } => {
+                                                SEQUENCE_DUPLICATES
+                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
+                                                    .inc();
+                                                debug!(
+                                                    exchange = exchange_name,
+                                                    symbol = %sym,
+                                                    seq,
+                                                    "Duplicate sequence detected"
+                                                );
+                                            }
+                                            SequenceCheckResult::Ok => {}
                                         }
 
                                         save_snapshot(
@@ -249,17 +345,20 @@ pub async fn websocket_worker(
                                             &sym,
                                             "orderbook",
                                             &sequence_id,
-                                            timestamp_exchange,
+                                            collector_time_us,
+                                            timestamp_exchange_us,
                                             &data,
                                         );
+                                        parse_tracker.record_success();
                                     }
                                     Ok(ExchangeMessage::Trade {
                                         symbol: sym,
                                         sequence_id,
-                                        timestamp_exchange,
+                                        timestamp_exchange_us,
                                         data,
                                     }) => {
-                                        let collector_time_ms = now_millis();
+                                        // Use same timestamp for collector and latency calculation
+                                        let collector_time_us = now_micros();
                                         MESSAGES_RECEIVED
                                             .with_label_values(&[
                                                 exchange_name,
@@ -272,39 +371,67 @@ pub async fn websocket_worker(
                                             &normalized_symbol,
                                         );
 
-                                        // Record latency (only positive values, clock skew can cause negative)
-                                        if timestamp_exchange > 0 {
-                                            let latency = collector_time_ms - timestamp_exchange;
-                                            if latency > 0 {
+                                        // Record latency in ms (only positive values, clock skew can cause negative)
+                                        if timestamp_exchange_us > 0 {
+                                            let latency_us = collector_time_us - timestamp_exchange_us;
+                                            if latency_us > 0 {
+                                                // Report latency in milliseconds for readability
                                                 LATENCY_EXCHANGE_TO_COLLECTOR
                                                     .with_label_values(&[exchange_name, &normalized_symbol, "trade"])
-                                                    .observe(latency as f64);
+                                                    .observe((latency_us / 1000) as f64);
                                             }
                                         }
 
-                                        // Check for sequence gaps
-                                        if let Some(gap) = seq_tracker.check(
+                                        // Check for sequence anomalies
+                                        match seq_tracker.check(
                                             exchange_name,
                                             &sym,
                                             "trade",
                                             &sequence_id,
-                                            collector_time_ms,
+                                            collector_time_us,
                                         ) {
-                                            SEQUENCE_GAPS
-                                                .with_label_values(&[exchange_name, &sym, "trade"])
-                                                .inc();
-                                            SEQUENCE_GAP_SIZE
-                                                .with_label_values(&[exchange_name, &sym, "trade"])
-                                                .observe(gap.gap_size as f64);
-                                            warn!(
-                                                exchange = exchange_name,
-                                                symbol = %sym,
-                                                data_type = "trade",
-                                                expected = gap.expected,
-                                                received = gap.received,
-                                                gap_size = gap.gap_size,
-                                                "Sequence gap detected"
-                                            );
+                                            SequenceCheckResult::Gap(gap) => {
+                                                SEQUENCE_GAPS
+                                                    .with_label_values(&[exchange_name, &sym, "trade"])
+                                                    .inc();
+                                                SEQUENCE_GAP_SIZE
+                                                    .with_label_values(&[exchange_name, &sym, "trade"])
+                                                    .observe(gap.gap_size as f64);
+                                                warn!(
+                                                    exchange = exchange_name,
+                                                    symbol = %sym,
+                                                    data_type = "trade",
+                                                    expected = gap.expected,
+                                                    received = gap.received,
+                                                    gap_size = gap.gap_size,
+                                                    "Sequence gap detected"
+                                                );
+                                            }
+                                            SequenceCheckResult::OutOfOrder { expected, received } => {
+                                                SEQUENCE_OUT_OF_ORDER
+                                                    .with_label_values(&[exchange_name, &sym, "trade"])
+                                                    .inc();
+                                                warn!(
+                                                    exchange = exchange_name,
+                                                    symbol = %sym,
+                                                    data_type = "trade",
+                                                    expected,
+                                                    received,
+                                                    "Out-of-order sequence detected"
+                                                );
+                                            }
+                                            SequenceCheckResult::Duplicate { seq } => {
+                                                SEQUENCE_DUPLICATES
+                                                    .with_label_values(&[exchange_name, &sym, "trade"])
+                                                    .inc();
+                                                debug!(
+                                                    exchange = exchange_name,
+                                                    symbol = %sym,
+                                                    seq,
+                                                    "Duplicate sequence detected"
+                                                );
+                                            }
+                                            SequenceCheckResult::Ok => {}
                                         }
 
                                         save_snapshot(
@@ -313,9 +440,11 @@ pub async fn websocket_worker(
                                             &sym,
                                             "trade",
                                             &sequence_id,
-                                            timestamp_exchange,
+                                            collector_time_us,
+                                            timestamp_exchange_us,
                                             &data,
                                         );
+                                        parse_tracker.record_success();
                                     }
                                     Ok(ExchangeMessage::Ping(data)) => {
                                         debug!(
@@ -339,6 +468,15 @@ pub async fn websocket_worker(
                                         );
                                     }
                                     Err(e) => {
+                                        if parse_tracker.record_error() {
+                                            error!(
+                                                exchange = exchange_name,
+                                                error_rate = "50%+",
+                                                "Circuit breaker tripped - too many parse errors, reconnecting"
+                                            );
+                                            PARSE_CIRCUIT_BREAKS.with_label_values(&[exchange_name]).inc();
+                                            break;  // Exit message loop to trigger reconnect
+                                        }
                                         warn!(
                                             exchange = exchange_name,
                                             error = %e,
@@ -434,24 +572,25 @@ pub async fn websocket_worker(
     }
 }
 
-/// Get current time in milliseconds since epoch
-fn now_millis() -> i64 {
+/// Get current time in microseconds since epoch
+fn now_micros() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
-        .as_millis() as i64
+        .as_micros() as i64
 }
 
-/// Update the last message timestamp metric
+/// Update the last message timestamp metric (integer seconds for precision)
 fn update_last_message_timestamp(exchange: &str, symbol: &str) {
+    // Use integer seconds to avoid floating-point precision loss
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as f64;
+
     LAST_MESSAGE_TIMESTAMP
         .with_label_values(&[exchange, symbol])
-        .set(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64(),
-        );
+        .set(now_secs);
 }
 
 /// Save a snapshot to the channel for database processing
@@ -461,7 +600,8 @@ fn save_snapshot(
     symbol: &str,
     data_type: &str,
     exchange_sequence_id: &str,
-    timestamp_exchange: i64,
+    timestamp_collector_us: i64,
+    timestamp_exchange_us: i64,
     raw_data: &str,
 ) {
     let data = SnapshotData {
@@ -469,11 +609,8 @@ fn save_snapshot(
         symbol: symbol.to_string(),
         data_type: data_type.to_string(),
         exchange_sequence_id: exchange_sequence_id.to_string(),
-        timestamp_collector: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as i64,
-        timestamp_exchange,
+        timestamp_collector: timestamp_collector_us,
+        timestamp_exchange: timestamp_exchange_us,
         data: raw_data.to_string(),
     };
 

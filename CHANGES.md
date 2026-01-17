@@ -2,6 +2,142 @@
 
 ## 2026-01-17
 
+### Added: Quant Expert Review Round 2 Fixes
+
+**Files changed:** `src/models.rs`, `src/metrics.rs`, `src/websocket.rs`, `src/db.rs`, `src/archive.rs`, `src/http.rs`, `src/config.rs`, `src/main.rs`, `src/exchanges/mod.rs`, `src/exchanges/binance.rs`, `src/exchanges/coinbase.rs`, `src/exchanges/upbit.rs`, `src/exchanges/okx.rs`, `src/exchanges/bybit.rs`
+
+**Purpose:** Implement 11 fixes from second quant expert review (3 HIGH, 7 MEDIUM, 1 LOW priority).
+
+#### HIGH Priority Fixes
+
+**1. Backwards Sequence Detection**
+
+Problem: `SequenceTracker::check()` only detected forward gaps. Out-of-order (seq < last) and duplicate (seq == last) messages went undetected.
+
+Solution:
+- Added `SequenceCheckResult` enum with `Ok`, `Gap`, `OutOfOrder`, `Duplicate` variants
+- Out-of-order messages don't update `last_seen` (preserves gap detection)
+- New metrics: `collector_sequence_out_of_order_total`, `collector_sequence_duplicates_total`
+
+**2. Timestamp Precision Mismatch**
+
+Problem: `timestamp_collector` stored in microseconds, `timestamp_exchange` in milliseconds. Latency calculated with separate `now_millis()` call.
+
+Solution:
+- All timestamps now in **microseconds** (μs)
+- Exchange parsers convert ms → μs at parse time (`* 1000`)
+- Same `collector_time_us` used for storage AND latency calculation
+- Renamed field to `timestamp_exchange_us` in `ExchangeMessage` enum
+
+**3. Unbounded Memory in SequenceTracker**
+
+Problem: `HashMap<String, i64>` grows forever. Watching many symbols = memory leak.
+
+Solution:
+- Added LRU-style eviction with `VecDeque` for insertion order
+- Default max 10,000 entries (configurable via `with_max_entries()`)
+- Oldest keys evicted when capacity reached
+
+#### MEDIUM Priority Fixes
+
+**4. Channel Backpressure in Health Check**
+
+Problem: `/health` didn't reflect dropped messages.
+
+Solution:
+- Added `messages_dropped` field to health response
+- Status changes to `"degraded"` with `degraded_reason: "backpressure"` when drops > 0
+- Also shows `"degraded"` with `degraded_reason: "partial_connections"` for partial WS failures
+
+**5. Archive Duplicate Prevention**
+
+Problem: If S3 verify failed, next cycle uploaded same data with different timestamp = duplicates.
+
+Solution:
+- Track `LAST_ARCHIVE_MAX_TIMESTAMP` (AtomicI64)
+- Skip archive if current batch max timestamp <= last archived
+- Only update after successful verification AND DB delete
+
+**6. Config Parameter Validation**
+
+Problem: Conflicting config values caused mysterious failures.
+
+Solution: Added `validate()` method that panics with helpful messages:
+- `WS_MESSAGE_TIMEOUT_SECS >= BATCH_INTERVAL` (avoid false timeouts)
+- `ARCHIVE_INTERVAL_SECS` between 60-86400 seconds
+- `WS_INITIAL_RETRY_DELAY_SECS < WS_MESSAGE_TIMEOUT_SECS`
+- `WS_MAX_RETRY_DELAY_SECS >= WS_INITIAL_RETRY_DELAY_SECS`
+
+**7. Floating-Point Timestamp Precision**
+
+Problem: `as_secs_f64()` loses precision for large timestamps.
+
+Solution: Use integer seconds (`as_secs() as f64`) for metrics where sub-second precision isn't needed:
+- `LAST_MESSAGE_TIMESTAMP` gauge
+- `APP_START_TIMESTAMP` gauge
+- Health endpoint uptime calculation
+
+**8. Parse Error Circuit Breaker**
+
+Problem: Format changes caused millions of warnings but collector kept running with garbage data.
+
+Solution:
+- Added `ParseErrorTracker` with sliding 60-second window
+- Trips at 50% error rate (min 100 samples)
+- On trip: logs error, increments `collector_parse_circuit_breaks_total`, triggers reconnect
+- Window resets after duration expires
+
+**9. DB Error Categorization**
+
+Problem: Couldn't distinguish normal duplicate rejections from actual DB errors.
+
+Solution:
+- `DB_INSERT_ERRORS` changed from Counter to CounterVec with `error_type` label
+- Categories: `"duplicate"`, `"constraint"`, `"io"`, `"other"`
+- Added `categorize_sqlx_error()` function
+- Only logs non-duplicate errors (duplicates are expected on reconnect)
+
+**10. Per-Worker Shutdown Timeouts**
+
+Problem: One stuck worker blocked all others from clean shutdown.
+
+Solution: Individual timeouts with `tokio::time::timeout`:
+- WebSocket: 10 seconds
+- DB worker: 15 seconds (more time to flush)
+- Archive: 5 seconds (lowest priority)
+
+#### LOW Priority Fix
+
+**11. Jitter in Exponential Backoff**
+
+Problem: All reconnects at exact intervals (1s, 2s, 4s) = thundering herd.
+
+Solution:
+- Added ±25% random jitter using `rand::rng().random_range(0.75..1.25)`
+- Applied to `ExponentialBackoff::next_delay()`
+
+#### New Prometheus Metrics
+
+```
+collector_sequence_out_of_order_total{exchange,symbol,data_type}
+collector_sequence_duplicates_total{exchange,symbol,data_type}
+collector_parse_circuit_breaks_total{exchange}
+collector_db_insert_errors_total{error_type}  # was Counter, now CounterVec
+```
+
+#### Verification
+
+```bash
+cargo build   # Compiles with warnings (unused code only)
+cargo test    # 16 tests pass, 5 ignored (live smoke tests)
+```
+
+**Breaking changes:**
+- `timestamp_exchange` column now stores microseconds (was milliseconds)
+- Delete existing `.db` file before running
+
+---
+
 ### Added: Production Hardening for Quant Systems
 
 **Files changed:** `src/models.rs`, `src/db.rs`, `src/websocket.rs`, `src/archive.rs`, `src/main.rs`, `src/metrics.rs`, `src/exchanges/mod.rs`, `src/exchanges/binance.rs`, `src/exchanges/coinbase.rs`, `src/exchanges/upbit.rs`, `src/exchanges/okx.rs`, `src/exchanges/bybit.rs`
