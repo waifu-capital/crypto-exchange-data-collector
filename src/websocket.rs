@@ -1,13 +1,21 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
 
+use crate::exchanges::{Exchange, ExchangeMessage, FeedType};
+use crate::metrics::{
+    LAST_MESSAGE_TIMESTAMP, MESSAGES_DROPPED, MESSAGES_RECEIVED, MESSAGE_TIMEOUTS,
+    WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
+};
+use crate::models::{ConnectionState, SnapshotData};
+
 /// WebSocket connection configuration
+#[derive(Clone)]
 pub struct WsConfig {
     /// Timeout for receiving WebSocket messages (seconds)
     pub message_timeout_secs: u64,
@@ -46,61 +54,84 @@ impl ExponentialBackoff {
     }
 }
 
-use crate::metrics::{
-    LAST_MESSAGE_TIMESTAMP, MESSAGES_DROPPED, MESSAGES_RECEIVED, MESSAGE_TIMEOUTS,
-    WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
-};
-use crate::models::{ConnectionState, SnapshotData};
-
 /// Helper to update connection state
-async fn set_connection_status(conn_state: &ConnectionState, exchange: &str, symbol: &str, connected: bool) {
+async fn set_connection_status(
+    conn_state: &ConnectionState,
+    exchange: &str,
+    symbol: &str,
+    connected: bool,
+) {
     let key = format!("{}:{}", exchange, symbol);
     conn_state.write().await.insert(key, connected);
 }
 
-/// WebSocket worker that connects to Binance and streams orderbook data
+/// WebSocket worker that connects to an exchange and streams market data.
+///
+/// This is a generic worker that works with any exchange implementing the `Exchange` trait.
+/// It handles connection management, message parsing, and forwards data to the database channel.
 pub async fn websocket_worker(
+    exchange: Box<dyn Exchange>,
     db_tx: Sender<SnapshotData>,
-    market_symbol: String,
+    symbol: String,
+    feeds: Vec<FeedType>,
     ws_config: WsConfig,
     conn_state: ConnectionState,
 ) {
-    let url = format!(
-        "wss://stream.binance.com:9443/ws/{}@depth20@100ms",
-        market_symbol.to_lowercase()
-    );
+    let exchange_name = exchange.name();
+    let normalized_symbol = exchange.normalize_symbol(&symbol);
+    let url = exchange.websocket_url(&symbol);
     let message_timeout = Duration::from_secs(ws_config.message_timeout_secs);
     let mut backoff = ExponentialBackoff::new(
         ws_config.initial_retry_delay_secs,
         ws_config.max_retry_delay_secs,
     );
 
+    info!(
+        exchange = exchange_name,
+        symbol = %normalized_symbol,
+        url = %url,
+        feeds = ?feeds,
+        "Starting WebSocket worker"
+    );
+
     loop {
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
-                info!(symbol = %market_symbol, "Connected to Binance WebSocket");
+                info!(
+                    exchange = exchange_name,
+                    symbol = %normalized_symbol,
+                    "Connected to WebSocket"
+                );
                 WEBSOCKET_CONNECTED
-                    .with_label_values(&["binance", &market_symbol])
+                    .with_label_values(&[exchange_name, &normalized_symbol])
                     .set(1.0);
-                set_connection_status(&conn_state, "binance", &market_symbol, true).await;
-                backoff.reset(); // Reset backoff on successful connection
+                set_connection_status(&conn_state, exchange_name, &normalized_symbol, true).await;
+                backoff.reset();
+
                 let (mut write, mut read) = ws_stream.split();
+
+                // Send subscription messages
+                let subscribe_msgs = exchange.build_subscribe_messages(&symbol, &feeds);
+                for msg in subscribe_msgs {
+                    debug!(
+                        exchange = exchange_name,
+                        message = %msg,
+                        "Sending subscription message"
+                    );
+                    if let Err(e) = write.send(Message::Text(msg.into())).await {
+                        error!(
+                            exchange = exchange_name,
+                            error = %e,
+                            "Failed to send subscription message"
+                        );
+                        break;
+                    }
+                }
 
                 loop {
                     match timeout(message_timeout, read.next()).await {
                         Ok(Some(Ok(msg))) => {
                             if msg.is_text() {
-                                // Sample log ~0.1% of messages at debug level
-                                if rand::random::<u32>() % 1000 == 0 {
-                                    if let Ok(preview) = msg.to_text() {
-                                        let preview_len = preview.len().min(50);
-                                        debug!(
-                                            preview = &preview[..preview_len],
-                                            "Received orderbook message"
-                                        );
-                                    }
-                                }
-
                                 let text = match msg.into_text() {
                                     Ok(t) => t,
                                     Err(e) => {
@@ -109,77 +140,152 @@ pub async fn websocket_worker(
                                     }
                                 };
 
-                                let snapshot: Value = match serde_json::from_str(&text) {
-                                    Ok(v) => v,
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to parse JSON");
-                                        continue;
-                                    }
-                                };
-
-                                let exchange_sequence_id = snapshot["lastUpdateId"].to_string();
-
-                                // Update metrics
-                                MESSAGES_RECEIVED
-                                    .with_label_values(&["binance", &market_symbol, "orderbook"])
-                                    .inc();
-                                LAST_MESSAGE_TIMESTAMP
-                                    .with_label_values(&["binance", &market_symbol])
-                                    .set(
-                                        SystemTime::now()
-                                            .duration_since(UNIX_EPOCH)
-                                            .unwrap()
-                                            .as_secs_f64(),
+                                // Sample log ~0.1% of messages at debug level
+                                if rand::random::<u32>() % 1000 == 0 {
+                                    let preview_len = text.len().min(80);
+                                    debug!(
+                                        exchange = exchange_name,
+                                        preview = &text[..preview_len],
+                                        "Received message"
                                     );
+                                }
 
-                                save_snapshot(
-                                    &db_tx,
-                                    "binance",
-                                    &market_symbol,
-                                    "orderbook",
-                                    &exchange_sequence_id,
-                                    &text,
-                                );
+                                // Parse message using exchange-specific logic
+                                match exchange.parse_message(&text) {
+                                    Ok(ExchangeMessage::Orderbook {
+                                        symbol: sym,
+                                        sequence_id,
+                                        data,
+                                    }) => {
+                                        MESSAGES_RECEIVED
+                                            .with_label_values(&[
+                                                exchange_name,
+                                                &normalized_symbol,
+                                                "orderbook",
+                                            ])
+                                            .inc();
+                                        update_last_message_timestamp(
+                                            exchange_name,
+                                            &normalized_symbol,
+                                        );
+                                        save_snapshot(
+                                            &db_tx,
+                                            exchange_name,
+                                            &sym,
+                                            "orderbook",
+                                            &sequence_id,
+                                            &data,
+                                        );
+                                    }
+                                    Ok(ExchangeMessage::Trade {
+                                        symbol: sym,
+                                        sequence_id,
+                                        data,
+                                    }) => {
+                                        MESSAGES_RECEIVED
+                                            .with_label_values(&[
+                                                exchange_name,
+                                                &normalized_symbol,
+                                                "trade",
+                                            ])
+                                            .inc();
+                                        update_last_message_timestamp(
+                                            exchange_name,
+                                            &normalized_symbol,
+                                        );
+                                        save_snapshot(
+                                            &db_tx,
+                                            exchange_name,
+                                            &sym,
+                                            "trade",
+                                            &sequence_id,
+                                            &data,
+                                        );
+                                    }
+                                    Ok(ExchangeMessage::Ping(data)) => {
+                                        debug!(
+                                            exchange = exchange_name,
+                                            "Received ping, sending pong"
+                                        );
+                                        if let Err(e) = write.send(Message::Pong(data.into())).await {
+                                            error!(error = %e, "Failed to send pong");
+                                            break;
+                                        }
+                                    }
+                                    Ok(ExchangeMessage::Pong) => {
+                                        debug!(exchange = exchange_name, "Received pong");
+                                    }
+                                    Ok(ExchangeMessage::Other(other)) => {
+                                        // Subscription confirmations, heartbeats, etc.
+                                        debug!(
+                                            exchange = exchange_name,
+                                            message = %other.chars().take(100).collect::<String>(),
+                                            "Received other message"
+                                        );
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            exchange = exchange_name,
+                                            error = %e,
+                                            "Failed to parse message"
+                                        );
+                                    }
+                                }
                             } else if msg.is_ping() {
-                                debug!("Received ping frame");
-                                let pong =
-                                    tokio_tungstenite::tungstenite::Message::Pong(msg.into_data());
+                                debug!(exchange = exchange_name, "Received ping frame");
+                                let pong = Message::Pong(msg.into_data());
                                 if let Err(e) = write.send(pong).await {
                                     error!(error = %e, "Failed to send pong frame");
                                     break;
                                 }
-                                debug!("Sent pong frame in response to ping");
+                                debug!(exchange = exchange_name, "Sent pong frame");
                             } else if msg.is_pong() {
-                                debug!("Received pong frame");
+                                debug!(exchange = exchange_name, "Received pong frame");
+                            } else if msg.is_binary() {
+                                // Some exchanges send binary messages (e.g., OKX compressed)
+                                debug!(
+                                    exchange = exchange_name,
+                                    len = msg.len(),
+                                    "Received binary message"
+                                );
                             } else {
-                                debug!(?msg, "Received other message");
+                                debug!(exchange = exchange_name, ?msg, "Received other frame");
                             }
                         }
                         Ok(Some(Err(e))) => {
-                            error!(error = %e, "WebSocket error");
+                            error!(
+                                exchange = exchange_name,
+                                error = %e,
+                                "WebSocket error"
+                            );
                             WEBSOCKET_CONNECTED
-                                .with_label_values(&["binance", &market_symbol])
+                                .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
                             break;
                         }
                         Ok(None) => {
-                            info!(symbol = %market_symbol, "WebSocket stream ended");
+                            info!(
+                                exchange = exchange_name,
+                                symbol = %normalized_symbol,
+                                "WebSocket stream ended"
+                            );
                             WEBSOCKET_CONNECTED
-                                .with_label_values(&["binance", &market_symbol])
+                                .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
                             break;
                         }
                         Err(_) => {
                             error!(
-                                symbol = %market_symbol,
+                                exchange = exchange_name,
+                                symbol = %normalized_symbol,
                                 timeout_secs = message_timeout.as_secs(),
                                 "Message timeout - connection may be stale, reconnecting"
                             );
                             MESSAGE_TIMEOUTS
-                                .with_label_values(&["binance", &market_symbol])
+                                .with_label_values(&[exchange_name, &normalized_symbol])
                                 .inc();
                             WEBSOCKET_CONNECTED
-                                .with_label_values(&["binance", &market_symbol])
+                                .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
                             break;
                         }
@@ -187,24 +293,42 @@ pub async fn websocket_worker(
                 }
             }
             Err(e) => {
-                error!(error = %e, "Failed to connect to WebSocket");
+                error!(
+                    exchange = exchange_name,
+                    url = %url,
+                    error = %e,
+                    "Failed to connect to WebSocket"
+                );
             }
         }
 
         // Mark connection as down before attempting reconnect
-        set_connection_status(&conn_state, "binance", &market_symbol, false).await;
+        set_connection_status(&conn_state, exchange_name, &normalized_symbol, false).await;
 
         let delay = backoff.next_delay();
         WEBSOCKET_RECONNECTS
-            .with_label_values(&["binance", &market_symbol])
+            .with_label_values(&[exchange_name, &normalized_symbol])
             .inc();
         info!(
-            symbol = %market_symbol,
+            exchange = exchange_name,
+            symbol = %normalized_symbol,
             delay_secs = delay.as_secs(),
             "Reconnecting to WebSocket with exponential backoff"
         );
         sleep(delay).await;
     }
+}
+
+/// Update the last message timestamp metric
+fn update_last_message_timestamp(exchange: &str, symbol: &str) {
+    LAST_MESSAGE_TIMESTAMP
+        .with_label_values(&[exchange, symbol])
+        .set(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs_f64(),
+        );
 }
 
 /// Save a snapshot to the channel for database processing

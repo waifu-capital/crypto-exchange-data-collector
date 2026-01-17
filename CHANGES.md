@@ -2,6 +2,63 @@
 
 ## 2026-01-17
 
+### Refactored: WebSocket Worker to Use Exchange Trait
+
+**Files changed:** `src/websocket.rs`, `src/config.rs`, `src/main.rs`
+
+**Problem:** The websocket worker was hardcoded for Binance, making it impossible to use the Exchange trait implementations created earlier.
+
+**Solution:** Refactored the websocket worker to accept `Box<dyn Exchange>` and use the trait methods:
+
+1. **Updated `websocket_worker` signature:**
+   ```rust
+   pub async fn websocket_worker(
+       exchange: Box<dyn Exchange>,
+       db_tx: Sender<SnapshotData>,
+       symbol: String,
+       feeds: Vec<FeedType>,
+       ws_config: WsConfig,
+       conn_state: ConnectionState,
+   )
+   ```
+
+2. **Generic message handling:**
+   ```rust
+   let url = exchange.websocket_url(&symbol);
+   let subscribe_msgs = exchange.build_subscribe_messages(&symbol, &feeds);
+
+   match exchange.parse_message(&text) {
+       Ok(ExchangeMessage::Orderbook { symbol, sequence_id, data }) => { ... }
+       Ok(ExchangeMessage::Trade { symbol, sequence_id, data }) => { ... }
+       Ok(ExchangeMessage::Ping(data)) => { write.send(Message::Pong(data.into())).await; }
+       // ...
+   }
+   ```
+
+3. **New configuration options in `config.rs`:**
+   ```bash
+   EXCHANGE=binance        # Exchange to connect to (default: binance)
+   FEEDS=orderbook,trades  # Comma-separated feed types (default: orderbook)
+   ```
+
+4. **Dynamic path naming:**
+   - Database: `snapshots-{exchange}-spot-{symbol}.db`
+   - Archive: `archive-{exchange}-{symbol}/`
+   - S3 bucket: `{exchange}-spot-{symbol}`
+
+5. **Exchange factory in `main.rs`:**
+   ```rust
+   let exchange = create_exchange(&config.exchange)
+       .expect("Unknown exchange");
+   let feeds = parse_feeds(&config.feeds);
+   ```
+
+**Supported exchanges:** binance, coinbase, upbit, okx, bybit
+
+**Impact:** The system can now connect to any of the 5 implemented exchanges by setting `EXCHANGE=<name>`. Each exchange uses its own symbol normalization, subscription format, and message parsing.
+
+---
+
 ### Added: Multi-Exchange Architecture with Exchange Trait
 
 **Files created:**

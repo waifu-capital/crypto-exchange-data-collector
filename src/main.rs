@@ -18,6 +18,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use crate::archive::{create_bucket_if_not_exists, create_s3_client, run_archive_scheduler};
 use crate::config::Config;
 use crate::db::{create_pool, db_worker, init_database};
+use crate::exchanges::{create_exchange, FeedType};
 use crate::http::{run_http_server, run_liveness_probe};
 use crate::metrics::init_metrics;
 use crate::models::{new_connection_state, SnapshotData};
@@ -41,19 +42,32 @@ fn init_tracing() {
         .with_file(false);
 
     // File layer - JSON format for log aggregation
-    let file_layer = fmt::layer()
-        .json()
-        .with_writer(file_appender);
+    let file_layer = fmt::layer().json().with_writer(file_appender);
 
     // Environment filter - default to info, configurable via RUST_LOG
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::registry()
         .with(env_filter)
         .with(stdout_layer)
         .with(file_layer)
         .init();
+}
+
+/// Parse feed type strings into FeedType enum
+fn parse_feeds(feeds: &[String]) -> Vec<FeedType> {
+    feeds
+        .iter()
+        .filter_map(|f| match f.as_str() {
+            "orderbook" => Some(FeedType::Orderbook),
+            "trades" | "trade" => Some(FeedType::Trades),
+            _ => {
+                tracing::warn!(feed = %f, "Unknown feed type, skipping");
+                None
+            }
+        })
+        .collect()
 }
 
 #[tokio::main]
@@ -72,8 +86,24 @@ async fn main() {
     // Clean up old log files on startup
     cleanup_old_logs("logs", config.log_retention_days);
 
+    // Create exchange instance
+    let exchange = create_exchange(&config.exchange).unwrap_or_else(|| {
+        panic!(
+            "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
+            config.exchange
+        )
+    });
+
+    // Parse feed types
+    let feeds = parse_feeds(&config.feeds);
+    if feeds.is_empty() {
+        panic!("No valid feeds configured. Use FEEDS=orderbook,trades");
+    }
+
     info!(
+        exchange = %config.exchange,
         market_symbol = %config.market_symbol,
+        feeds = ?feeds,
         aws_region = %config.aws_region,
         log_retention_days = config.log_retention_days,
         "Starting crypto exchange data collector"
@@ -115,7 +145,8 @@ async fn main() {
         };
         let conn_state = conn_state.clone();
         tokio::spawn(async move {
-            websocket_worker(websocket_tx, market_symbol, ws_config, conn_state).await;
+            websocket_worker(exchange, websocket_tx, market_symbol, feeds, ws_config, conn_state)
+                .await;
         });
     }
 
