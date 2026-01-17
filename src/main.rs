@@ -16,12 +16,12 @@ use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 use crate::archive::{create_bucket_if_not_exists, create_s3_client, run_archive_scheduler};
-use crate::config::Config;
+use crate::config::{Config, MarketPair};
 use crate::db::{create_pool, db_worker, init_database};
 use crate::exchanges::{create_exchange, FeedType};
 use crate::http::{run_http_server, run_liveness_probe};
 use crate::metrics::init_metrics;
-use crate::models::{new_connection_state, SnapshotData};
+use crate::models::{new_connection_state, MarketEvent};
 use crate::utils::cleanup_old_logs;
 use crate::websocket::{websocket_worker, WsConfig};
 
@@ -80,34 +80,30 @@ async fn main() {
     // Initialize metrics
     init_metrics();
 
-    // Load configuration
-    let config = Config::from_env();
+    // Load configuration from TOML
+    let config = Config::from_toml();
 
     // Clean up old log files on startup
     cleanup_old_logs("logs", config.log_retention_days);
 
-    // Create exchange instance
-    let exchange = create_exchange(&config.exchange).unwrap_or_else(|| {
-        panic!(
-            "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
-            config.exchange
-        )
-    });
-
     // Parse feed types
     let feeds = parse_feeds(&config.feeds);
     if feeds.is_empty() {
-        panic!("No valid feeds configured. Use FEEDS=orderbook,trades");
+        panic!("No valid feeds configured. Set feeds = [\"orderbook\", \"trades\"] in config.toml");
     }
 
     info!(
-        exchange = %config.exchange,
-        market_symbol = %config.market_symbol,
+        market_pairs = config.market_pairs.len(),
         feeds = ?feeds,
         aws_region = %config.aws_region,
         log_retention_days = config.log_retention_days,
         "Starting crypto exchange data collector"
     );
+
+    // Log all configured market pairs
+    for pair in &config.market_pairs {
+        info!(exchange = %pair.exchange, symbol = %pair.symbol, "Configured market pair");
+    }
 
     // Initialize AWS client
     let client = create_s3_client(&config).await;
@@ -119,8 +115,9 @@ async fn main() {
     let db_pool = create_pool(&config.database_path).await;
     init_database(&db_pool).await;
 
-    // Create channel for snapshot data
-    let (db_tx, db_rx) = channel::<SnapshotData>(1000);
+    // Create channel for market events (sized for all market pairs)
+    let channel_size = 1000 * config.market_pairs.len();
+    let (db_tx, db_rx) = channel::<MarketEvent>(channel_size);
 
     // Create shutdown broadcast channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -138,29 +135,48 @@ async fn main() {
         })
     };
 
-    // Spawn WebSocket worker with shutdown receiver
-    let ws_handle = {
+    // WebSocket config shared by all workers
+    let ws_config = WsConfig {
+        message_timeout_secs: config.ws_message_timeout_secs,
+        initial_retry_delay_secs: config.ws_initial_retry_delay_secs,
+        max_retry_delay_secs: config.ws_max_retry_delay_secs,
+    };
+
+    // Spawn WebSocket worker for each market pair
+    let mut ws_handles: Vec<(MarketPair, tokio::task::JoinHandle<()>)> = Vec::new();
+    for pair in &config.market_pairs {
+        let exchange = create_exchange(&pair.exchange).unwrap_or_else(|| {
+            panic!(
+                "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
+                pair.exchange
+            )
+        });
+
         let websocket_tx = db_tx.clone();
-        let market_symbol = config.market_symbol.clone();
-        let ws_config = WsConfig {
-            message_timeout_secs: config.ws_message_timeout_secs,
-            initial_retry_delay_secs: config.ws_initial_retry_delay_secs,
-            max_retry_delay_secs: config.ws_max_retry_delay_secs,
-        };
+        let symbol = pair.symbol.clone();
+        let feeds = feeds.clone();
+        let ws_config = ws_config.clone();
         let conn_state = conn_state.clone();
         let shutdown_rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            websocket_worker(exchange, websocket_tx, market_symbol, feeds, ws_config, conn_state, shutdown_rx)
+        let pair_clone = pair.clone();
+
+        let handle = tokio::spawn(async move {
+            websocket_worker(exchange, websocket_tx, symbol, feeds, ws_config, conn_state, shutdown_rx)
                 .await;
-        })
-    };
+        });
+
+        ws_handles.push((pair_clone, handle));
+    }
+
+    // Drop the original sender so DB worker knows when all WebSocket workers are done
+    drop(db_tx);
 
     // Spawn liveness probe
     tokio::spawn(async move {
         run_liveness_probe().await;
     });
 
-    // Spawn metrics HTTP server (port 9090 by default)
+    // Spawn metrics HTTP server
     let metrics_port = config.metrics_port;
     tokio::spawn(async move {
         run_http_server(Some(metrics_port), conn_state).await;
@@ -178,13 +194,11 @@ async fn main() {
         });
     }
 
-    // Spawn archive scheduler (non-blocking)
+    // Spawn archive scheduler (archives ALL data from all exchanges/symbols)
     let archive_handle = {
         let db_pool = db_pool.clone();
         let archive_dir = config.archive_dir;
         let bucket_name = config.bucket_name;
-        let exchange_name = config.exchange;
-        let market_symbol = config.market_symbol;
         let home_server_name = config.home_server_name;
         let archive_interval_secs = config.archive_interval_secs;
         let shutdown_rx = shutdown_tx.subscribe();
@@ -194,8 +208,6 @@ async fn main() {
                 archive_dir,
                 bucket_name,
                 client,
-                exchange_name,
-                market_symbol,
                 home_server_name,
                 archive_interval_secs,
                 shutdown_rx,
@@ -216,15 +228,31 @@ async fn main() {
     let db_timeout = Duration::from_secs(15);  // More time to flush pending data
     let archive_timeout = Duration::from_secs(5);  // Least priority
 
-    // Wait for workers with individual timeouts
-    let (_, _, _) = tokio::join!(
-        async {
-            match tokio::time::timeout(ws_timeout, ws_handle).await {
-                Ok(Ok(_)) => info!("WebSocket worker stopped cleanly"),
-                Ok(Err(e)) => warn!(error = %e, "WebSocket worker panicked"),
-                Err(_) => warn!(timeout_secs = ws_timeout.as_secs(), "WebSocket worker shutdown timed out"),
-            }
-        },
+    // Wait for all WebSocket workers
+    for (pair, handle) in ws_handles {
+        match tokio::time::timeout(ws_timeout, handle).await {
+            Ok(Ok(_)) => info!(
+                exchange = %pair.exchange,
+                symbol = %pair.symbol,
+                "WebSocket worker stopped cleanly"
+            ),
+            Ok(Err(e)) => warn!(
+                exchange = %pair.exchange,
+                symbol = %pair.symbol,
+                error = %e,
+                "WebSocket worker panicked"
+            ),
+            Err(_) => warn!(
+                exchange = %pair.exchange,
+                symbol = %pair.symbol,
+                timeout_secs = ws_timeout.as_secs(),
+                "WebSocket worker shutdown timed out"
+            ),
+        }
+    }
+
+    // Wait for DB and archive workers
+    let (_, _) = tokio::join!(
         async {
             match tokio::time::timeout(db_timeout, db_handle).await {
                 Ok(Ok(_)) => info!("DB worker stopped cleanly"),

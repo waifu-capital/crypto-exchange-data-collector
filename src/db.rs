@@ -7,7 +7,7 @@ use tokio::time::interval;
 use tracing::{error, info, warn};
 
 use crate::metrics::{CHANNEL_QUEUE_DEPTH, DB_INSERT_ERRORS, DB_SNAPSHOTS_WRITTEN, DB_WRITE_DURATION};
-use crate::models::SnapshotData;
+use crate::models::{DataType, MarketEvent};
 
 /// Create a SQLite connection pool
 pub async fn create_pool(database_path: &Path) -> SqlitePool {
@@ -19,7 +19,7 @@ pub async fn create_pool(database_path: &Path) -> SqlitePool {
         .expect("Failed to create SQLite pool")
 }
 
-/// Initialize database schema with WAL mode
+/// Initialize database schema with WAL mode and separate tables
 pub async fn init_database(db_pool: &SqlitePool) {
     // Enable WAL mode for better crash recovery and write performance
     sqlx::query("PRAGMA journal_mode=WAL")
@@ -27,35 +27,63 @@ pub async fn init_database(db_pool: &SqlitePool) {
         .await
         .expect("Failed to enable WAL mode");
 
-    // Ensure the snapshots table exists
+    // Orderbooks table
     sqlx::query(
-        "CREATE TABLE IF NOT EXISTS snapshots (
+        "CREATE TABLE IF NOT EXISTS orderbooks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             exchange TEXT NOT NULL,
             symbol TEXT NOT NULL,
-            data_type TEXT NOT NULL,
             exchange_sequence_id TEXT NOT NULL,
             timestamp_collector INTEGER NOT NULL,
             timestamp_exchange INTEGER NOT NULL,
             data TEXT NOT NULL,
-            UNIQUE(exchange, symbol, data_type, exchange_sequence_id)
-        )"
+            UNIQUE(exchange, symbol, exchange_sequence_id)
+        )",
     )
     .execute(db_pool)
     .await
-    .expect("Failed to create snapshots table");
+    .expect("Failed to create orderbooks table");
 
-    info!("Database initialized with WAL mode");
+    // Index for time-based queries
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_orderbooks_time ON orderbooks(timestamp_collector)")
+        .execute(db_pool)
+        .await
+        .ok();
+
+    // Trades table
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            exchange TEXT NOT NULL,
+            symbol TEXT NOT NULL,
+            exchange_sequence_id TEXT NOT NULL,
+            timestamp_collector INTEGER NOT NULL,
+            timestamp_exchange INTEGER NOT NULL,
+            data TEXT NOT NULL,
+            UNIQUE(exchange, symbol, exchange_sequence_id)
+        )",
+    )
+    .execute(db_pool)
+    .await
+    .expect("Failed to create trades table");
+
+    // Index for time-based queries
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_time ON trades(timestamp_collector)")
+        .execute(db_pool)
+        .await
+        .ok();
+
+    info!("Database initialized with WAL mode and separate orderbooks/trades tables");
 }
 
-/// Background worker that batches and writes snapshots to the database
+/// Background worker that batches and writes market events to the database
 pub async fn db_worker(
     db_pool: SqlitePool,
-    mut db_rx: tokio::sync::mpsc::Receiver<SnapshotData>,
+    mut db_rx: tokio::sync::mpsc::Receiver<MarketEvent>,
     batch_interval_secs: u64,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
-    let mut batch: Vec<SnapshotData> = Vec::new();
+    let mut batch: Vec<MarketEvent> = Vec::new();
     let mut interval = interval(Duration::from_secs(batch_interval_secs));
 
     loop {
@@ -69,8 +97,8 @@ pub async fn db_worker(
                 }
                 break;
             }
-            Some(snapshot) = db_rx.recv() => {
-                batch.push(snapshot);
+            Some(event) = db_rx.recv() => {
+                batch.push(event);
                 // Update queue depth metric (approximate - batch size)
                 CHANNEL_QUEUE_DEPTH.set(batch.len() as f64);
             },
@@ -86,8 +114,8 @@ pub async fn db_worker(
     info!("DB worker stopped");
 }
 
-/// Flush a batch of snapshots to the database
-async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
+/// Flush a batch of market events to the appropriate tables
+async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<MarketEvent>) {
     let batch_size = batch.len();
     let start = Instant::now();
 
@@ -104,26 +132,35 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
     let mut tx = tx;
 
     let mut insert_errors = 0;
-    for snapshot in batch.drain(..) {
+    for event in batch.drain(..) {
+        // Route to correct table based on data type
+        let table = match event.data_type {
+            DataType::Orderbook => "orderbooks",
+            DataType::Trade => "trades",
+        };
+
         // INSERT OR IGNORE skips duplicates based on UNIQUE constraint
-        if let Err(e) = sqlx::query(
-            "INSERT OR IGNORE INTO snapshots (exchange, symbol, data_type, exchange_sequence_id, timestamp_collector, timestamp_exchange, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&snapshot.exchange)
-        .bind(&snapshot.symbol)
-        .bind(&snapshot.data_type)
-        .bind(&snapshot.exchange_sequence_id)
-        .bind(snapshot.timestamp_collector)
-        .bind(snapshot.timestamp_exchange)
-        .bind(&snapshot.data)
-        .execute(&mut *tx)
-        .await {
+        let query = format!(
+            "INSERT OR IGNORE INTO {} (exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data) VALUES (?, ?, ?, ?, ?, ?)",
+            table
+        );
+
+        if let Err(e) = sqlx::query(&query)
+            .bind(&event.exchange)
+            .bind(&event.symbol)
+            .bind(&event.exchange_sequence_id)
+            .bind(event.timestamp_collector)
+            .bind(event.timestamp_exchange)
+            .bind(&event.data)
+            .execute(&mut *tx)
+            .await
+        {
             insert_errors += 1;
             let error_type = categorize_sqlx_error(&e);
             DB_INSERT_ERRORS.with_label_values(&[error_type]).inc();
             // Only log non-duplicate errors (duplicates are expected with INSERT OR IGNORE)
             if error_type != "duplicate" {
-                error!(error = %e, error_type, "Failed to insert snapshot");
+                error!(error = %e, error_type, table, "Failed to insert event");
             }
         }
     }
@@ -132,7 +169,7 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
         error!(
             error = %e,
             batch_size,
-            "Failed to commit transaction, snapshots may be lost"
+            "Failed to commit transaction, events may be lost"
         );
         DB_WRITE_DURATION
             .with_label_values(&["commit_error"])
@@ -155,36 +192,76 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
     }
 }
 
-/// Fetch all snapshots from the database for archiving
-/// Returns (exchange, symbol, data_type, exchange_sequence_id, timestamp_collector, timestamp_exchange, data)
-pub async fn fetch_all_snapshots(db_pool: &SqlitePool) -> Result<Vec<(String, String, String, String, i64, i64, String)>, sqlx::Error> {
-    let rows = sqlx::query("SELECT exchange, symbol, data_type, exchange_sequence_id, timestamp_collector, timestamp_exchange, data FROM snapshots")
-        .fetch_all(db_pool)
-        .await?;
+/// Row data returned from database queries
+pub struct DbRow {
+    pub exchange: String,
+    pub symbol: String,
+    pub data_type: DataType,
+    pub exchange_sequence_id: String,
+    pub timestamp_collector: i64,
+    pub timestamp_exchange: i64,
+    pub data: String,
+}
 
-    let snapshots = rows
+/// Fetch all orderbooks from the database for archiving
+pub async fn fetch_all_orderbooks(db_pool: &SqlitePool) -> Result<Vec<DbRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data FROM orderbooks",
+    )
+    .fetch_all(db_pool)
+    .await?;
+
+    let events = rows
         .iter()
-        .map(|row| {
-            (
-                row.get::<String, _>("exchange"),
-                row.get::<String, _>("symbol"),
-                row.get::<String, _>("data_type"),
-                row.get::<String, _>("exchange_sequence_id"),
-                row.get::<i64, _>("timestamp_collector"),
-                row.get::<i64, _>("timestamp_exchange"),
-                row.get::<String, _>("data"),
-            )
+        .map(|row| DbRow {
+            exchange: row.get("exchange"),
+            symbol: row.get("symbol"),
+            data_type: DataType::Orderbook,
+            exchange_sequence_id: row.get("exchange_sequence_id"),
+            timestamp_collector: row.get("timestamp_collector"),
+            timestamp_exchange: row.get("timestamp_exchange"),
+            data: row.get("data"),
         })
         .collect();
 
-    Ok(snapshots)
+    Ok(events)
 }
 
-/// Delete all snapshots from the database after successful archive
-pub async fn delete_all_snapshots(db_pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM snapshots")
+/// Fetch all trades from the database for archiving
+pub async fn fetch_all_trades(db_pool: &SqlitePool) -> Result<Vec<DbRow>, sqlx::Error> {
+    let rows = sqlx::query(
+        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data FROM trades",
+    )
+    .fetch_all(db_pool)
+    .await?;
+
+    let events = rows
+        .iter()
+        .map(|row| DbRow {
+            exchange: row.get("exchange"),
+            symbol: row.get("symbol"),
+            data_type: DataType::Trade,
+            exchange_sequence_id: row.get("exchange_sequence_id"),
+            timestamp_collector: row.get("timestamp_collector"),
+            timestamp_exchange: row.get("timestamp_exchange"),
+            data: row.get("data"),
+        })
+        .collect();
+
+    Ok(events)
+}
+
+/// Delete all orderbooks from the database after successful archive
+pub async fn delete_all_orderbooks(db_pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM orderbooks")
         .execute(db_pool)
         .await?;
+    Ok(())
+}
+
+/// Delete all trades from the database after successful archive
+pub async fn delete_all_trades(db_pool: &SqlitePool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM trades").execute(db_pool).await?;
     Ok(())
 }
 

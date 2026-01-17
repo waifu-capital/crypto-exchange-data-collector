@@ -14,7 +14,7 @@ use crate::metrics::{
     MESSAGE_TIMEOUTS, PARSE_CIRCUIT_BREAKS, SEQUENCE_DUPLICATES, SEQUENCE_GAPS, SEQUENCE_GAP_SIZE,
     SEQUENCE_OUT_OF_ORDER, WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
 };
-use crate::models::{ConnectionState, SequenceCheckResult, SequenceTracker, SnapshotData};
+use crate::models::{ConnectionState, DataType, MarketEvent, SequenceCheckResult, SequenceTracker};
 
 /// WebSocket connection configuration
 #[derive(Clone)]
@@ -136,7 +136,7 @@ async fn set_connection_status(
 /// It handles connection management, message parsing, and forwards data to the database channel.
 pub async fn websocket_worker(
     exchange: Box<dyn Exchange>,
-    db_tx: Sender<SnapshotData>,
+    db_tx: Sender<MarketEvent>,
     symbol: String,
     feeds: Vec<FeedType>,
     ws_config: WsConfig,
@@ -291,7 +291,7 @@ pub async fn websocket_worker(
                                         match seq_tracker.check(
                                             exchange_name,
                                             &sym,
-                                            "orderbook",
+                                            DataType::Orderbook,
                                             &sequence_id,
                                             collector_time_us,
                                         ) {
@@ -339,11 +339,11 @@ pub async fn websocket_worker(
                                             SequenceCheckResult::Ok => {}
                                         }
 
-                                        save_snapshot(
+                                        save_event(
                                             &db_tx,
                                             exchange_name,
                                             &sym,
-                                            "orderbook",
+                                            DataType::Orderbook,
                                             &sequence_id,
                                             collector_time_us,
                                             timestamp_exchange_us,
@@ -386,7 +386,7 @@ pub async fn websocket_worker(
                                         match seq_tracker.check(
                                             exchange_name,
                                             &sym,
-                                            "trade",
+                                            DataType::Trade,
                                             &sequence_id,
                                             collector_time_us,
                                         ) {
@@ -434,11 +434,11 @@ pub async fn websocket_worker(
                                             SequenceCheckResult::Ok => {}
                                         }
 
-                                        save_snapshot(
+                                        save_event(
                                             &db_tx,
                                             exchange_name,
                                             &sym,
-                                            "trade",
+                                            DataType::Trade,
                                             &sequence_id,
                                             collector_time_us,
                                             timestamp_exchange_us,
@@ -593,21 +593,21 @@ fn update_last_message_timestamp(exchange: &str, symbol: &str) {
         .set(now_secs);
 }
 
-/// Save a snapshot to the channel for database processing
-fn save_snapshot(
-    db_tx: &Sender<SnapshotData>,
+/// Save a market event to the channel for database processing
+fn save_event(
+    db_tx: &Sender<MarketEvent>,
     exchange: &str,
     symbol: &str,
-    data_type: &str,
+    data_type: DataType,
     exchange_sequence_id: &str,
     timestamp_collector_us: i64,
     timestamp_exchange_us: i64,
     raw_data: &str,
 ) {
-    let data = SnapshotData {
+    let event = MarketEvent {
         exchange: exchange.to_string(),
         symbol: symbol.to_string(),
-        data_type: data_type.to_string(),
+        data_type,
         exchange_sequence_id: exchange_sequence_id.to_string(),
         timestamp_collector: timestamp_collector_us,
         timestamp_exchange: timestamp_exchange_us,
@@ -615,13 +615,13 @@ fn save_snapshot(
     };
 
     // Non-blocking send - never stall WebSocket even under backpressure
-    match db_tx.try_send(data) {
+    match db_tx.try_send(event) {
         Ok(_) => {}
         Err(_) => {
             MESSAGES_DROPPED.inc();
             warn!(
                 total_dropped = MESSAGES_DROPPED.get() as u64,
-                "Channel full, dropped snapshot"
+                "Channel full, dropped event"
             );
         }
     }

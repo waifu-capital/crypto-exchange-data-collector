@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -10,7 +11,6 @@ use aws_sdk_s3::Client;
 /// Track last successfully archived max timestamp to prevent duplicates
 static LAST_ARCHIVE_MAX_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 use chrono::Utc;
-use itertools::multiunzip;
 use polars::prelude::*;
 use sqlx::sqlite::SqlitePool;
 use tokio::time::sleep;
@@ -19,11 +19,14 @@ use tokio_retry::Retry;
 use tracing::{error, info, warn};
 
 use crate::config::Config;
-use crate::db::{delete_all_snapshots, fetch_all_snapshots};
+use crate::db::{
+    delete_all_orderbooks, delete_all_trades, fetch_all_orderbooks, fetch_all_trades, DbRow,
+};
 use crate::metrics::{
     ARCHIVE_FAILURES, ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES,
     S3_UPLOAD_RETRIES, SNAPSHOTS_ARCHIVED,
 };
+use crate::models::DataType;
 
 /// Create and configure the S3 client
 pub async fn create_s3_client(config: &Config) -> Client {
@@ -83,13 +86,12 @@ pub async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, reg
 }
 
 /// Schedule and run archive task at regular intervals
+/// Archives ALL data from all exchanges and symbols
 pub async fn run_archive_scheduler(
     db_pool: SqlitePool,
     archive_dir: PathBuf,
     bucket_name: String,
     client: Client,
-    exchange: String,
-    symbol: String,
     home_server_name: Option<String>,
     archive_interval_secs: u64,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
@@ -107,16 +109,10 @@ pub async fn run_archive_scheduler(
         // Run archive with timeout
         match tokio::time::timeout(
             archive_timeout,
-            archive_snapshots(
-                &db_pool,
-                &archive_dir,
-                &bucket_name,
-                &client,
-                &exchange,
-                &symbol,
-                home_server_name.as_deref(),
-            )
-        ).await {
+            archive_all_data(&db_pool, &archive_dir, &bucket_name, &client, home_server_name.as_deref()),
+        )
+        .await
+        {
             Ok(_) => { /* success */ }
             Err(_) => {
                 ARCHIVE_FAILURES.with_label_values(&["timeout"]).inc();
@@ -138,52 +134,52 @@ pub async fn run_archive_scheduler(
     info!("Archive scheduler stopped");
 }
 
-/// Archive snapshots to Parquet and upload to S3
-///
-/// S3 key structure:
-/// - With server: `{exchange}/{symbol}/{server}/{YYYY-MM-DD}/{timestamp}.parquet`
-/// - Without server: `{exchange}/{symbol}/{YYYY-MM-DD}/{timestamp}.parquet`
-pub async fn archive_snapshots(
+/// Archive all data from both orderbooks and trades tables
+/// Groups data by (exchange, symbol, data_type) and creates separate Parquet files
+pub async fn archive_all_data(
     db_pool: &SqlitePool,
     archive_dir: &Path,
     bucket_name: &str,
     client: &Client,
-    exchange: &str,
-    symbol: &str,
     home_server_name: Option<&str>,
 ) {
-    // Fetch all snapshots
-    let snapshots = match fetch_all_snapshots(db_pool).await {
-        Ok(s) => s,
+    // Fetch from both tables
+    let orderbooks = match fetch_all_orderbooks(db_pool).await {
+        Ok(rows) => rows,
         Err(e) => {
             ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
-            error!(error = %e, "Failed to fetch snapshots for archive");
+            error!(error = %e, "Failed to fetch orderbooks for archive");
             return;
         }
     };
 
-    if snapshots.is_empty() {
-        info!("No snapshots to archive");
+    let trades = match fetch_all_trades(db_pool).await {
+        Ok(rows) => rows,
+        Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
+            error!(error = %e, "Failed to fetch trades for archive");
+            return;
+        }
+    };
+
+    if orderbooks.is_empty() && trades.is_empty() {
+        info!("No data to archive");
         return;
     }
 
-    // Extract columns from snapshot tuples using multiunzip
-    let snapshot_count = snapshots.len();
-    let (exchanges, symbols, data_types, seq_ids, timestamps_collector, timestamps_exchange, data_col): (
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        Vec<String>,
-        Vec<i64>,
-        Vec<i64>,
-        Vec<String>,
-    ) = multiunzip(snapshots);
+    // Combine all rows
+    let all_rows: Vec<DbRow> = orderbooks.into_iter().chain(trades.into_iter()).collect();
+    let total_count = all_rows.len();
 
-    // Get max timestamp from this batch for duplicate prevention
-    let max_collector_ts = timestamps_collector.iter().copied().max().unwrap_or(0);
+    // Get max timestamp for duplicate prevention
+    let max_collector_ts = all_rows
+        .iter()
+        .map(|r| r.timestamp_collector)
+        .max()
+        .unwrap_or(0);
     let last_archived = LAST_ARCHIVE_MAX_TIMESTAMP.load(Ordering::SeqCst);
 
-    // Check if this data was already archived (retry scenario after failed verification)
+    // Check for duplicate archive scenario
     if max_collector_ts > 0 && max_collector_ts <= last_archived {
         warn!(
             last_archived,
@@ -191,17 +187,90 @@ pub async fn archive_snapshots(
             "Skipping archive - data appears to already be archived (retry scenario)"
         );
         // Delete from DB since data is already in S3
-        if let Err(e) = delete_all_snapshots(db_pool).await {
-            error!(error = %e, "Failed to clean up already-archived snapshots from database");
+        if let Err(e) = delete_all_orderbooks(db_pool).await {
+            error!(error = %e, "Failed to clean up already-archived orderbooks");
+        }
+        if let Err(e) = delete_all_trades(db_pool).await {
+            error!(error = %e, "Failed to clean up already-archived trades");
         }
         return;
     }
 
-    // Create DataFrame from extracted columns
+    // Group rows by (exchange, symbol, data_type)
+    let mut groups: HashMap<(String, String, DataType), Vec<DbRow>> = HashMap::new();
+    for row in all_rows {
+        let key = (row.exchange.clone(), row.symbol.clone(), row.data_type);
+        groups.entry(key).or_default().push(row);
+    }
+
+    info!(
+        total_count,
+        groups = groups.len(),
+        "Archiving data in groups"
+    );
+
+    // Process each group
+    let mut all_uploads_succeeded = true;
+    for ((exchange, symbol, data_type), rows) in groups {
+        let success = archive_group(
+            &rows,
+            &exchange,
+            &symbol,
+            data_type,
+            archive_dir,
+            bucket_name,
+            client,
+            home_server_name,
+        )
+        .await;
+
+        if !success {
+            all_uploads_succeeded = false;
+        }
+    }
+
+    // Only delete from DB if ALL uploads succeeded
+    if all_uploads_succeeded {
+        if let Err(e) = delete_all_orderbooks(db_pool).await {
+            error!(error = %e, "Failed to delete orderbooks from database");
+        }
+        if let Err(e) = delete_all_trades(db_pool).await {
+            error!(error = %e, "Failed to delete trades from database");
+        }
+        // Update last archived timestamp after successful delete
+        LAST_ARCHIVE_MAX_TIMESTAMP.store(max_collector_ts, Ordering::SeqCst);
+        info!(total_count, "Successfully archived and cleaned up all data");
+    } else {
+        warn!("Some uploads failed, keeping data in database for retry");
+    }
+}
+
+/// Archive a single group of rows (same exchange/symbol/data_type)
+async fn archive_group(
+    rows: &[DbRow],
+    exchange: &str,
+    symbol: &str,
+    data_type: DataType,
+    archive_dir: &Path,
+    bucket_name: &str,
+    client: &Client,
+    home_server_name: Option<&str>,
+) -> bool {
+    let row_count = rows.len();
+    let data_type_str = data_type.as_str();
+
+    // Extract columns
+    let exchanges: Vec<String> = rows.iter().map(|r| r.exchange.clone()).collect();
+    let symbols: Vec<String> = rows.iter().map(|r| r.symbol.clone()).collect();
+    let seq_ids: Vec<String> = rows.iter().map(|r| r.exchange_sequence_id.clone()).collect();
+    let timestamps_collector: Vec<i64> = rows.iter().map(|r| r.timestamp_collector).collect();
+    let timestamps_exchange: Vec<i64> = rows.iter().map(|r| r.timestamp_exchange).collect();
+    let data_col: Vec<String> = rows.iter().map(|r| r.data.clone()).collect();
+
+    // Create DataFrame
     let mut df = match DataFrame::new(vec![
         Column::new("exchange".into(), exchanges),
         Column::new("symbol".into(), symbols),
-        Column::new("data_type".into(), data_types),
         Column::new("exchange_sequence_id".into(), seq_ids),
         Column::new("timestamp_collector".into(), timestamps_collector),
         Column::new("timestamp_exchange".into(), timestamps_exchange),
@@ -210,29 +279,38 @@ pub async fn archive_snapshots(
         Ok(df) => df,
         Err(e) => {
             ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
-            error!(error = %e, "Failed to create DataFrame");
-            return;
+            error!(
+                error = %e,
+                exchange,
+                symbol,
+                data_type = data_type_str,
+                "Failed to create DataFrame"
+            );
+            return false;
         }
     };
 
     // Build S3 key with hierarchical structure
+    // Format: {exchange}/{symbol}/{data_type}/[{server}/]{date}/{timestamp}.parquet
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("System time before Unix epoch")
         .as_millis();
     let date = Utc::now().format("%Y-%m-%d");
 
-    // S3 key: {exchange}/{symbol}/[{server}/]{date}/{timestamp}.parquet
     let s3_key = match home_server_name {
         Some(server) => format!(
-            "{}/{}/{}/{}/{}.parquet",
-            exchange, symbol, server, date, timestamp
+            "{}/{}/{}/{}/{}/{}.parquet",
+            exchange, symbol, data_type_str, server, date, timestamp
         ),
-        None => format!("{}/{}/{}/{}.parquet", exchange, symbol, date, timestamp),
+        None => format!(
+            "{}/{}/{}/{}/{}.parquet",
+            exchange, symbol, data_type_str, date, timestamp
+        ),
     };
 
     // Local file name (flat, for temporary storage)
-    let local_file_name = format!("{}.parquet", timestamp);
+    let local_file_name = format!("{}_{}_{}.parquet", exchange, symbol, timestamp);
     let archive_file_path = archive_dir.join(&local_file_name);
 
     let mut file = match std::fs::File::create(&archive_file_path) {
@@ -244,7 +322,7 @@ pub async fn archive_snapshots(
                 path = %archive_file_path.display(),
                 "Failed to create archive file"
             );
-            return;
+            return false;
         }
     };
 
@@ -255,9 +333,8 @@ pub async fn archive_snapshots(
             path = %archive_file_path.display(),
             "Failed to write Parquet file"
         );
-        // Try to clean up the partial file
         let _ = std::fs::remove_file(&archive_file_path);
-        return;
+        return false;
     }
 
     // Get local file size for verification
@@ -266,14 +343,17 @@ pub async fn archive_snapshots(
         Err(e) => {
             ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
             error!(error = %e, "Failed to get local file size");
-            return;
+            return false;
         }
     };
+
     info!(
-        snapshot_count,
-        path = %archive_file_path.display(),
+        row_count,
+        exchange,
+        symbol,
+        data_type = data_type_str,
         s3_key = %s3_key,
-        "Written snapshots to Parquet file"
+        "Written group to Parquet file"
     );
 
     // Upload to S3
@@ -285,13 +365,13 @@ pub async fn archive_snapshots(
         S3_UPLOAD_DURATION
             .with_label_values(&["failure"])
             .observe(upload_start.elapsed().as_secs_f64());
-        return;
+        return false;
     }
     S3_UPLOAD_DURATION
         .with_label_values(&["success"])
         .observe(upload_start.elapsed().as_secs_f64());
 
-    // Verify upload succeeded with size check before deleting local data
+    // Verify upload succeeded with size check
     match client
         .head_object()
         .bucket(bucket_name)
@@ -300,55 +380,49 @@ pub async fn archive_snapshots(
         .await
     {
         Ok(head_resp) => {
-            // Verify file size matches
             let remote_size = head_resp.content_length().unwrap_or(0) as u64;
 
             if remote_size != local_file_size {
                 ARCHIVE_FAILURES.with_label_values(&["verify_size"]).inc();
                 error!(
                     local_size = local_file_size,
-                    remote_size = remote_size,
-                    "Size mismatch after S3 upload, keeping local data"
+                    remote_size,
+                    s3_key = %s3_key,
+                    "Size mismatch after S3 upload"
                 );
-                return;
+                return false;
             }
 
             info!(
                 bucket = bucket_name,
                 key = %s3_key,
                 size = remote_size,
-                "Verified S3 upload (size matches)"
+                "Verified S3 upload"
             );
 
-            // Update metrics for successful archive
+            // Update metrics
             ARCHIVES_COMPLETED.inc();
-            SNAPSHOTS_ARCHIVED.inc_by(snapshot_count as f64);
+            SNAPSHOTS_ARCHIVED.inc_by(row_count as f64);
 
-            if let Err(e) = delete_all_snapshots(db_pool).await {
-                error!(error = %e, "Failed to delete snapshots from database");
-                // Data is safe in S3, but duplicates may occur next cycle
-            } else {
-                // Only update last archived timestamp after successful DB delete
-                // This prevents the same data from being skipped if delete fails
-                LAST_ARCHIVE_MAX_TIMESTAMP.store(max_collector_ts, Ordering::SeqCst);
-            }
+            // Clean up local file
             if let Err(e) = std::fs::remove_file(&archive_file_path) {
                 warn!(
                     error = %e,
                     path = %archive_file_path.display(),
                     "Failed to remove local archive file"
                 );
-                // Not critical - file can be cleaned up manually
             }
-            info!("Deleted local data after verified upload");
+
+            true
         }
         Err(e) => {
             ARCHIVE_FAILURES.with_label_values(&["verify_head"]).inc();
             error!(
                 error = %e,
-                "Failed to verify S3 upload, keeping local data"
+                s3_key = %s3_key,
+                "Failed to verify S3 upload"
             );
-            // Don't delete SQLite data or local file - will retry next cycle
+            false
         }
     }
 }

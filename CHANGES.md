@@ -2,6 +2,105 @@
 
 ## 2026-01-17
 
+### Refactored: Multi-Exchange Architecture + Data Model Improvements
+
+**Files changed:** `Cargo.toml`, `src/config.rs`, `src/models.rs`, `src/db.rs`, `src/websocket.rs`, `src/archive.rs`, `src/main.rs`, `config.toml` (new)
+
+**Purpose:** Two major architectural improvements:
+1. Multi-exchange/multi-symbol support in a single process
+2. Better data models with type-safe enums and separate database tables
+
+#### Part 1: Multi-Exchange/Multi-Symbol Support
+
+**Problem:** Previously required running 1 process per exchange+symbol combination. Managing 10+ instances was operationally complex.
+
+**Solution:** TOML configuration file with multi-worker spawning:
+
+```toml
+[[markets]]
+exchange = "binance"
+symbols = ["btcusdt", "ethusdt", "solusdt"]
+
+[[markets]]
+exchange = "coinbase"
+symbols = ["BTC-USD", "ETH-USD"]
+
+[[markets]]
+exchange = "bybit"
+symbols = ["BTCUSDT"]
+```
+
+**Changes:**
+- Added `toml = "0.8"` dependency
+- Rewrote `src/config.rs` for TOML parsing with `MarketPair`, `MarketConfig` structs
+- `main.rs` spawns one WebSocket worker per market pair, all sharing a single DB channel
+- Archive scheduler now archives ALL data (no exchange/symbol parameters)
+- Channel sized for all market pairs: `1000 * market_pairs.len()`
+
+**Configuration:**
+- Config file path: `config.toml` (or set `CONFIG_PATH` env var)
+- AWS credentials still from env vars: `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`
+
+#### Part 2: Data Model Refactor
+
+**Problem:** `SnapshotData` was misleadingly named (originally for Binance orderbook snapshots). String-based `data_type` field was error-prone. Single `snapshots` table mixed orderbook and trade data.
+
+**Solution:**
+
+1. **Renamed `SnapshotData` → `MarketEvent`** - Accurate name for all market data types
+
+2. **Added type-safe `DataType` enum:**
+   ```rust
+   #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+   pub enum DataType {
+       Orderbook,
+       Trade,
+   }
+   ```
+
+3. **Separate database tables:**
+   ```sql
+   CREATE TABLE orderbooks (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       exchange TEXT NOT NULL,
+       symbol TEXT NOT NULL,
+       exchange_sequence_id TEXT NOT NULL,
+       timestamp_collector INTEGER NOT NULL,
+       timestamp_exchange INTEGER NOT NULL,
+       data TEXT NOT NULL,
+       UNIQUE(exchange, symbol, exchange_sequence_id)
+   );
+
+   CREATE TABLE trades (
+       -- Same schema as orderbooks
+   );
+   ```
+
+4. **Updated S3 structure:**
+   ```
+   {exchange}/{symbol}/{orderbook|trade}/[{server}/]{date}/{timestamp}.parquet
+   ```
+
+**Files updated:**
+- `src/models.rs` - Added `DataType` enum, renamed struct
+- `src/db.rs` - Split into two tables, separate fetch/delete functions
+- `src/websocket.rs` - Uses `DataType` enum, renamed `save_snapshot` → `save_event`
+- `src/archive.rs` - Groups data by (exchange, symbol, data_type), creates separate Parquet files
+
+#### Breaking Changes
+
+1. **Config format:** Requires `config.toml` file (env vars no longer supported for market config)
+2. **Database schema:** Delete existing `.db` file before running (new table structure)
+3. **S3 structure:** New path includes data type: `{exchange}/{symbol}/{orderbook|trade}/...`
+
+#### Verification
+
+```bash
+cargo build   # Compiles with warnings (unused code only)
+```
+
+---
+
 ### Added: Quant Expert Review Round 2 Fixes
 
 **Files changed:** `src/models.rs`, `src/metrics.rs`, `src/websocket.rs`, `src/db.rs`, `src/archive.rs`, `src/http.rs`, `src/config.rs`, `src/main.rs`, `src/exchanges/mod.rs`, `src/exchanges/binance.rs`, `src/exchanges/coinbase.rs`, `src/exchanges/upbit.rs`, `src/exchanges/okx.rs`, `src/exchanges/bybit.rs`

@@ -1,139 +1,270 @@
+use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
 
-/// Application configuration loaded from environment variables
+/// TOML config file structure
+#[derive(Debug, Deserialize)]
+pub struct ConfigFile {
+    pub collector: CollectorConfig,
+    #[serde(default)]
+    pub aws: AwsConfig,
+    #[serde(default)]
+    pub database: DatabaseConfig,
+    #[serde(default)]
+    pub archive: ArchiveConfig,
+    #[serde(default)]
+    pub websocket: WebSocketConfig,
+    pub markets: Vec<MarketConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct CollectorConfig {
+    #[serde(default = "default_feeds")]
+    pub feeds: Vec<String>,
+    #[serde(default = "default_batch_interval")]
+    pub batch_interval_secs: u64,
+    #[serde(default = "default_archive_interval")]
+    pub archive_interval_secs: u64,
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    #[serde(default = "default_log_retention")]
+    pub log_retention_days: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AwsConfig {
+    #[serde(default = "default_region")]
+    pub region: String,
+    #[serde(default = "default_bucket")]
+    pub bucket: String,
+    pub home_server_name: Option<String>,
+}
+
+impl Default for AwsConfig {
+    fn default() -> Self {
+        Self {
+            region: default_region(),
+            bucket: default_bucket(),
+            home_server_name: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct DatabaseConfig {
+    #[serde(default = "default_db_path")]
+    pub path: String,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            path: default_db_path(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ArchiveConfig {
+    #[serde(default = "default_archive_dir")]
+    pub dir: String,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            dir: default_archive_dir(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct WebSocketConfig {
+    #[serde(default = "default_message_timeout")]
+    pub message_timeout_secs: u64,
+    #[serde(default = "default_initial_retry")]
+    pub initial_retry_delay_secs: u64,
+    #[serde(default = "default_max_retry")]
+    pub max_retry_delay_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct MarketConfig {
+    pub exchange: String,
+    pub symbols: Vec<String>,
+}
+
+// Default value functions
+fn default_feeds() -> Vec<String> {
+    vec!["orderbook".to_string()]
+}
+fn default_batch_interval() -> u64 {
+    5
+}
+fn default_archive_interval() -> u64 {
+    3600
+}
+fn default_metrics_port() -> u16 {
+    9090
+}
+fn default_log_retention() -> u64 {
+    1
+}
+fn default_region() -> String {
+    "us-west-2".to_string()
+}
+fn default_bucket() -> String {
+    "crypto-market-data".to_string()
+}
+fn default_db_path() -> String {
+    "data/collector.db".to_string()
+}
+fn default_archive_dir() -> String {
+    "data/archive".to_string()
+}
+fn default_message_timeout() -> u64 {
+    30
+}
+fn default_initial_retry() -> u64 {
+    1
+}
+fn default_max_retry() -> u64 {
+    60
+}
+
+/// A single exchange+symbol pair for data collection
+#[derive(Debug, Clone)]
+pub struct MarketPair {
+    pub exchange: String,
+    pub symbol: String,
+}
+
+/// Application configuration
 pub struct Config {
+    // AWS credentials (from env vars for security)
     pub aws_access_key: String,
     pub aws_secret_key: String,
     pub aws_region: String,
-    pub exchange: String,
-    pub market_symbol: String,
-    pub feeds: Vec<String>,
     pub bucket_name: String,
+    pub home_server_name: Option<String>,
+    // Markets to collect
+    pub market_pairs: Vec<MarketPair>,
+    pub feeds: Vec<String>,
+    // Paths
     pub database_path: PathBuf,
     pub archive_dir: PathBuf,
+    // Intervals
     pub batch_interval_secs: u64,
-    pub home_server_name: Option<String>,
-    pub log_retention_days: u64,
-    pub metrics_port: u16,
-    // WebSocket connection settings
+    pub archive_interval_secs: u64,
+    // WebSocket settings
     pub ws_message_timeout_secs: u64,
     pub ws_initial_retry_delay_secs: u64,
     pub ws_max_retry_delay_secs: u64,
-    // Archive settings
-    pub archive_interval_secs: u64,
+    // Other
+    pub log_retention_days: u64,
+    pub metrics_port: u16,
 }
 
 impl Config {
-    /// Load configuration from environment variables
-    pub fn from_env() -> Self {
-        let config = Self::load_from_env();
+    /// Load configuration from TOML file
+    pub fn from_toml() -> Self {
+        let config = Self::load_from_toml();
         config.validate();
         config
     }
 
-    /// Internal: Load values without validation
-    fn load_from_env() -> Self {
+    fn load_from_toml() -> Self {
+        // Config file path (defaults to config.toml in current dir)
+        let config_path = env::var("CONFIG_PATH").unwrap_or_else(|_| "config.toml".to_string());
+
+        let content = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
+            panic!(
+                "Failed to read config file '{}': {}. Create config.toml or set CONFIG_PATH.",
+                config_path, e
+            )
+        });
+
+        let file: ConfigFile = toml::from_str(&content).unwrap_or_else(|e| {
+            panic!("Failed to parse config file '{}': {}", config_path, e)
+        });
+
+        // AWS credentials from environment (not in TOML for security)
         let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
         let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY must be set");
-        let aws_region = env::var("AWS_REGION").unwrap_or_else(|_| "us-west-2".to_string());
 
-        // Exchange configuration (defaults to binance for backward compatibility)
-        let exchange = env::var("EXCHANGE").unwrap_or_else(|_| "binance".to_string());
-        let market_symbol = env::var("MARKET_SYMBOL").unwrap_or_else(|_| "btcusdt".to_string());
-
-        // Feed types: comma-separated list (e.g., "orderbook,trades")
-        let feeds = env::var("FEEDS")
-            .unwrap_or_else(|_| "orderbook".to_string())
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
+        // Flatten markets into pairs
+        let market_pairs: Vec<MarketPair> = file
+            .markets
+            .iter()
+            .flat_map(|m| {
+                m.symbols.iter().map(|s| MarketPair {
+                    exchange: m.exchange.to_lowercase(),
+                    symbol: s.clone(),
+                })
+            })
             .collect();
 
-        let home_server_name = env::var("HOME_SERVER_NAME").ok();
+        if market_pairs.is_empty() {
+            panic!("Configuration error: No markets configured. Add [[markets]] sections to config.toml");
+        }
 
+        // Resolve paths relative to current directory
         let curr_dir = env::current_dir().expect("Failed to get current directory");
-        let base_path = curr_dir.join("orderbookdata");
-
-        // Single bucket for all data (hierarchical prefixes used in S3 keys)
-        let bucket_name = env::var("BUCKET_NAME")
-            .unwrap_or_else(|_| "crypto-market-data".to_string());
-
-        // Local paths still use exchange/symbol for organization
-        let exchange_lower = exchange.to_lowercase();
-        let symbol_lower = market_symbol.to_lowercase();
-        let database_path = base_path.join(format!(
-            "snapshots-{}-spot-{}.db",
-            exchange_lower, symbol_lower
-        ));
-        let archive_dir = base_path.join(format!("archive-{}-{}", exchange_lower, symbol_lower));
-
-        let batch_interval_secs = env::var("BATCH_INTERVAL")
-            .unwrap_or_else(|_| "5".to_string())
-            .parse::<u64>()
-            .unwrap_or(5);
-
-        let log_retention_days = env::var("LOG_RETENTION_DAYS")
-            .unwrap_or_else(|_| "1".to_string())
-            .parse::<u64>()
-            .unwrap_or(1);
-
-        let metrics_port = env::var("METRICS_PORT")
-            .unwrap_or_else(|_| "9090".to_string())
-            .parse::<u16>()
-            .unwrap_or(9090);
-
-        let ws_message_timeout_secs = env::var("WS_MESSAGE_TIMEOUT_SECS")
-            .unwrap_or_else(|_| "30".to_string())
-            .parse::<u64>()
-            .unwrap_or(30);
-
-        let ws_initial_retry_delay_secs = env::var("WS_INITIAL_RETRY_DELAY_SECS")
-            .unwrap_or_else(|_| "1".to_string())
-            .parse::<u64>()
-            .unwrap_or(1);
-
-        let ws_max_retry_delay_secs = env::var("WS_MAX_RETRY_DELAY_SECS")
-            .unwrap_or_else(|_| "60".to_string())
-            .parse::<u64>()
-            .unwrap_or(60);
-
-        let archive_interval_secs = env::var("ARCHIVE_INTERVAL_SECS")
-            .unwrap_or_else(|_| "3600".to_string())
-            .parse::<u64>()
-            .unwrap_or(3600);
+        let database_path = curr_dir.join(&file.database.path);
+        let archive_dir = curr_dir.join(&file.archive.dir);
 
         // Ensure directories exist
-        std::fs::create_dir_all(&base_path).expect("Failed to create base data directory");
+        if let Some(parent) = database_path.parent() {
+            std::fs::create_dir_all(parent).expect("Failed to create database directory");
+        }
         std::fs::create_dir_all(&archive_dir).expect("Failed to create archive directory");
 
         Self {
             aws_access_key,
             aws_secret_key,
-            aws_region,
-            exchange,
-            market_symbol,
-            feeds,
-            bucket_name,
+            aws_region: file.aws.region,
+            bucket_name: file.aws.bucket,
+            home_server_name: file.aws.home_server_name,
+            market_pairs,
+            feeds: file.collector.feeds,
             database_path,
             archive_dir,
-            batch_interval_secs,
-            home_server_name,
-            log_retention_days,
-            metrics_port,
-            ws_message_timeout_secs,
-            ws_initial_retry_delay_secs,
-            ws_max_retry_delay_secs,
-            archive_interval_secs,
+            batch_interval_secs: file.collector.batch_interval_secs,
+            archive_interval_secs: file.collector.archive_interval_secs,
+            ws_message_timeout_secs: file.websocket.message_timeout_secs,
+            ws_initial_retry_delay_secs: file.websocket.initial_retry_delay_secs,
+            ws_max_retry_delay_secs: file.websocket.max_retry_delay_secs,
+            log_retention_days: file.collector.log_retention_days,
+            metrics_port: file.collector.metrics_port,
         }
     }
 
     /// Validate configuration for conflicting or invalid values
     fn validate(&self) {
+        // Check for duplicate market pairs
+        let mut seen = std::collections::HashSet::new();
+        for pair in &self.market_pairs {
+            let key = format!("{}:{}", pair.exchange, pair.symbol.to_lowercase());
+            if !seen.insert(key.clone()) {
+                panic!("Configuration error: Duplicate market pair: {}", key);
+            }
+        }
+
+        // Validate exchange names
+        let supported = crate::exchanges::supported_exchanges();
+        for pair in &self.market_pairs {
+            if !supported.contains(&pair.exchange.as_str()) {
+                panic!(
+                    "Configuration error: Unknown exchange '{}'. Supported: {:?}",
+                    pair.exchange, supported
+                );
+            }
+        }
+
         // WS timeout should be > batch interval to avoid false reconnects
         if self.ws_message_timeout_secs < self.batch_interval_secs {
             panic!(
-                "Configuration error: WS_MESSAGE_TIMEOUT_SECS ({}) must be >= BATCH_INTERVAL ({}) to avoid false timeouts",
+                "Configuration error: websocket.message_timeout_secs ({}) must be >= collector.batch_interval_secs ({}) to avoid false timeouts",
                 self.ws_message_timeout_secs, self.batch_interval_secs
             );
         }
@@ -141,13 +272,13 @@ impl Config {
         // Archive interval should be reasonable (1 min to 24 hours)
         if self.archive_interval_secs < 60 {
             panic!(
-                "Configuration error: ARCHIVE_INTERVAL_SECS ({}) must be at least 60 seconds",
+                "Configuration error: collector.archive_interval_secs ({}) must be at least 60 seconds",
                 self.archive_interval_secs
             );
         }
         if self.archive_interval_secs > 86400 {
             panic!(
-                "Configuration error: ARCHIVE_INTERVAL_SECS ({}) must be at most 86400 seconds (24 hours)",
+                "Configuration error: collector.archive_interval_secs ({}) must be at most 86400 seconds (24 hours)",
                 self.archive_interval_secs
             );
         }
@@ -155,7 +286,7 @@ impl Config {
         // Retry delay should be < message timeout
         if self.ws_initial_retry_delay_secs >= self.ws_message_timeout_secs {
             panic!(
-                "Configuration error: WS_INITIAL_RETRY_DELAY_SECS ({}) must be < WS_MESSAGE_TIMEOUT_SECS ({})",
+                "Configuration error: websocket.initial_retry_delay_secs ({}) must be < websocket.message_timeout_secs ({})",
                 self.ws_initial_retry_delay_secs, self.ws_message_timeout_secs
             );
         }
@@ -163,7 +294,7 @@ impl Config {
         // Max retry delay should be >= initial delay
         if self.ws_max_retry_delay_secs < self.ws_initial_retry_delay_secs {
             panic!(
-                "Configuration error: WS_MAX_RETRY_DELAY_SECS ({}) must be >= WS_INITIAL_RETRY_DELAY_SECS ({})",
+                "Configuration error: websocket.max_retry_delay_secs ({}) must be >= websocket.initial_retry_delay_secs ({})",
                 self.ws_max_retry_delay_secs, self.ws_initial_retry_delay_secs
             );
         }

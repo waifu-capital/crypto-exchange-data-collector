@@ -1,12 +1,37 @@
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-/// Data structure for snapshot messages sent through the channel
-pub struct SnapshotData {
+/// Type-safe enum for market data types
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DataType {
+    Orderbook,
+    Trade,
+}
+
+impl DataType {
+    /// String representation for database/metrics
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DataType::Orderbook => "orderbook",
+            DataType::Trade => "trade",
+        }
+    }
+}
+
+impl fmt::Display for DataType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
+/// Market event data sent through the channel to the database worker.
+/// Replaces the old SnapshotData name which was misleading for trades.
+pub struct MarketEvent {
     pub exchange: String,              // "binance", "coinbase", "bybit", etc.
     pub symbol: String,                // "btcusdt", "BTC-USD", etc.
-    pub data_type: String,             // "orderbook", "trade"
+    pub data_type: DataType,           // Orderbook or Trade (was String)
     pub exchange_sequence_id: String,  // Exchange-specific ID for deduplication
     pub timestamp_collector: i64,      // Microseconds since Unix epoch (our receipt time)
     pub timestamp_exchange: i64,       // Microseconds since Unix epoch (exchange event time)
@@ -74,11 +99,11 @@ impl SequenceTracker {
         &mut self,
         exchange: &str,
         symbol: &str,
-        data_type: &str,
+        data_type: DataType,
         sequence_id: &str,
         current_time: i64,
     ) -> SequenceCheckResult {
-        let key = format!("{}:{}:{}", exchange, symbol, data_type);
+        let key = format!("{}:{}:{}", exchange, symbol, data_type.as_str());
 
         // Try to parse as i64 for numeric comparison
         let seq = match sequence_id.parse::<i64>() {
