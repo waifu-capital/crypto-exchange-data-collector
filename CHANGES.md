@@ -372,7 +372,7 @@ cargo test live_binance -- --ignored  # Run single exchange test
 
 1. **New `BUCKET_NAME` env var:**
    ```bash
-   BUCKET_NAME=crypto-market-data  # Single bucket for all data
+   BUCKET_NAME=crypto-exchange-data-collector  # Single bucket for all data
    ```
 
 2. **Hierarchical S3 key structure:**
@@ -386,7 +386,7 @@ cargo test live_binance -- --ignored  # Run single exchange test
 
 3. **Example S3 structure:**
    ```
-   crypto-market-data/
+   crypto-exchange-data-collector/
    ├── binance/
    │   └── btcusdt/
    │       └── server1/
@@ -410,8 +410,8 @@ cargo test live_binance -- --ignored  # Run single exchange test
 - Backward compatible (just set `BUCKET_NAME`)
 
 **Migration:**
-1. Create bucket: `aws s3 mb s3://crypto-market-data`
-2. Set env var: `BUCKET_NAME=crypto-market-data`
+1. Create bucket: `aws s3 mb s3://crypto-exchange-data-collector`
+2. Set env var: `BUCKET_NAME=crypto-exchange-data-collector`
 3. Deploy new code
 
 ---

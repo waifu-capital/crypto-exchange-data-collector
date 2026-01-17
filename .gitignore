@@ -25,3 +25,6 @@ target
 .DS_Store
 
 .claude/
+
+data/
+logs/

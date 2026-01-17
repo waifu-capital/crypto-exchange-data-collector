@@ -9,15 +9,15 @@ feeds = ["orderbook", "trades"]
 # How often to flush batched data to SQLite (seconds)
 batch_interval_secs = 5
 # How often to archive to S3 (seconds, 1 hour = 3600)
-archive_interval_secs = 3600
+archive_interval_secs = 60
 # Prometheus metrics HTTP port
 metrics_port = 9090
 # How many days to keep log files
-log_retention_days = 7
+log_retention_days = 1
 
 [aws]
 region = "us-west-2"
-bucket = "crypto-market-data"
+bucket = "crypto-exchange-data-collector"
 # Optional: identifier for this server (appears in S3 path)
 # home_server_name = "prod-1"
 
@@ -44,10 +44,10 @@ max_retry_delay_secs = 60
 exchange = "binance"
 symbols = ["btcusdt", "ethusdt", "solusdt"]
 
-[[markets]]
-exchange = "coinbase"
-symbols = ["BTC-USD", "ETH-USD"]
+# [[markets]]
+# exchange = "coinbase"
+# symbols = ["BTC-USD", "ETH-USD"]
 
-[[markets]]
-exchange = "bybit"
-symbols = ["BTCUSDT"]
+# [[markets]]
+# exchange = "bybit"
+# symbols = ["BTCUSDT"]

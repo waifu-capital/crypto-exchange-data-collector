@@ -114,7 +114,7 @@ fn default_region() -> String {
     "us-west-2".to_string()
 }
 fn default_bucket() -> String {
-    "crypto-market-data".to_string()
+    "crypto-exchange-data-collector".to_string()
 }
 fn default_db_path() -> String {
     "data/collector.db".to_string()

@@ -146,7 +146,7 @@ cargo test live_bybit -- --ignored
 | Option | Default | Description |
 |--------|---------|-------------|
 | `region` | `us-west-2` | AWS region for S3 |
-| `bucket` | `crypto-market-data` | S3 bucket name |
+| `bucket` | `crypto-exchange-data-collector` | S3 bucket name |
 | `home_server_name` | (none) | Optional server identifier in S3 path |
 
 ### `[database]`

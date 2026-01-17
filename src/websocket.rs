@@ -14,7 +14,7 @@ use crate::metrics::{
     MESSAGE_TIMEOUTS, PARSE_CIRCUIT_BREAKS, SEQUENCE_DUPLICATES, SEQUENCE_GAPS, SEQUENCE_GAP_SIZE,
     SEQUENCE_OUT_OF_ORDER, WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
 };
-use crate::models::{ConnectionState, DataType, MarketEvent, SequenceCheckResult, SequenceTracker};
+use crate::models::{ConnectionState, DataType, MarketEvent};
 
 /// WebSocket connection configuration
 #[derive(Clone)]
@@ -152,8 +152,6 @@ pub async fn websocket_worker(
         ws_config.max_retry_delay_secs,
     );
 
-    // Sequence tracker for gap detection
-    let mut seq_tracker = SequenceTracker::new();
     // Parse error tracker for circuit breaker
     let mut parse_tracker = ParseErrorTracker::new();
 
@@ -287,58 +285,6 @@ pub async fn websocket_worker(
                                             }
                                         }
 
-                                        // Check for sequence anomalies
-                                        match seq_tracker.check(
-                                            exchange_name,
-                                            &sym,
-                                            DataType::Orderbook,
-                                            &sequence_id,
-                                            collector_time_us,
-                                        ) {
-                                            SequenceCheckResult::Gap(gap) => {
-                                                SEQUENCE_GAPS
-                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
-                                                    .inc();
-                                                SEQUENCE_GAP_SIZE
-                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
-                                                    .observe(gap.gap_size as f64);
-                                                warn!(
-                                                    exchange = exchange_name,
-                                                    symbol = %sym,
-                                                    data_type = "orderbook",
-                                                    expected = gap.expected,
-                                                    received = gap.received,
-                                                    gap_size = gap.gap_size,
-                                                    "Sequence gap detected"
-                                                );
-                                            }
-                                            SequenceCheckResult::OutOfOrder { expected, received } => {
-                                                SEQUENCE_OUT_OF_ORDER
-                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
-                                                    .inc();
-                                                warn!(
-                                                    exchange = exchange_name,
-                                                    symbol = %sym,
-                                                    data_type = "orderbook",
-                                                    expected,
-                                                    received,
-                                                    "Out-of-order sequence detected"
-                                                );
-                                            }
-                                            SequenceCheckResult::Duplicate { seq } => {
-                                                SEQUENCE_DUPLICATES
-                                                    .with_label_values(&[exchange_name, &sym, "orderbook"])
-                                                    .inc();
-                                                debug!(
-                                                    exchange = exchange_name,
-                                                    symbol = %sym,
-                                                    seq,
-                                                    "Duplicate sequence detected"
-                                                );
-                                            }
-                                            SequenceCheckResult::Ok => {}
-                                        }
-
                                         save_event(
                                             &db_tx,
                                             exchange_name,
@@ -380,58 +326,6 @@ pub async fn websocket_worker(
                                                     .with_label_values(&[exchange_name, &normalized_symbol, "trade"])
                                                     .observe((latency_us / 1000) as f64);
                                             }
-                                        }
-
-                                        // Check for sequence anomalies
-                                        match seq_tracker.check(
-                                            exchange_name,
-                                            &sym,
-                                            DataType::Trade,
-                                            &sequence_id,
-                                            collector_time_us,
-                                        ) {
-                                            SequenceCheckResult::Gap(gap) => {
-                                                SEQUENCE_GAPS
-                                                    .with_label_values(&[exchange_name, &sym, "trade"])
-                                                    .inc();
-                                                SEQUENCE_GAP_SIZE
-                                                    .with_label_values(&[exchange_name, &sym, "trade"])
-                                                    .observe(gap.gap_size as f64);
-                                                warn!(
-                                                    exchange = exchange_name,
-                                                    symbol = %sym,
-                                                    data_type = "trade",
-                                                    expected = gap.expected,
-                                                    received = gap.received,
-                                                    gap_size = gap.gap_size,
-                                                    "Sequence gap detected"
-                                                );
-                                            }
-                                            SequenceCheckResult::OutOfOrder { expected, received } => {
-                                                SEQUENCE_OUT_OF_ORDER
-                                                    .with_label_values(&[exchange_name, &sym, "trade"])
-                                                    .inc();
-                                                warn!(
-                                                    exchange = exchange_name,
-                                                    symbol = %sym,
-                                                    data_type = "trade",
-                                                    expected,
-                                                    received,
-                                                    "Out-of-order sequence detected"
-                                                );
-                                            }
-                                            SequenceCheckResult::Duplicate { seq } => {
-                                                SEQUENCE_DUPLICATES
-                                                    .with_label_values(&[exchange_name, &sym, "trade"])
-                                                    .inc();
-                                                debug!(
-                                                    exchange = exchange_name,
-                                                    symbol = %sym,
-                                                    seq,
-                                                    "Duplicate sequence detected"
-                                                );
-                                            }
-                                            SequenceCheckResult::Ok => {}
                                         }
 
                                         save_event(
