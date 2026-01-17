@@ -2,6 +2,102 @@
 
 ## 2026-01-17
 
+### Improved: Code Review Polish Items (4 Minor Improvements)
+
+Based on a code review that found the module structure well-organized, these 4 optional polish items were identified and implemented:
+
+#### 1. Configurable WebSocket Constants
+
+**Files changed:** `src/config.rs`, `src/websocket.rs`
+
+**Problem:** WebSocket connection parameters were hardcoded constants:
+```rust
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+```
+
+**Solution:** Moved to `Config` struct with environment variables:
+- `WS_MESSAGE_TIMEOUT_SECS` (default: 30)
+- `WS_INITIAL_RETRY_DELAY_SECS` (default: 1)
+- `WS_MAX_RETRY_DELAY_SECS` (default: 60)
+
+**Impact:** Operators can tune connection parameters without recompiling.
+
+#### 2. Archive Runs Immediately on Startup
+
+**Files changed:** `src/archive.rs`
+
+**Problem:** The archive loop slept first, so first archive happened 1 hour after startup:
+```rust
+loop {
+    sleep(Duration::from_secs(3600)).await;  // Sleep first
+    archive_snapshots(...).await;
+}
+```
+
+**Solution:** Reordered to archive first, then sleep:
+```rust
+loop {
+    archive_snapshots(...).await;  // Archive first
+    sleep(Duration::from_secs(archive_interval_secs)).await;
+}
+```
+
+Also made interval configurable via `ARCHIVE_INTERVAL_SECS` (default: 3600).
+
+**Impact:** Data is archived immediately on startup, useful after restarts.
+
+#### 3. Health Handler Uses Shared Connection State
+
+**Files changed:** `src/http.rs`, `src/websocket.rs`, `src/models.rs`
+
+**Problem:** Health handler iterated through all Prometheus metrics to find connection status:
+```rust
+for family in &metric_families {
+    if family.get_name() == "collector_websocket_connected" { ... }
+}
+```
+
+**Solution:** Added `ConnectionState` (`Arc<RwLock<HashMap<String, bool>>>`) shared between WebSocket workers and HTTP handler:
+```rust
+// In websocket.rs - update on connect/disconnect
+conn_state.write().await.insert(key, connected);
+
+// In http.rs - read for health check
+let state = conn_state.read().await;
+let connections_up = state.values().filter(|&&v| v).count();
+```
+
+**Impact:** O(1) health check instead of O(n) metric iteration.
+
+#### 4. Simplified Parquet Construction with itertools
+
+**Files changed:** `Cargo.toml`, `src/archive.rs`
+
+**Problem:** Verbose manual tuple extraction (17 lines):
+```rust
+let mut exchanges = Vec::with_capacity(snapshot_count);
+let mut symbols = Vec::with_capacity(snapshot_count);
+// ... 4 more vectors
+for (ex, sym, dt, seq, ts, d) in snapshots {
+    exchanges.push(ex);
+    symbols.push(sym);
+    // ... 4 more pushes
+}
+```
+
+**Solution:** Using `itertools::multiunzip` (3 lines):
+```rust
+let (exchanges, symbols, data_types, seq_ids, timestamps, data_col): (
+    Vec<String>, Vec<String>, Vec<String>, Vec<String>, Vec<i64>, Vec<String>,
+) = multiunzip(snapshots);
+```
+
+**Impact:** Cleaner, more idiomatic Rust. Added `itertools = "0.14"` dependency.
+
+---
+
 ### Added: WebSocket Connection Health Monitoring
 
 **Files changed:** `src/websocket.rs`

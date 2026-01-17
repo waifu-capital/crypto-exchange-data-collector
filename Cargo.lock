@@ -1118,6 +1118,7 @@ dependencies = [
  "chrono",
  "dotenv",
  "futures-util",
+ "itertools",
  "lazy_static",
  "polars",
  "prometheus",

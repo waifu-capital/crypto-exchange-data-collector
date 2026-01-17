@@ -7,38 +7,42 @@ use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tracing::{debug, error, info, warn};
 
-/// Timeout for receiving WebSocket messages.
-/// With 100ms message frequency from Binance, 30s without a message indicates a stale connection.
-const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// Initial delay before retrying a failed connection.
-const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
-
-/// Maximum delay between retry attempts.
-const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+/// WebSocket connection configuration
+pub struct WsConfig {
+    /// Timeout for receiving WebSocket messages (seconds)
+    pub message_timeout_secs: u64,
+    /// Initial delay before retrying a failed connection (seconds)
+    pub initial_retry_delay_secs: u64,
+    /// Maximum delay between retry attempts (seconds)
+    pub max_retry_delay_secs: u64,
+}
 
 /// Exponential backoff helper for connection retries.
 struct ExponentialBackoff {
     current_delay: Duration,
+    max_delay: Duration,
+    initial_delay: Duration,
 }
 
 impl ExponentialBackoff {
-    fn new() -> Self {
+    fn new(initial_delay_secs: u64, max_delay_secs: u64) -> Self {
         Self {
-            current_delay: INITIAL_RETRY_DELAY,
+            current_delay: Duration::from_secs(initial_delay_secs),
+            max_delay: Duration::from_secs(max_delay_secs),
+            initial_delay: Duration::from_secs(initial_delay_secs),
         }
     }
 
-    /// Returns the next delay and doubles it for the next call (capped at MAX_RETRY_DELAY).
+    /// Returns the next delay and doubles it for the next call (capped at max_delay).
     fn next_delay(&mut self) -> Duration {
         let delay = self.current_delay;
-        self.current_delay = (self.current_delay * 2).min(MAX_RETRY_DELAY);
+        self.current_delay = (self.current_delay * 2).min(self.max_delay);
         delay
     }
 
     /// Resets the backoff to the initial delay (call after successful connection).
     fn reset(&mut self) {
-        self.current_delay = INITIAL_RETRY_DELAY;
+        self.current_delay = self.initial_delay;
     }
 }
 
@@ -46,15 +50,30 @@ use crate::metrics::{
     LAST_MESSAGE_TIMESTAMP, MESSAGES_DROPPED, MESSAGES_RECEIVED, MESSAGE_TIMEOUTS,
     WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
 };
-use crate::models::SnapshotData;
+use crate::models::{ConnectionState, SnapshotData};
+
+/// Helper to update connection state
+async fn set_connection_status(conn_state: &ConnectionState, exchange: &str, symbol: &str, connected: bool) {
+    let key = format!("{}:{}", exchange, symbol);
+    conn_state.write().await.insert(key, connected);
+}
 
 /// WebSocket worker that connects to Binance and streams orderbook data
-pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
+pub async fn websocket_worker(
+    db_tx: Sender<SnapshotData>,
+    market_symbol: String,
+    ws_config: WsConfig,
+    conn_state: ConnectionState,
+) {
     let url = format!(
         "wss://stream.binance.com:9443/ws/{}@depth20@100ms",
         market_symbol.to_lowercase()
     );
-    let mut backoff = ExponentialBackoff::new();
+    let message_timeout = Duration::from_secs(ws_config.message_timeout_secs);
+    let mut backoff = ExponentialBackoff::new(
+        ws_config.initial_retry_delay_secs,
+        ws_config.max_retry_delay_secs,
+    );
 
     loop {
         match connect_async(&url).await {
@@ -63,11 +82,12 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                 WEBSOCKET_CONNECTED
                     .with_label_values(&["binance", &market_symbol])
                     .set(1.0);
+                set_connection_status(&conn_state, "binance", &market_symbol, true).await;
                 backoff.reset(); // Reset backoff on successful connection
                 let (mut write, mut read) = ws_stream.split();
 
                 loop {
-                    match timeout(MESSAGE_TIMEOUT, read.next()).await {
+                    match timeout(message_timeout, read.next()).await {
                         Ok(Some(Ok(msg))) => {
                             if msg.is_text() {
                                 // Sample log ~0.1% of messages at debug level
@@ -152,7 +172,7 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                         Err(_) => {
                             error!(
                                 symbol = %market_symbol,
-                                timeout_secs = MESSAGE_TIMEOUT.as_secs(),
+                                timeout_secs = message_timeout.as_secs(),
                                 "Message timeout - connection may be stale, reconnecting"
                             );
                             MESSAGE_TIMEOUTS
@@ -170,6 +190,9 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                 error!(error = %e, "Failed to connect to WebSocket");
             }
         }
+
+        // Mark connection as down before attempting reconnect
+        set_connection_status(&conn_state, "binance", &market_symbol, false).await;
 
         let delay = backoff.next_delay();
         WEBSOCKET_RECONNECTS

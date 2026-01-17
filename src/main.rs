@@ -23,9 +23,9 @@ use crate::config::Config;
 use crate::db::{create_pool, db_worker, init_database};
 use crate::http::run_http_server;
 use crate::metrics::init_metrics;
-use crate::models::SnapshotData;
+use crate::models::{new_connection_state, SnapshotData};
 use crate::utils::cleanup_old_logs;
-use crate::websocket::websocket_worker;
+use crate::websocket::{websocket_worker, WsConfig};
 
 /// Initialize tracing with multiple outputs:
 /// - Pretty format to stdout (for humans)
@@ -95,6 +95,9 @@ async fn main() {
     // Create channel for snapshot data
     let (db_tx, mut db_rx) = channel::<SnapshotData>(1000);
 
+    // Create shared connection state for health checks
+    let conn_state = new_connection_state();
+
     // Spawn database worker
     {
         let db_pool = db_pool.clone();
@@ -108,8 +111,14 @@ async fn main() {
     {
         let websocket_tx = db_tx.clone();
         let market_symbol = config.market_symbol.clone();
+        let ws_config = WsConfig {
+            message_timeout_secs: config.ws_message_timeout_secs,
+            initial_retry_delay_secs: config.ws_initial_retry_delay_secs,
+            max_retry_delay_secs: config.ws_max_retry_delay_secs,
+        };
+        let conn_state = conn_state.clone();
         tokio::spawn(async move {
-            websocket_worker(websocket_tx, market_symbol).await;
+            websocket_worker(websocket_tx, market_symbol, ws_config, conn_state).await;
         });
     }
 
@@ -121,7 +130,7 @@ async fn main() {
     // Spawn metrics HTTP server (port 9090 by default)
     let metrics_port = config.metrics_port;
     tokio::spawn(async move {
-        run_http_server(Some(metrics_port)).await;
+        run_http_server(Some(metrics_port), conn_state).await;
     });
 
     // Spawn periodic log cleanup task (runs once per day)
@@ -143,6 +152,7 @@ async fn main() {
         config.bucket_name,
         client,
         config.home_server_name,
+        config.archive_interval_secs,
     )
     .await;
 }

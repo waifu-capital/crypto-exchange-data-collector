@@ -14,6 +14,12 @@ pub struct Config {
     pub home_server_name: Option<String>,
     pub log_retention_days: u64,
     pub metrics_port: u16,
+    // WebSocket connection settings
+    pub ws_message_timeout_secs: u64,
+    pub ws_initial_retry_delay_secs: u64,
+    pub ws_max_retry_delay_secs: u64,
+    // Archive settings
+    pub archive_interval_secs: u64,
 }
 
 impl Config {
@@ -46,6 +52,26 @@ impl Config {
             .parse::<u16>()
             .unwrap_or(9090);
 
+        let ws_message_timeout_secs = env::var("WS_MESSAGE_TIMEOUT_SECS")
+            .unwrap_or_else(|_| "30".to_string())
+            .parse::<u64>()
+            .unwrap_or(30);
+
+        let ws_initial_retry_delay_secs = env::var("WS_INITIAL_RETRY_DELAY_SECS")
+            .unwrap_or_else(|_| "1".to_string())
+            .parse::<u64>()
+            .unwrap_or(1);
+
+        let ws_max_retry_delay_secs = env::var("WS_MAX_RETRY_DELAY_SECS")
+            .unwrap_or_else(|_| "60".to_string())
+            .parse::<u64>()
+            .unwrap_or(60);
+
+        let archive_interval_secs = env::var("ARCHIVE_INTERVAL_SECS")
+            .unwrap_or_else(|_| "3600".to_string())
+            .parse::<u64>()
+            .unwrap_or(3600);
+
         // Ensure directories exist
         std::fs::create_dir_all(&base_path).expect("Failed to create base data directory");
         std::fs::create_dir_all(&archive_dir).expect("Failed to create archive directory");
@@ -62,6 +88,10 @@ impl Config {
             home_server_name,
             log_retention_days,
             metrics_port,
+            ws_message_timeout_secs,
+            ws_initial_retry_delay_secs,
+            ws_max_retry_delay_secs,
+            archive_interval_secs,
         }
     }
 }

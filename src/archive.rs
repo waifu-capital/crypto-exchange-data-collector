@@ -3,6 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use itertools::multiunzip;
 use polars::prelude::*;
 use sqlx::sqlite::SqlitePool;
 use tokio::time::sleep;
@@ -58,12 +59,9 @@ pub async fn run_archive_scheduler(
     bucket_name: String,
     client: Client,
     home_server_name: Option<String>,
+    archive_interval_secs: u64,
 ) {
     loop {
-        let sleep_duration = 3600;
-        info!(sleep_secs = sleep_duration, "Sleeping until next archive");
-        sleep(Duration::from_secs(sleep_duration)).await;
-
         archive_snapshots(
             &db_pool,
             &archive_dir,
@@ -72,6 +70,9 @@ pub async fn run_archive_scheduler(
             home_server_name.as_deref(),
         )
         .await;
+
+        info!(sleep_secs = archive_interval_secs, "Sleeping until next archive");
+        sleep(Duration::from_secs(archive_interval_secs)).await;
     }
 }
 
@@ -105,38 +106,25 @@ pub async fn archive_snapshots(
         return;
     }
 
-    // Create DataFrame
+    // Extract columns from snapshot tuples using multiunzip
+    let snapshot_count = snapshots.len();
+    let (exchanges, symbols, data_types, seq_ids, timestamps, data_col): (
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<i64>,
+        Vec<String>,
+    ) = multiunzip(snapshots);
+
+    // Create DataFrame from extracted columns
     let mut df = match DataFrame::new(vec![
-        Series::new(
-            "exchange".into(),
-            snapshots.iter().map(|s| s.0.clone()).collect::<Vec<String>>(),
-        )
-        .into(),
-        Series::new(
-            "symbol".into(),
-            snapshots.iter().map(|s| s.1.clone()).collect::<Vec<String>>(),
-        )
-        .into(),
-        Series::new(
-            "data_type".into(),
-            snapshots.iter().map(|s| s.2.clone()).collect::<Vec<String>>(),
-        )
-        .into(),
-        Series::new(
-            "exchange_sequence_id".into(),
-            snapshots.iter().map(|s| s.3.clone()).collect::<Vec<String>>(),
-        )
-        .into(),
-        Series::new(
-            "timestamp".into(),
-            snapshots.iter().map(|s| s.4).collect::<Vec<i64>>(),
-        )
-        .into(),
-        Series::new(
-            "data".into(),
-            snapshots.iter().map(|s| s.5.clone()).collect::<Vec<String>>(),
-        )
-        .into(),
+        Column::new("exchange".into(), exchanges),
+        Column::new("symbol".into(), symbols),
+        Column::new("data_type".into(), data_types),
+        Column::new("exchange_sequence_id".into(), seq_ids),
+        Column::new("timestamp".into(), timestamps),
+        Column::new("data".into(), data_col),
     ]) {
         Ok(df) => df,
         Err(e) => {
@@ -176,7 +164,7 @@ pub async fn archive_snapshots(
         return;
     }
     info!(
-        snapshot_count = snapshots.len(),
+        snapshot_count,
         path = %archive_file_path.display(),
         "Written snapshots to Parquet file"
     );
@@ -213,7 +201,7 @@ pub async fn archive_snapshots(
 
             // Update metrics for successful archive
             ARCHIVES_COMPLETED.inc();
-            SNAPSHOTS_ARCHIVED.inc_by(snapshots.len() as f64);
+            SNAPSHOTS_ARCHIVED.inc_by(snapshot_count as f64);
 
             if let Err(e) = delete_all_snapshots(db_pool).await {
                 error!(error = %e, "Failed to delete snapshots from database");

@@ -1,6 +1,7 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::{
+    extract::State,
     http::StatusCode,
     response::IntoResponse,
     routing::get,
@@ -11,6 +12,7 @@ use serde_json::json;
 use tracing::{error, info};
 
 use crate::metrics::{APP_START_TIMESTAMP, MESSAGES_DROPPED};
+use crate::models::ConnectionState;
 
 /// Default port for the metrics HTTP server
 const DEFAULT_METRICS_PORT: u16 = 9090;
@@ -42,7 +44,7 @@ async fn metrics_handler() -> impl IntoResponse {
 }
 
 /// Handler for /health endpoint - returns JSON health status
-async fn health_handler() -> impl IntoResponse {
+async fn health_handler(State(conn_state): State<ConnectionState>) -> impl IntoResponse {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -55,22 +57,11 @@ async fn health_handler() -> impl IntoResponse {
         0.0
     };
 
-    // Check WebSocket connections - gather all label combinations
-    // For now, we check if any connection is up
-    let metric_families = prometheus::gather();
-    let mut connections_up = 0;
-    let mut connections_total = 0;
-
-    for family in &metric_families {
-        if family.get_name() == "collector_websocket_connected" {
-            for metric in family.get_metric() {
-                connections_total += 1;
-                if metric.get_gauge().get_value() > 0.0 {
-                    connections_up += 1;
-                }
-            }
-        }
-    }
+    // Check WebSocket connections from shared state
+    let state = conn_state.read().await;
+    let connections_total = state.len();
+    let connections_up = state.values().filter(|&&v| v).count();
+    drop(state);
 
     let messages_dropped = MESSAGES_DROPPED.get() as u64;
 
@@ -110,13 +101,14 @@ async fn ready_handler() -> impl IntoResponse {
 }
 
 /// Run the HTTP server for metrics and health endpoints
-pub async fn run_http_server(port: Option<u16>) {
+pub async fn run_http_server(port: Option<u16>, conn_state: ConnectionState) {
     let port = port.unwrap_or(DEFAULT_METRICS_PORT);
 
     let app = Router::new()
         .route("/metrics", get(metrics_handler))
         .route("/health", get(health_handler))
-        .route("/ready", get(ready_handler));
+        .route("/ready", get(ready_handler))
+        .with_state(conn_state);
 
     let addr = format!("0.0.0.0:{}", port);
 
