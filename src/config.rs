@@ -48,10 +48,13 @@ impl Config {
         let curr_dir = env::current_dir().expect("Failed to get current directory");
         let base_path = curr_dir.join("orderbookdata");
 
-        // Dynamic naming based on exchange
+        // Single bucket for all data (hierarchical prefixes used in S3 keys)
+        let bucket_name = env::var("BUCKET_NAME")
+            .unwrap_or_else(|_| "crypto-market-data".to_string());
+
+        // Local paths still use exchange/symbol for organization
         let exchange_lower = exchange.to_lowercase();
         let symbol_lower = market_symbol.to_lowercase();
-        let bucket_name = format!("{}-spot-{}", exchange_lower, symbol_lower);
         let database_path = base_path.join(format!(
             "snapshots-{}-spot-{}.db",
             exchange_lower, symbol_lower

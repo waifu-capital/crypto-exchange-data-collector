@@ -2,6 +2,60 @@
 
 ## 2026-01-17
 
+### Improved: S3 Bucket Organization with Hierarchical Prefixes
+
+**Files changed:** `src/config.rs`, `src/archive.rs`, `src/main.rs`
+
+**Problem:** With multiple exchanges and symbols, the previous approach created one S3 bucket per exchange-symbol combination (e.g., `binance-spot-btcusdt`, `coinbase-spot-btc-usd`). This becomes unmanageable with many symbols and complicates IAM policies, lifecycle rules, and cross-symbol analysis.
+
+**Solution:** Single bucket with hierarchical S3 key prefixes:
+
+1. **New `BUCKET_NAME` env var:**
+   ```bash
+   BUCKET_NAME=crypto-market-data  # Single bucket for all data
+   ```
+
+2. **Hierarchical S3 key structure:**
+   ```
+   # With HOME_SERVER_NAME (for redundant server setups):
+   {exchange}/{symbol}/{server}/{YYYY-MM-DD}/{timestamp}.parquet
+
+   # Without HOME_SERVER_NAME (default for single-server users):
+   {exchange}/{symbol}/{YYYY-MM-DD}/{timestamp}.parquet
+   ```
+
+3. **Example S3 structure:**
+   ```
+   crypto-market-data/
+   ├── binance/
+   │   └── btcusdt/
+   │       └── server1/
+   │           └── 2026-01-17/
+   │               └── 1737100800000.parquet
+   └── coinbase/
+       └── btc-usd/
+           └── 2026-01-17/
+               └── 1737100800000.parquet
+   ```
+
+4. **Server level is optional:**
+   - If `HOME_SERVER_NAME` is set: includes server in path (for multi-server redundancy)
+   - If not set: omits server level (simpler for single-server deployments)
+
+**Benefits:**
+- Single bucket to manage with one IAM policy
+- One lifecycle rule applies to all data
+- Easy cross-exchange queries with S3 Select or Athena
+- Navigable folder structure in AWS Console
+- Backward compatible (just set `BUCKET_NAME`)
+
+**Migration:**
+1. Create bucket: `aws s3 mb s3://crypto-market-data`
+2. Set env var: `BUCKET_NAME=crypto-market-data`
+3. Deploy new code
+
+---
+
 ### Refactored: WebSocket Worker to Use Exchange Trait
 
 **Files changed:** `src/websocket.rs`, `src/config.rs`, `src/main.rs`

@@ -179,6 +179,8 @@ async fn main() {
         config.archive_dir,
         config.bucket_name,
         client,
+        config.exchange,
+        config.market_symbol,
         config.home_server_name,
         config.archive_interval_secs,
     )

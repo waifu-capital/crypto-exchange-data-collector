@@ -5,6 +5,7 @@ use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
+use chrono::Utc;
 use itertools::multiunzip;
 use polars::prelude::*;
 use sqlx::sqlite::SqlitePool;
@@ -70,7 +71,7 @@ pub async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, reg
                 Err(e) => warn!(
                     bucket = bucket_name,
                     error = %e,
-                    "Failed to create bucket, will retry on next upload"
+                    "Failed to create bucket (may already exist or require manual creation)"
                 ),
             }
         }
@@ -83,6 +84,8 @@ pub async fn run_archive_scheduler(
     archive_dir: PathBuf,
     bucket_name: String,
     client: Client,
+    exchange: String,
+    symbol: String,
     home_server_name: Option<String>,
     archive_interval_secs: u64,
 ) {
@@ -92,6 +95,8 @@ pub async fn run_archive_scheduler(
             &archive_dir,
             &bucket_name,
             &client,
+            &exchange,
+            &symbol,
             home_server_name.as_deref(),
         )
         .await;
@@ -102,21 +107,19 @@ pub async fn run_archive_scheduler(
 }
 
 /// Archive snapshots to Parquet and upload to S3
+///
+/// S3 key structure:
+/// - With server: `{exchange}/{symbol}/{server}/{YYYY-MM-DD}/{timestamp}.parquet`
+/// - Without server: `{exchange}/{symbol}/{YYYY-MM-DD}/{timestamp}.parquet`
 pub async fn archive_snapshots(
     db_pool: &SqlitePool,
     archive_dir: &Path,
     bucket_name: &str,
     client: &Client,
+    exchange: &str,
+    symbol: &str,
     home_server_name: Option<&str>,
 ) {
-    let home_server_name = match home_server_name {
-        Some(name) => name,
-        None => {
-            error!("HOME_SERVER_NAME not set, skipping archive");
-            return;
-        }
-    };
-
     // Fetch all snapshots
     let snapshots = match fetch_all_snapshots(db_pool).await {
         Ok(s) => s,
@@ -158,13 +161,25 @@ pub async fn archive_snapshots(
         }
     };
 
-    // Create archive file
+    // Build S3 key with hierarchical structure
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("System time before Unix epoch")
         .as_millis();
-    let archive_file_name = format!("snapshots_{}_{}.parquet", home_server_name, timestamp);
-    let archive_file_path = archive_dir.join(&archive_file_name);
+    let date = Utc::now().format("%Y-%m-%d");
+
+    // S3 key: {exchange}/{symbol}/[{server}/]{date}/{timestamp}.parquet
+    let s3_key = match home_server_name {
+        Some(server) => format!(
+            "{}/{}/{}/{}/{}.parquet",
+            exchange, symbol, server, date, timestamp
+        ),
+        None => format!("{}/{}/{}/{}.parquet", exchange, symbol, date, timestamp),
+    };
+
+    // Local file name (flat, for temporary storage)
+    let local_file_name = format!("{}.parquet", timestamp);
+    let archive_file_path = archive_dir.join(&local_file_name);
 
     let mut file = match std::fs::File::create(&archive_file_path) {
         Ok(f) => f,
@@ -191,13 +206,13 @@ pub async fn archive_snapshots(
     info!(
         snapshot_count,
         path = %archive_file_path.display(),
+        s3_key = %s3_key,
         "Written snapshots to Parquet file"
     );
 
     // Upload to S3
     let upload_start = Instant::now();
-    if let Err(e) = upload_to_s3(&archive_file_path, bucket_name, &archive_file_name, client).await
-    {
+    if let Err(e) = upload_to_s3(&archive_file_path, bucket_name, &s3_key, client).await {
         error!(error = %e, "Failed to upload to S3, will retry next cycle");
         S3_UPLOAD_FAILURES.inc();
         S3_UPLOAD_DURATION
@@ -213,14 +228,14 @@ pub async fn archive_snapshots(
     match client
         .head_object()
         .bucket(bucket_name)
-        .key(&archive_file_name)
+        .key(&s3_key)
         .send()
         .await
     {
         Ok(_) => {
             info!(
                 bucket = bucket_name,
-                key = archive_file_name,
+                key = %s3_key,
                 "Verified S3 upload"
             );
 
