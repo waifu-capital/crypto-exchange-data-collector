@@ -20,6 +20,7 @@ use crate::archive::{create_bucket_if_not_exists, run_archive_scheduler};
 use crate::config::Config;
 use crate::db::{create_pool, db_worker, init_database};
 use crate::models::SnapshotData;
+use crate::utils::cleanup_old_logs;
 use crate::websocket::websocket_worker;
 
 /// Initialize tracing with multiple outputs:
@@ -64,9 +65,13 @@ async fn main() {
     // Load configuration
     let config = Config::from_env();
 
+    // Clean up old log files on startup
+    cleanup_old_logs("logs", config.log_retention_days);
+
     info!(
         market_symbol = %config.market_symbol,
         aws_region = %config.aws_region,
+        log_retention_days = config.log_retention_days,
         "Starting crypto exchange data collector"
     );
 
@@ -105,6 +110,18 @@ async fn main() {
     tokio::spawn(async move {
         run_liveness_probe().await;
     });
+
+    // Spawn periodic log cleanup task (runs once per day)
+    {
+        let retention_days = config.log_retention_days;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            loop {
+                interval.tick().await;
+                cleanup_old_logs("logs", retention_days);
+            }
+        });
+    }
 
     // Run archive scheduler (blocks main task)
     run_archive_scheduler(

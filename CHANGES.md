@@ -1,5 +1,52 @@
 # Changelog
 
+## 2026-01-17
+
+### Added: Log File Retention Management
+
+**Files changed:** `src/config.rs`, `src/utils.rs`, `src/main.rs`
+
+**Problem:** The logging setup uses `tracing-appender` with `Rotation::DAILY` but had no cleanup of old log files. Daily files would accumulate indefinitely, eventually filling up disk space.
+
+**Solution:** Implemented age-based log cleanup:
+
+1. **New configuration option:**
+   ```bash
+   LOG_RETENTION_DAYS=1  # Default: 1 day
+   ```
+
+2. **Cleanup function in `src/utils.rs`:**
+   ```rust
+   pub fn cleanup_old_logs(logs_dir: &str, retention_days: u64) {
+       // Deletes files older than retention_days based on modification time
+   }
+   ```
+
+3. **Cleanup triggers:**
+   - On application startup (immediate cleanup)
+   - Periodically every 24 hours via background task
+
+**Behavior:**
+- Scans the `logs/` directory for files
+- Deletes any file whose modification time exceeds the retention period
+- Logs deleted files at INFO level
+- Logs errors at WARN level but continues processing
+
+**Configuration:**
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LOG_RETENTION_DAYS` | 1 | Number of days to keep log files |
+
+**Trade-offs:**
+- Doesn't limit individual file size (a single day could produce a large file)
+- Cleanup only happens when the app is running
+- Simple implementation without new dependencies
+
+**Impact:** Prevents unbounded disk usage from log accumulation. Default 1-day retention keeps only recent logs while ensuring disk space is reclaimed.
+
+---
+
 ## 2026-01-16
 
 ### Fixed: Polars API Compatibility
