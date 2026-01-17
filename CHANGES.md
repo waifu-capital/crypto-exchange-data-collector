@@ -2,6 +2,72 @@
 
 ## 2026-01-17
 
+### Added: WebSocket Connection Health Monitoring
+
+**Files changed:** `src/websocket.rs`
+
+**Problem:** The WebSocket implementation could detect explicit connection failures but couldn't detect "silent failures" where:
+- The TCP connection stays open but the server stops sending data
+- Network issues don't immediately close the socket
+- The connection appears alive but is actually stale
+
+With 100ms message frequency from Binance, if no message arrives for 30+ seconds, something is wrong.
+
+**Solution:** Implemented application-level timeout with exponential backoff:
+
+1. **Message timeout detection:**
+   ```rust
+   const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+   match timeout(MESSAGE_TIMEOUT, read.next()).await {
+       Ok(Some(Ok(msg))) => { /* process */ }
+       Ok(Some(Err(e))) => break,  // WebSocket error
+       Ok(None) => break,          // Stream ended
+       Err(_) => break,            // TIMEOUT - reconnect
+   }
+   ```
+
+2. **Exponential backoff for reconnection:**
+   ```rust
+   const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+   const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+   struct ExponentialBackoff {
+       current_delay: Duration,
+   }
+
+   impl ExponentialBackoff {
+       fn next_delay(&mut self) -> Duration {
+           let delay = self.current_delay;
+           self.current_delay = (self.current_delay * 2).min(MAX_RETRY_DELAY);
+           delay
+       }
+
+       fn reset(&mut self) {
+           self.current_delay = INITIAL_RETRY_DELAY;
+       }
+   }
+   ```
+
+3. **Backoff behavior:**
+   - Resets to 1 second after successful connection
+   - Doubles after each failure: 1s → 2s → 4s → 8s → ... → 60s (max)
+   - Prevents hammering the server during extended outages
+
+**Benefits:**
+- Detects stale connections within 30 seconds
+- Zero runtime overhead (tokio timeout is essentially free)
+- Self-contained, no external dependencies
+- Prevents rapid reconnection loops during outages
+
+**Trade-offs:**
+- 30-second timeout is tuned for Binance's 100ms message frequency
+- May need adjustment for lower-frequency data sources
+
+**Impact:** System now automatically recovers from silent connection failures that would previously cause indefinite data loss.
+
+---
+
 ### Added: Log File Retention Management
 
 **Files changed:** `src/config.rs`, `src/utils.rs`, `src/main.rs`

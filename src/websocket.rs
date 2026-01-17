@@ -3,9 +3,44 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::Value;
 use tokio::sync::mpsc::Sender;
-use tokio::time::sleep;
+use tokio::time::{sleep, timeout};
 use tokio_tungstenite::connect_async;
 use tracing::{debug, error, info, warn};
+
+/// Timeout for receiving WebSocket messages.
+/// With 100ms message frequency from Binance, 30s without a message indicates a stale connection.
+const MESSAGE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Initial delay before retrying a failed connection.
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Maximum delay between retry attempts.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+
+/// Exponential backoff helper for connection retries.
+struct ExponentialBackoff {
+    current_delay: Duration,
+}
+
+impl ExponentialBackoff {
+    fn new() -> Self {
+        Self {
+            current_delay: INITIAL_RETRY_DELAY,
+        }
+    }
+
+    /// Returns the next delay and doubles it for the next call (capped at MAX_RETRY_DELAY).
+    fn next_delay(&mut self) -> Duration {
+        let delay = self.current_delay;
+        self.current_delay = (self.current_delay * 2).min(MAX_RETRY_DELAY);
+        delay
+    }
+
+    /// Resets the backoff to the initial delay (call after successful connection).
+    fn reset(&mut self) {
+        self.current_delay = INITIAL_RETRY_DELAY;
+    }
+}
 
 use crate::models::SnapshotData;
 use crate::utils::increment_dropped_snapshots;
@@ -16,17 +51,18 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
         "wss://stream.binance.com:9443/ws/{}@depth20@100ms",
         market_symbol.to_lowercase()
     );
-    let retry_delay = Duration::from_secs(5);
+    let mut backoff = ExponentialBackoff::new();
 
     loop {
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
                 info!(symbol = %market_symbol, "Connected to Binance WebSocket");
+                backoff.reset(); // Reset backoff on successful connection
                 let (mut write, mut read) = ws_stream.split();
 
-                while let Some(message) = read.next().await {
-                    match message {
-                        Ok(msg) => {
+                loop {
+                    match timeout(MESSAGE_TIMEOUT, read.next()).await {
+                        Ok(Some(Ok(msg))) => {
                             if msg.is_text() {
                                 // Sample log ~0.1% of messages at debug level
                                 if rand::random::<u32>() % 1000 == 0 {
@@ -79,8 +115,20 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                                 debug!(?msg, "Received other message");
                             }
                         }
-                        Err(e) => {
+                        Ok(Some(Err(e))) => {
                             error!(error = %e, "WebSocket error");
+                            break;
+                        }
+                        Ok(None) => {
+                            info!(symbol = %market_symbol, "WebSocket stream ended");
+                            break;
+                        }
+                        Err(_) => {
+                            error!(
+                                symbol = %market_symbol,
+                                timeout_secs = MESSAGE_TIMEOUT.as_secs(),
+                                "Message timeout - connection may be stale, reconnecting"
+                            );
                             break;
                         }
                     }
@@ -91,11 +139,13 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
             }
         }
 
+        let delay = backoff.next_delay();
         info!(
-            delay_secs = retry_delay.as_secs(),
-            "Reconnecting to WebSocket"
+            symbol = %market_symbol,
+            delay_secs = delay.as_secs(),
+            "Reconnecting to WebSocket with exponential backoff"
         );
-        sleep(retry_delay).await;
+        sleep(delay).await;
     }
 }
 
