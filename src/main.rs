@@ -115,8 +115,9 @@ async fn main() {
     let db_pool = create_pool(&config.database_path).await;
     init_database(&db_pool).await;
 
-    // Create channel for market events (sized for all market pairs)
-    let channel_size = 1000 * config.market_pairs.len();
+    // Create channel for market events (sized for all market pairs * feeds)
+    // Each (pair, feed) combination gets its own worker
+    let channel_size = 1000 * config.market_pairs.len() * feeds.len();
     let (db_tx, db_rx) = channel::<MarketEvent>(channel_size);
 
     // Create shutdown broadcast channel
@@ -142,30 +143,41 @@ async fn main() {
         max_retry_delay_secs: config.ws_max_retry_delay_secs,
     };
 
-    // Spawn WebSocket worker for each market pair
-    let mut ws_handles: Vec<(MarketPair, tokio::task::JoinHandle<()>)> = Vec::new();
+    // Spawn WebSocket worker for each (market pair, feed) combination
+    // This isolates failure domains - if orderbook feed fails, trades continue (and vice versa)
+    let mut ws_handles: Vec<(MarketPair, FeedType, tokio::task::JoinHandle<()>)> = Vec::new();
     for pair in &config.market_pairs {
-        let exchange = create_exchange(&pair.exchange).unwrap_or_else(|| {
-            panic!(
-                "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
-                pair.exchange
-            )
-        });
+        for feed in &feeds {
+            let exchange = create_exchange(&pair.exchange).unwrap_or_else(|| {
+                panic!(
+                    "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
+                    pair.exchange
+                )
+            });
 
-        let websocket_tx = db_tx.clone();
-        let symbol = pair.symbol.clone();
-        let feeds = feeds.clone();
-        let ws_config = ws_config.clone();
-        let conn_state = conn_state.clone();
-        let shutdown_rx = shutdown_tx.subscribe();
-        let pair_clone = pair.clone();
+            let websocket_tx = db_tx.clone();
+            let symbol = pair.symbol.clone();
+            let feed_vec = vec![*feed]; // Single feed per worker
+            let ws_config = ws_config.clone();
+            let conn_state = conn_state.clone();
+            let shutdown_rx = shutdown_tx.subscribe();
+            let pair_clone = pair.clone();
+            let feed_clone = *feed;
 
-        let handle = tokio::spawn(async move {
-            websocket_worker(exchange, websocket_tx, symbol, feeds, ws_config, conn_state, shutdown_rx)
-                .await;
-        });
+            info!(
+                exchange = %pair.exchange,
+                symbol = %pair.symbol,
+                feed = feed.as_str(),
+                "Spawning WebSocket worker"
+            );
 
-        ws_handles.push((pair_clone, handle));
+            let handle = tokio::spawn(async move {
+                websocket_worker(exchange, websocket_tx, symbol, feed_vec, ws_config, conn_state, shutdown_rx)
+                    .await;
+            });
+
+            ws_handles.push((pair_clone, feed_clone, handle));
+        }
     }
 
     // Drop the original sender so DB worker knows when all WebSocket workers are done
@@ -229,22 +241,25 @@ async fn main() {
     let archive_timeout = Duration::from_secs(5);  // Least priority
 
     // Wait for all WebSocket workers
-    for (pair, handle) in ws_handles {
+    for (pair, feed, handle) in ws_handles {
         match tokio::time::timeout(ws_timeout, handle).await {
             Ok(Ok(_)) => info!(
                 exchange = %pair.exchange,
                 symbol = %pair.symbol,
+                feed = feed.as_str(),
                 "WebSocket worker stopped cleanly"
             ),
             Ok(Err(e)) => warn!(
                 exchange = %pair.exchange,
                 symbol = %pair.symbol,
+                feed = feed.as_str(),
                 error = %e,
                 "WebSocket worker panicked"
             ),
             Err(_) => warn!(
                 exchange = %pair.exchange,
                 symbol = %pair.symbol,
+                feed = feed.as_str(),
                 timeout_secs = ws_timeout.as_secs(),
                 "WebSocket worker shutdown timed out"
             ),

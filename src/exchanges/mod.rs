@@ -30,6 +30,16 @@ pub enum FeedType {
     Trades,
 }
 
+impl FeedType {
+    /// Returns the string representation of the feed type
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FeedType::Orderbook => "orderbook",
+            FeedType::Trades => "trades",
+        }
+    }
+}
+
 /// Parsed message from an exchange WebSocket
 #[derive(Debug, Clone)]
 pub enum ExchangeMessage {

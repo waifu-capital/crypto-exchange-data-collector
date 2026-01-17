@@ -34,6 +34,60 @@ save_event(&db_tx, exchange_name, &normalized_symbol, DataType::Orderbook, ...);
 
 ---
 
+### Improved: Separate WebSocket Connections Per Feed Type
+
+**Files changed:** `src/main.rs`, `src/websocket.rs`, `src/exchanges/mod.rs`
+
+**Problem:** Previously, each WebSocket worker handled multiple feed types (orderbook + trades) on a single connection. This created a silent failure scenario:
+
+```
+┌─────────────────────────────────────────────────┐
+│  Single WebSocket Connection (ETH-USD)          │
+│                                                 │
+│  ┌─────────────┐    ┌─────────────┐            │
+│  │ Orderbook   │    │  Trades     │            │
+│  │ (100ms)     │    │  (stopped)  │  ← silent  │
+│  │ ✓ ✓ ✓ ✓ ✓   │    │  ✗          │    failure │
+│  └─────────────┘    └─────────────┘            │
+│                                                 │
+│  Timeout: Never triggers (orderbook flowing)    │
+└─────────────────────────────────────────────────┘
+```
+
+If orderbook messages kept flowing but trades silently stopped, the 30-second timeout would never fire (connection appears healthy), resulting in silent data loss.
+
+**Solution:** Spawn one WebSocket worker per (exchange, symbol, feed) combination instead of per (exchange, symbol):
+
+1. **Isolated failure domains:** Each feed has its own connection and timeout monitoring
+2. **Independent reconnection:** If trades feed fails, only trades reconnect; orderbook continues uninterrupted
+3. **Better observability:** Connection state now tracked per feed (`binance:btcusdt:orderbook`, `binance:btcusdt:trades`)
+
+**Changes:**
+- `main.rs`: Worker spawning loop now iterates over both market pairs AND feeds
+- `websocket.rs`: Connection state key includes feed type; logging includes feed in all messages
+- `exchanges/mod.rs`: Added `FeedType::as_str()` helper method
+- Channel size calculation: Now `1000 * market_pairs * feeds` (was `1000 * market_pairs`)
+
+**Example log output (before):**
+```
+Connected to WebSocket exchange="coinbase" symbol=ETH-USD
+```
+
+**Example log output (after):**
+```
+Connected to WebSocket exchange="coinbase" symbol=ETH-USD feed="orderbook"
+Connected to WebSocket exchange="coinbase" symbol=ETH-USD feed="trades"
+```
+
+**Trade-offs:**
+- 2x WebSocket connections per symbol (one per feed type)
+- Slightly higher memory usage
+- Some exchanges may rate-limit connections (not an issue for current supported exchanges)
+
+**Impact:** Eliminates silent partial feed failures. Each feed is independently monitored and will reconnect if it goes stale, ensuring no silent data loss.
+
+---
+
 ### Refactored: Multi-Exchange Architecture + Data Model Improvements
 
 **Files changed:** `Cargo.toml`, `src/config.rs`, `src/models.rs`, `src/db.rs`, `src/websocket.rs`, `src/archive.rs`, `src/main.rs`, `config.toml` (new)

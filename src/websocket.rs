@@ -124,9 +124,10 @@ async fn set_connection_status(
     conn_state: &ConnectionState,
     exchange: &str,
     symbol: &str,
+    feed: &str,
     connected: bool,
 ) {
-    let key = format!("{}:{}", exchange, symbol);
+    let key = format!("{}:{}:{}", exchange, symbol, feed);
     conn_state.write().await.insert(key, connected);
 }
 
@@ -152,14 +153,18 @@ pub async fn websocket_worker(
         ws_config.max_retry_delay_secs,
     );
 
+    // Each worker now handles exactly one feed type (isolated failure domains)
+    let feed_type = feeds.first().expect("Worker must have at least one feed");
+    let feed_str = feed_type.as_str();
+
     // Parse error tracker for circuit breaker
     let mut parse_tracker = ParseErrorTracker::new();
 
     info!(
         exchange = exchange_name,
         symbol = %normalized_symbol,
+        feed = feed_str,
         url = %url,
-        feeds = ?feeds,
         "Starting WebSocket worker"
     );
 
@@ -169,6 +174,7 @@ pub async fn websocket_worker(
             info!(
                 exchange = exchange_name,
                 symbol = %normalized_symbol,
+                feed = feed_str,
                 "WebSocket worker received shutdown signal"
             );
             break;
@@ -179,12 +185,13 @@ pub async fn websocket_worker(
                 info!(
                     exchange = exchange_name,
                     symbol = %normalized_symbol,
+                    feed = feed_str,
                     "Connected to WebSocket"
                 );
                 WEBSOCKET_CONNECTED
                     .with_label_values(&[exchange_name, &normalized_symbol])
                     .set(1.0);
-                set_connection_status(&conn_state, exchange_name, &normalized_symbol, true).await;
+                set_connection_status(&conn_state, exchange_name, &normalized_symbol, feed_str, true).await;
                 backoff.reset();
 
                 let (mut write, mut read) = ws_stream.split();
@@ -213,12 +220,13 @@ pub async fn websocket_worker(
                         info!(
                             exchange = exchange_name,
                             symbol = %normalized_symbol,
+                            feed = feed_str,
                             "WebSocket worker received shutdown signal, closing connection"
                         );
                         WEBSOCKET_CONNECTED
                             .with_label_values(&[exchange_name, &normalized_symbol])
                             .set(0.0);
-                        set_connection_status(&conn_state, exchange_name, &normalized_symbol, false).await;
+                        set_connection_status(&conn_state, exchange_name, &normalized_symbol, feed_str, false).await;
                         // Close the websocket cleanly
                         if let Err(e) = write.close().await {
                             debug!(error = %e, "Error closing WebSocket connection");
@@ -226,6 +234,7 @@ pub async fn websocket_worker(
                         info!(
                             exchange = exchange_name,
                             symbol = %normalized_symbol,
+                            feed = feed_str,
                             "WebSocket worker stopped"
                         );
                         return;
@@ -443,6 +452,7 @@ pub async fn websocket_worker(
                 error!(
                     exchange = exchange_name,
                     url = %url,
+                    feed = feed_str,
                     error = %e,
                     "Failed to connect to WebSocket"
                 );
@@ -450,7 +460,7 @@ pub async fn websocket_worker(
         }
 
         // Mark connection as down before attempting reconnect
-        set_connection_status(&conn_state, exchange_name, &normalized_symbol, false).await;
+        set_connection_status(&conn_state, exchange_name, &normalized_symbol, feed_str, false).await;
 
         let delay = backoff.next_delay();
         WEBSOCKET_RECONNECTS
@@ -459,6 +469,7 @@ pub async fn websocket_worker(
         info!(
             exchange = exchange_name,
             symbol = %normalized_symbol,
+            feed = feed_str,
             delay_secs = delay.as_secs(),
             "Reconnecting to WebSocket with exponential backoff"
         );
