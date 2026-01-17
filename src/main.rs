@@ -7,21 +7,17 @@ mod models;
 mod utils;
 mod websocket;
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
-use aws_config::meta::region::RegionProviderChain;
-use aws_sdk_s3::config::{BehaviorVersion, Region};
-use aws_sdk_s3::Client;
 use tokio::sync::mpsc::channel;
-use tokio::time::sleep;
 use tracing::info;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::archive::{create_bucket_if_not_exists, run_archive_scheduler};
+use crate::archive::{create_bucket_if_not_exists, create_s3_client, run_archive_scheduler};
 use crate::config::Config;
 use crate::db::{create_pool, db_worker, init_database};
-use crate::http::run_http_server;
+use crate::http::{run_http_server, run_liveness_probe};
 use crate::metrics::init_metrics;
 use crate::models::{new_connection_state, SnapshotData};
 use crate::utils::cleanup_old_logs;
@@ -155,38 +151,4 @@ async fn main() {
         config.archive_interval_secs,
     )
     .await;
-}
-
-/// Create and configure the S3 client
-async fn create_s3_client(config: &Config) -> Client {
-    let region_provider = RegionProviderChain::first_try(Region::new(config.aws_region.clone()))
-        .or_else(Region::new("us-west-2"));
-
-    let credentials_provider = aws_sdk_s3::config::Credentials::new(
-        &config.aws_access_key,
-        &config.aws_secret_key,
-        None,
-        None,
-        "custom",
-    );
-
-    let shared_config = aws_config::defaults(BehaviorVersion::v2026_01_12())
-        .region(region_provider)
-        .credentials_provider(credentials_provider)
-        .load()
-        .await;
-
-    Client::new(&shared_config)
-}
-
-/// Log liveness probe at regular intervals
-async fn run_liveness_probe() {
-    loop {
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        info!(timestamp, "Liveness probe");
-        sleep(Duration::from_secs(60)).await;
-    }
 }

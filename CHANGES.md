@@ -98,6 +98,33 @@ let (exchanges, symbols, data_types, seq_ids, timestamps, data_col): (
 
 ---
 
+### Refactored: Moved Functions to Appropriate Modules
+
+**Files changed:** `src/main.rs`, `src/archive.rs`, `src/http.rs`
+
+**Problem:** `main.rs` contained utility functions that belonged in domain-specific modules:
+- `create_s3_client()` - S3 client creation
+- `run_liveness_probe()` - periodic health logging
+
+**Solution:** Moved functions to their logical modules:
+
+1. **`create_s3_client()` → `archive.rs`**
+   - S3 client is only used by archive operations
+   - Keeps all S3-related code in one module
+   - `archive.rs` already imports aws_sdk_s3 types
+
+2. **`run_liveness_probe()` → `http.rs`**
+   - Liveness is a health/observability concern
+   - Groups with existing `/health` and `/ready` endpoints
+
+3. **`init_tracing()` stays in `main.rs`**
+   - Initialization code that runs once at startup
+   - Common Rust pattern to keep init functions in main
+
+**Impact:** `main.rs` is now purely orchestration (~100 lines). Each module owns its complete domain.
+
+---
+
 ### Added: WebSocket Connection Health Monitoring
 
 **Files changed:** `src/websocket.rs`

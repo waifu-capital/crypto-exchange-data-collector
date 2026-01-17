@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use aws_config::meta::region::RegionProviderChain;
+use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use itertools::multiunzip;
@@ -11,11 +13,34 @@ use tokio_retry::strategy::ExponentialBackoff;
 use tokio_retry::Retry;
 use tracing::{error, info, warn};
 
+use crate::config::Config;
 use crate::db::{delete_all_snapshots, fetch_all_snapshots};
 use crate::metrics::{
     ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES, S3_UPLOAD_RETRIES,
     SNAPSHOTS_ARCHIVED,
 };
+
+/// Create and configure the S3 client
+pub async fn create_s3_client(config: &Config) -> Client {
+    let region_provider = RegionProviderChain::first_try(Region::new(config.aws_region.clone()))
+        .or_else(Region::new("us-west-2"));
+
+    let credentials_provider = aws_sdk_s3::config::Credentials::new(
+        &config.aws_access_key,
+        &config.aws_secret_key,
+        None,
+        None,
+        "custom",
+    );
+
+    let shared_config = aws_config::defaults(BehaviorVersion::v2026_01_12())
+        .region(region_provider)
+        .credentials_provider(credentials_provider)
+        .load()
+        .await;
+
+    Client::new(&shared_config)
+}
 
 /// Create S3 bucket if it doesn't exist
 pub async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, region: &str) {

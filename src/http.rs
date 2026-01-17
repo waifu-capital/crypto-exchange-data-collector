@@ -1,4 +1,4 @@
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::{
     extract::State,
@@ -9,6 +9,7 @@ use axum::{
 };
 use prometheus::{Encoder, TextEncoder};
 use serde_json::json;
+use tokio::time::sleep;
 use tracing::{error, info};
 
 use crate::metrics::{APP_START_TIMESTAMP, MESSAGES_DROPPED};
@@ -124,5 +125,17 @@ pub async fn run_http_server(port: Option<u16>, conn_state: ConnectionState) {
 
     if let Err(e) = axum::serve(listener, app).await {
         error!(error = %e, "Metrics HTTP server error");
+    }
+}
+
+/// Log liveness probe at regular intervals
+pub async fn run_liveness_probe() {
+    loop {
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        info!(timestamp, "Liveness probe");
+        sleep(Duration::from_secs(60)).await;
     }
 }
