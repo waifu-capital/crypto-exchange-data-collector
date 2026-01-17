@@ -18,7 +18,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use crate::archive::{create_bucket_if_not_exists, create_s3_client, run_archive_scheduler};
 use crate::config::{Config, MarketPair};
 use crate::db::{create_pool, db_worker, init_database};
-use crate::exchanges::{create_exchange, FeedType};
+use crate::exchanges::{create_exchange, CoinbaseCredentials, FeedType};
 use crate::http::{run_http_server, run_liveness_probe};
 use crate::metrics::init_metrics;
 use crate::models::{new_connection_state, MarketEvent};
@@ -72,7 +72,15 @@ fn parse_feeds(feeds: &[String]) -> Vec<FeedType> {
 
 #[tokio::main]
 async fn main() {
-    dotenv::dotenv().ok();
+    // Load .env file if present
+    match dotenv::dotenv() {
+        Ok(path) => eprintln!("Loaded .env from: {:?}", path),
+        Err(e) => eprintln!("No .env file loaded: {}", e),
+    }
+
+    // Debug: check if Coinbase env vars are set
+    eprintln!("COINBASE_API_KEY set: {}", std::env::var("COINBASE_API_KEY").is_ok());
+    eprintln!("COINBASE_API_SECRET set: {}", std::env::var("COINBASE_API_SECRET").is_ok());
 
     // Initialize structured logging
     init_tracing();
@@ -142,6 +150,17 @@ async fn main() {
         max_retry_delay_secs: config.ws_max_retry_delay_secs,
     };
 
+    // Create Coinbase credentials from config (for authenticated channels)
+    let coinbase_creds = CoinbaseCredentials::new(
+        config.coinbase_api_key.clone(),
+        config.coinbase_api_secret.clone(),
+    );
+    if coinbase_creds.has_credentials() {
+        info!("Coinbase API credentials detected - authenticated channels (level2) available");
+    } else {
+        info!("No Coinbase API credentials - only unauthenticated channels (trades) available");
+    }
+
     // Spawn WebSocket worker for each (market pair, feed) combination
     // This isolates failure domains - if orderbook feed fails, trades continue (and vice versa)
     let mut ws_handles: Vec<(MarketPair, FeedType, tokio::task::JoinHandle<()>)> = Vec::new();
@@ -159,7 +178,7 @@ async fn main() {
         }
 
         for feed in market_feeds {
-            let exchange = create_exchange(&pair.exchange).unwrap_or_else(|| {
+            let exchange = create_exchange(&pair.exchange, &coinbase_creds).unwrap_or_else(|| {
                 panic!(
                     "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
                     pair.exchange

@@ -2,6 +2,80 @@
 
 ## 2026-01-17
 
+### Added: COINBASE_API_SECRET_FILE Environment Variable
+
+**Files changed:** `src/config.rs`
+
+**Problem:** The `dotenv` crate cannot parse multi-line PEM keys in `.env` files. The Coinbase API secret is an EC private key in PEM format which spans multiple lines, making it impossible to set via standard `.env` file syntax.
+
+**Solution:** Support loading the Coinbase API secret from a file path via `COINBASE_API_SECRET_FILE` environment variable.
+
+**Usage:**
+```bash
+# In .env file:
+COINBASE_API_KEY=organizations/{org_id}/apiKeys/{key_id}
+COINBASE_API_SECRET_FILE=./coinbase_key.pem
+```
+
+**Important:** The key must be converted from SEC1 to PKCS#8 format for compatibility with the `jsonwebtoken` crate (which uses `ring` internally):
+```bash
+openssl pkcs8 -topk8 -nocrypt -in cdp_api_key.pem -out coinbase_key.pem
+```
+
+**Changes:**
+- `src/config.rs`: Added logic to check for `COINBASE_API_SECRET_FILE` first, read the file contents, then fall back to `COINBASE_API_SECRET` env var
+- File contents are trimmed and line endings normalized
+- Improved logging to show which loading method was used
+
+**Behavior:**
+1. If `COINBASE_API_SECRET_FILE` is set → read secret from file at that path
+2. Else if `COINBASE_API_SECRET` is set → use that value directly (with `\n` escape replacement)
+3. Else → no Coinbase authentication (only trades channel will work)
+
+---
+
+### Added: Coinbase Authenticated WebSocket Support
+
+**Files changed:** `src/exchanges/coinbase.rs`, `src/exchanges/mod.rs`, `src/config.rs`, `src/main.rs`, `Cargo.toml`, `config.toml`
+
+**Problem:** Coinbase's `level2` (orderbook) channel requires authentication since August 2023. The previous implementation could only collect trades.
+
+**Solution:** Implemented JWT-based authentication for Coinbase Advanced Trade WebSocket API.
+
+**Environment Variables:**
+- `COINBASE_API_KEY` - API key in format `organizations/{org_id}/apiKeys/{key_id}`
+- `COINBASE_API_SECRET` - EC private key in PEM format
+
+**Changes:**
+
+1. **`src/exchanges/coinbase.rs`:**
+   - Switched to Advanced Trade WebSocket endpoint (`wss://advanced-trade-ws.coinbase.com`)
+   - Added JWT generation for authenticated channels using ES256 algorithm
+   - `level2` channel uses JWT authentication when credentials available
+   - `market_trades` channel works with or without authentication
+   - Added parsing for Advanced Trade API message format (`l2_data`, `market_trades` channels)
+   - Maintained backwards compatibility with old Exchange API formats
+
+2. **`src/exchanges/mod.rs`:**
+   - Added `CoinbaseCredentials` struct to pass API credentials
+   - Updated `create_exchange()` to accept Coinbase credentials
+
+3. **`src/config.rs`:**
+   - Added `coinbase_api_key` and `coinbase_api_secret` fields (loaded from env vars)
+
+4. **`src/main.rs`:**
+   - Pass Coinbase credentials to exchange creation
+   - Log whether Coinbase authentication is available at startup
+
+5. **`Cargo.toml`:**
+   - Added `jsonwebtoken = "9"` for JWT generation
+
+**Behavior:**
+- With credentials: Both `level2` (orderbook) and `market_trades` work
+- Without credentials: Only `market_trades` works; `level2` subscription is skipped with a warning
+
+---
+
 ### Added: Per-Market Feed Configuration
 
 **Files changed:** `src/config.rs`, `src/main.rs`, `config.toml`

@@ -93,7 +93,28 @@ export AWS_ACCESS_KEY="your-access-key"
 export AWS_SECRET_KEY="your-secret-key"
 ```
 
-### 4. Run
+### 4. Coinbase Authentication (Optional)
+
+Coinbase's `level2` (orderbook) channel requires authentication since August 2023. Without credentials, only trades will be collected.
+
+1. **Create API credentials** in the [Coinbase Developer Platform](https://portal.cdp.coinbase.com/)
+
+2. **Download your private key** - Coinbase provides an EC private key in PEM format
+
+3. **Convert the key format** - The key must be converted from SEC1 to PKCS#8 format:
+   ```bash
+   openssl pkcs8 -topk8 -nocrypt -in cdp_api_key.pem -out coinbase_key.pem
+   ```
+
+4. **Configure environment variables** in your `.env` file:
+   ```bash
+   COINBASE_API_KEY=organizations/{org_id}/apiKeys/{key_id}
+   COINBASE_API_SECRET_FILE=./coinbase_key.pem
+   ```
+
+   The `COINBASE_API_SECRET_FILE` points to your converted PKCS#8 key file. Alternatively, you can use `COINBASE_API_SECRET` directly if you can set multi-line environment variables (not supported by most `.env` parsers).
+
+### 5. Run
 
 ```bash
 ./target/release/crypto-exchange-data-collector

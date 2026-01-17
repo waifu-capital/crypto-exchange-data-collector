@@ -152,6 +152,10 @@ pub struct Config {
     pub aws_region: String,
     pub bucket_name: String,
     pub home_server_name: Option<String>,
+    // Coinbase API credentials (optional, from env vars for security)
+    // Required for level2 (orderbook) channel, not needed for matches (trades)
+    pub coinbase_api_key: Option<String>,
+    pub coinbase_api_secret: Option<String>,
     // Markets to collect (each MarketPair has its own feeds)
     pub market_pairs: Vec<MarketPair>,
     // Paths
@@ -196,6 +200,40 @@ impl Config {
         let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
         let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY must be set");
 
+        // Coinbase API credentials from environment (optional)
+        // Required for level2 (orderbook) channel authentication
+        let coinbase_api_key = env::var("COINBASE_API_KEY").ok();
+        if coinbase_api_key.is_some() {
+            tracing::info!("COINBASE_API_KEY found in environment");
+        } else {
+            tracing::debug!("COINBASE_API_KEY not set");
+        }
+        // Load secret from file if COINBASE_API_SECRET_FILE is set, otherwise try COINBASE_API_SECRET
+        let coinbase_api_secret = if let Ok(path) = env::var("COINBASE_API_SECRET_FILE") {
+            tracing::info!(path = %path, "COINBASE_API_SECRET_FILE env var found, reading file");
+            match std::fs::read_to_string(&path) {
+                Ok(content) => {
+                    // Normalize: trim, fix line endings, ensure trailing newline (required by some PEM parsers)
+                    let mut content = content.trim().replace("\r\n", "\n").to_string();
+                    if !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    tracing::info!(path = %path, len = content.len(), "Loaded COINBASE_API_SECRET from file");
+                    Some(content)
+                }
+                Err(e) => {
+                    tracing::error!(path = %path, error = %e, "Failed to read COINBASE_API_SECRET_FILE");
+                    None
+                }
+            }
+        } else if let Ok(secret) = env::var("COINBASE_API_SECRET") {
+            tracing::info!(len = secret.len(), "COINBASE_API_SECRET env var found (not file)");
+            Some(secret.replace("\\n", "\n"))
+        } else {
+            tracing::debug!("Neither COINBASE_API_SECRET_FILE nor COINBASE_API_SECRET set");
+            None
+        };
+
         // Flatten markets into pairs (each symbol gets the market's feeds)
         let market_pairs: Vec<MarketPair> = file
             .markets
@@ -231,6 +269,8 @@ impl Config {
             aws_region: file.aws.region,
             bucket_name: file.aws.bucket,
             home_server_name: file.aws.home_server_name,
+            coinbase_api_key,
+            coinbase_api_secret,
             market_pairs,
             database_path,
             archive_dir,

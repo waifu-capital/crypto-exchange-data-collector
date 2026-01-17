@@ -128,17 +128,41 @@ pub trait Exchange: Send + Sync {
     }
 }
 
+/// Coinbase API credentials for authenticated channels.
+#[derive(Clone, Default)]
+pub struct CoinbaseCredentials {
+    pub api_key: Option<String>,
+    pub api_secret: Option<String>,
+}
+
+impl CoinbaseCredentials {
+    pub fn new(api_key: Option<String>, api_secret: Option<String>) -> Self {
+        Self { api_key, api_secret }
+    }
+
+    pub fn has_credentials(&self) -> bool {
+        self.api_key.is_some() && self.api_secret.is_some()
+    }
+}
+
 /// Creates an exchange instance by name.
 ///
 /// # Arguments
 /// * `name` - Exchange name: "binance", "coinbase", "upbit", "okx", "bybit"
+/// * `coinbase_creds` - Optional Coinbase API credentials for authenticated channels
 ///
 /// # Returns
 /// `Some(Box<dyn Exchange>)` if the name is recognized, `None` otherwise.
-pub fn create_exchange(name: &str) -> Option<Box<dyn Exchange>> {
+pub fn create_exchange(name: &str, coinbase_creds: &CoinbaseCredentials) -> Option<Box<dyn Exchange>> {
     match name.to_lowercase().as_str() {
         "binance" => Some(Box::new(binance::Binance::new())),
-        "coinbase" => Some(Box::new(coinbase::Coinbase::new())),
+        "coinbase" => {
+            if let (Some(key), Some(secret)) = (&coinbase_creds.api_key, &coinbase_creds.api_secret) {
+                Some(Box::new(coinbase::Coinbase::with_credentials(key.clone(), secret.clone())))
+            } else {
+                Some(Box::new(coinbase::Coinbase::new()))
+            }
+        }
         "upbit" => Some(Box::new(upbit::Upbit::new())),
         "okx" => Some(Box::new(okx::Okx::new())),
         "bybit" => Some(Box::new(bybit::Bybit::new())),

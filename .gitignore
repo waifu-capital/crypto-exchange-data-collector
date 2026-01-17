@@ -28,3 +28,6 @@ target
 
 data/
 logs/
+cdp_api_key.json
+coinbase_key.pem
+coinbase_key_pkcs8.pem
