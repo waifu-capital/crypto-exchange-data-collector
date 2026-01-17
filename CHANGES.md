@@ -2,6 +2,62 @@
 
 ## 2026-01-17
 
+### Added: Multi-Exchange Architecture with Exchange Trait
+
+**Files created:**
+- `src/exchanges/mod.rs` - Exchange trait and common types
+- `src/exchanges/README.md` - Comprehensive API documentation
+- `src/exchanges/binance.rs` - Binance implementation
+- `src/exchanges/coinbase.rs` - Coinbase implementation
+- `src/exchanges/upbit.rs` - Upbit implementation
+- `src/exchanges/okx.rs` - OKX implementation
+- `src/exchanges/bybit.rs` - Bybit implementation
+
+**Architecture:**
+
+Implemented a trait-based abstraction for multi-exchange support:
+
+```rust
+pub trait Exchange: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn websocket_url(&self, symbol: &str) -> String;
+    fn build_subscribe_messages(&self, symbol: &str, feeds: &[FeedType]) -> Vec<String>;
+    fn parse_message(&self, msg: &str) -> Result<ExchangeMessage, ExchangeError>;
+    fn normalize_symbol(&self, symbol: &str) -> String;
+}
+```
+
+**Supported Exchanges:**
+
+| Exchange | Orderbook | Trades | Symbol Format |
+|----------|-----------|--------|---------------|
+| Binance | `@depth20@100ms` | `@trade` | `btcusdt` |
+| Coinbase | `level2` / `level2_batch` | `matches` | `BTC-USD` |
+| Upbit | `orderbook` | `trade` | `KRW-BTC` |
+| OKX | `books` / `books5` | `trades` | `BTC-USDT` |
+| Bybit | `orderbook.50` | `publicTrade` | `BTCUSDT` |
+
+**Key Features:**
+- Unified `ExchangeMessage` enum for all exchanges (Orderbook, Trade, Ping, Pong, Other)
+- Symbol normalization per exchange
+- Configurable depth levels and update speeds
+- Factory function `create_exchange(name)` for runtime selection
+- Comprehensive unit tests for message parsing
+
+**Documentation:**
+`src/exchanges/README.md` contains complete WebSocket API reference for all exchanges including:
+- Connection URLs
+- Subscription formats
+- Message schemas
+- Sequence ID fields
+- Rate limits
+
+**Dependencies added:** `uuid = "1.11"` (for Upbit ticket generation)
+
+**Impact:** Foundation for multi-exchange data collection. The websocket worker can now be generalized to use `Box<dyn Exchange>` instead of Binance-specific code.
+
+---
+
 ### Improved: Code Review Polish Items (4 Minor Improvements)
 
 Based on a code review that found the module structure well-organized, these 4 optional polish items were identified and implemented:

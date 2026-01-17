@@ -1,6 +1,7 @@
 mod archive;
 mod config;
 mod db;
+mod exchanges;
 mod http;
 mod metrics;
 mod models;
