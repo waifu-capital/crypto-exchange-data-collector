@@ -9,10 +9,10 @@ use tracing::{debug, error, info, warn};
 
 use crate::exchanges::{Exchange, ExchangeMessage, FeedType};
 use crate::metrics::{
-    LAST_MESSAGE_TIMESTAMP, MESSAGES_DROPPED, MESSAGES_RECEIVED, MESSAGE_TIMEOUTS,
-    WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
+    LAST_MESSAGE_TIMESTAMP, LATENCY_EXCHANGE_TO_COLLECTOR, MESSAGES_DROPPED, MESSAGES_RECEIVED,
+    MESSAGE_TIMEOUTS, SEQUENCE_GAPS, SEQUENCE_GAP_SIZE, WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
 };
-use crate::models::{ConnectionState, SnapshotData};
+use crate::models::{ConnectionState, SequenceTracker, SnapshotData};
 
 /// WebSocket connection configuration
 #[derive(Clone)]
@@ -76,6 +76,7 @@ pub async fn websocket_worker(
     feeds: Vec<FeedType>,
     ws_config: WsConfig,
     conn_state: ConnectionState,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let exchange_name = exchange.name();
     let normalized_symbol = exchange.normalize_symbol(&symbol);
@@ -86,6 +87,9 @@ pub async fn websocket_worker(
         ws_config.max_retry_delay_secs,
     );
 
+    // Sequence tracker for gap detection
+    let mut seq_tracker = SequenceTracker::new();
+
     info!(
         exchange = exchange_name,
         symbol = %normalized_symbol,
@@ -95,6 +99,16 @@ pub async fn websocket_worker(
     );
 
     loop {
+        // Check for shutdown signal before attempting to connect
+        if shutdown_rx.try_recv().is_ok() {
+            info!(
+                exchange = exchange_name,
+                symbol = %normalized_symbol,
+                "WebSocket worker received shutdown signal"
+            );
+            break;
+        }
+
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
                 info!(
@@ -129,6 +143,29 @@ pub async fn websocket_worker(
                 }
 
                 loop {
+                    // Check for shutdown signal
+                    if shutdown_rx.try_recv().is_ok() {
+                        info!(
+                            exchange = exchange_name,
+                            symbol = %normalized_symbol,
+                            "WebSocket worker received shutdown signal, closing connection"
+                        );
+                        WEBSOCKET_CONNECTED
+                            .with_label_values(&[exchange_name, &normalized_symbol])
+                            .set(0.0);
+                        set_connection_status(&conn_state, exchange_name, &normalized_symbol, false).await;
+                        // Close the websocket cleanly
+                        if let Err(e) = write.close().await {
+                            debug!(error = %e, "Error closing WebSocket connection");
+                        }
+                        info!(
+                            exchange = exchange_name,
+                            symbol = %normalized_symbol,
+                            "WebSocket worker stopped"
+                        );
+                        return;
+                    }
+
                     match timeout(message_timeout, read.next()).await {
                         Ok(Some(Ok(msg))) => {
                             if msg.is_text() {
@@ -155,8 +192,10 @@ pub async fn websocket_worker(
                                     Ok(ExchangeMessage::Orderbook {
                                         symbol: sym,
                                         sequence_id,
+                                        timestamp_exchange,
                                         data,
                                     }) => {
+                                        let collector_time_ms = now_millis();
                                         MESSAGES_RECEIVED
                                             .with_label_values(&[
                                                 exchange_name,
@@ -168,20 +207,59 @@ pub async fn websocket_worker(
                                             exchange_name,
                                             &normalized_symbol,
                                         );
+
+                                        // Record latency (only positive values, clock skew can cause negative)
+                                        if timestamp_exchange > 0 {
+                                            let latency = collector_time_ms - timestamp_exchange;
+                                            if latency > 0 {
+                                                LATENCY_EXCHANGE_TO_COLLECTOR
+                                                    .with_label_values(&[exchange_name, &normalized_symbol, "orderbook"])
+                                                    .observe(latency as f64);
+                                            }
+                                        }
+
+                                        // Check for sequence gaps
+                                        if let Some(gap) = seq_tracker.check(
+                                            exchange_name,
+                                            &sym,
+                                            "orderbook",
+                                            &sequence_id,
+                                            collector_time_ms,
+                                        ) {
+                                            SEQUENCE_GAPS
+                                                .with_label_values(&[exchange_name, &sym, "orderbook"])
+                                                .inc();
+                                            SEQUENCE_GAP_SIZE
+                                                .with_label_values(&[exchange_name, &sym, "orderbook"])
+                                                .observe(gap.gap_size as f64);
+                                            warn!(
+                                                exchange = exchange_name,
+                                                symbol = %sym,
+                                                data_type = "orderbook",
+                                                expected = gap.expected,
+                                                received = gap.received,
+                                                gap_size = gap.gap_size,
+                                                "Sequence gap detected"
+                                            );
+                                        }
+
                                         save_snapshot(
                                             &db_tx,
                                             exchange_name,
                                             &sym,
                                             "orderbook",
                                             &sequence_id,
+                                            timestamp_exchange,
                                             &data,
                                         );
                                     }
                                     Ok(ExchangeMessage::Trade {
                                         symbol: sym,
                                         sequence_id,
+                                        timestamp_exchange,
                                         data,
                                     }) => {
+                                        let collector_time_ms = now_millis();
                                         MESSAGES_RECEIVED
                                             .with_label_values(&[
                                                 exchange_name,
@@ -193,12 +271,49 @@ pub async fn websocket_worker(
                                             exchange_name,
                                             &normalized_symbol,
                                         );
+
+                                        // Record latency (only positive values, clock skew can cause negative)
+                                        if timestamp_exchange > 0 {
+                                            let latency = collector_time_ms - timestamp_exchange;
+                                            if latency > 0 {
+                                                LATENCY_EXCHANGE_TO_COLLECTOR
+                                                    .with_label_values(&[exchange_name, &normalized_symbol, "trade"])
+                                                    .observe(latency as f64);
+                                            }
+                                        }
+
+                                        // Check for sequence gaps
+                                        if let Some(gap) = seq_tracker.check(
+                                            exchange_name,
+                                            &sym,
+                                            "trade",
+                                            &sequence_id,
+                                            collector_time_ms,
+                                        ) {
+                                            SEQUENCE_GAPS
+                                                .with_label_values(&[exchange_name, &sym, "trade"])
+                                                .inc();
+                                            SEQUENCE_GAP_SIZE
+                                                .with_label_values(&[exchange_name, &sym, "trade"])
+                                                .observe(gap.gap_size as f64);
+                                            warn!(
+                                                exchange = exchange_name,
+                                                symbol = %sym,
+                                                data_type = "trade",
+                                                expected = gap.expected,
+                                                received = gap.received,
+                                                gap_size = gap.gap_size,
+                                                "Sequence gap detected"
+                                            );
+                                        }
+
                                         save_snapshot(
                                             &db_tx,
                                             exchange_name,
                                             &sym,
                                             "trade",
                                             &sequence_id,
+                                            timestamp_exchange,
                                             &data,
                                         );
                                     }
@@ -319,6 +434,14 @@ pub async fn websocket_worker(
     }
 }
 
+/// Get current time in milliseconds since epoch
+fn now_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
 /// Update the last message timestamp metric
 fn update_last_message_timestamp(exchange: &str, symbol: &str) {
     LAST_MESSAGE_TIMESTAMP
@@ -338,6 +461,7 @@ fn save_snapshot(
     symbol: &str,
     data_type: &str,
     exchange_sequence_id: &str,
+    timestamp_exchange: i64,
     raw_data: &str,
 ) {
     let data = SnapshotData {
@@ -345,10 +469,11 @@ fn save_snapshot(
         symbol: symbol.to_string(),
         data_type: data_type.to_string(),
         exchange_sequence_id: exchange_sequence_id.to_string(),
-        timestamp: SystemTime::now()
+        timestamp_collector: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_micros() as i64,
+        timestamp_exchange,
         data: raw_data.to_string(),
     };
 

@@ -106,10 +106,16 @@ impl Exchange for Binance {
                 .unwrap_or("unknown")
                 .to_string();
             let sequence_id = json["lastUpdateId"].to_string();
+            // E = event time in milliseconds
+            let timestamp_exchange = json
+                .get("E")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Orderbook {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -125,10 +131,17 @@ impl Exchange for Binance {
                 .get("t")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "0".to_string());
+            // E = event time, T = trade time (use E for consistency)
+            let timestamp_exchange = json
+                .get("E")
+                .and_then(|v| v.as_i64())
+                .or_else(|| json.get("T").and_then(|v| v.as_i64()))
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -144,10 +157,17 @@ impl Exchange for Binance {
                 .get("a")
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "0".to_string());
+            // E = event time, T = trade time
+            let timestamp_exchange = json
+                .get("E")
+                .and_then(|v| v.as_i64())
+                .or_else(|| json.get("T").and_then(|v| v.as_i64()))
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -182,11 +202,12 @@ mod tests {
     #[test]
     fn test_parse_orderbook() {
         let binance = Binance::new();
-        let msg = r#"{"lastUpdateId":160,"bids":[["0.0024","10"]],"asks":[["0.0026","100"]]}"#;
+        let msg = r#"{"lastUpdateId":160,"E":1672515782136,"bids":[["0.0024","10"]],"asks":[["0.0026","100"]]}"#;
         let result = binance.parse_message(msg).unwrap();
         match result {
-            ExchangeMessage::Orderbook { sequence_id, .. } => {
+            ExchangeMessage::Orderbook { sequence_id, timestamp_exchange, .. } => {
                 assert_eq!(sequence_id, "160");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Orderbook message"),
         }
@@ -201,10 +222,12 @@ mod tests {
             ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(sequence_id, "12345");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Trade message"),
         }

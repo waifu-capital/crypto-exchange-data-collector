@@ -10,8 +10,8 @@ mod websocket;
 
 use std::time::Duration;
 
-use tokio::sync::mpsc::channel;
-use tracing::info;
+use tokio::sync::{broadcast, mpsc::channel};
+use tracing::{info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
@@ -120,22 +120,26 @@ async fn main() {
     init_database(&db_pool).await;
 
     // Create channel for snapshot data
-    let (db_tx, mut db_rx) = channel::<SnapshotData>(1000);
+    let (db_tx, db_rx) = channel::<SnapshotData>(1000);
+
+    // Create shutdown broadcast channel
+    let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // Create shared connection state for health checks
     let conn_state = new_connection_state();
 
-    // Spawn database worker
-    {
+    // Spawn database worker with shutdown receiver
+    let db_handle = {
         let db_pool = db_pool.clone();
         let batch_interval = config.batch_interval_secs;
+        let shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            db_worker(db_pool, &mut db_rx, batch_interval).await;
-        });
-    }
+            db_worker(db_pool, db_rx, batch_interval, shutdown_rx).await;
+        })
+    };
 
-    // Spawn WebSocket worker
-    {
+    // Spawn WebSocket worker with shutdown receiver
+    let ws_handle = {
         let websocket_tx = db_tx.clone();
         let market_symbol = config.market_symbol.clone();
         let ws_config = WsConfig {
@@ -144,11 +148,12 @@ async fn main() {
             max_retry_delay_secs: config.ws_max_retry_delay_secs,
         };
         let conn_state = conn_state.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            websocket_worker(exchange, websocket_tx, market_symbol, feeds, ws_config, conn_state)
+            websocket_worker(exchange, websocket_tx, market_symbol, feeds, ws_config, conn_state, shutdown_rx)
                 .await;
-        });
-    }
+        })
+    };
 
     // Spawn liveness probe
     tokio::spawn(async move {
@@ -173,16 +178,50 @@ async fn main() {
         });
     }
 
-    // Run archive scheduler (blocks main task)
-    run_archive_scheduler(
-        db_pool,
-        config.archive_dir,
-        config.bucket_name,
-        client,
-        config.exchange,
-        config.market_symbol,
-        config.home_server_name,
-        config.archive_interval_secs,
-    )
-    .await;
+    // Spawn archive scheduler (non-blocking)
+    let archive_handle = {
+        let db_pool = db_pool.clone();
+        let archive_dir = config.archive_dir;
+        let bucket_name = config.bucket_name;
+        let exchange_name = config.exchange;
+        let market_symbol = config.market_symbol;
+        let home_server_name = config.home_server_name;
+        let archive_interval_secs = config.archive_interval_secs;
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            run_archive_scheduler(
+                db_pool,
+                archive_dir,
+                bucket_name,
+                client,
+                exchange_name,
+                market_symbol,
+                home_server_name,
+                archive_interval_secs,
+                shutdown_rx,
+            )
+            .await;
+        })
+    };
+
+    // Wait for shutdown signal (Ctrl+C / SIGTERM)
+    tokio::signal::ctrl_c().await.ok();
+    info!("Shutdown signal received, stopping workers...");
+
+    // Signal all workers to stop
+    shutdown_tx.send(()).ok();
+
+    // Wait for workers with timeout
+    let shutdown_timeout = Duration::from_secs(30);
+    match tokio::time::timeout(
+        shutdown_timeout,
+        async {
+            let _ = tokio::join!(ws_handle, db_handle, archive_handle);
+        }
+    ).await {
+        Ok(_) => info!("All workers stopped cleanly"),
+        Err(_) => warn!("Shutdown timed out after 30 seconds, some workers may not have finished"),
+    }
+
+    info!("Collector shutdown complete");
 }

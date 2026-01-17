@@ -81,10 +81,17 @@ impl Exchange for Upbit {
                     .or_else(|| json.get("timestamp"))
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| "0".to_string());
+                // tms = timestamp in milliseconds
+                let timestamp_exchange = json
+                    .get("tms")
+                    .or_else(|| json.get("timestamp"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
                 Ok(ExchangeMessage::Orderbook {
                     symbol,
                     sequence_id,
+                    timestamp_exchange,
                     data: msg.to_string(),
                 })
             }
@@ -106,10 +113,17 @@ impl Exchange for Upbit {
                             .map(|v| v.to_string())
                             .unwrap_or_else(|| "0".to_string())
                     });
+                // ttms = trade timestamp in milliseconds
+                let timestamp_exchange = json
+                    .get("ttms")
+                    .or_else(|| json.get("trade_timestamp"))
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
 
                 Ok(ExchangeMessage::Trade {
                     symbol,
                     sequence_id,
+                    timestamp_exchange,
                     data: msg.to_string(),
                 })
             }
@@ -181,8 +195,9 @@ mod tests {
         let msg = r#"{"ty":"orderbook","cd":"KRW-BTC","tms":1672515782136,"tas":12.345,"tbs":23.456,"obu":[{"ap":50000000,"as":0.1,"bp":49999000,"bs":0.2}]}"#;
         let result = upbit.parse_message(msg).unwrap();
         match result {
-            ExchangeMessage::Orderbook { symbol, .. } => {
+            ExchangeMessage::Orderbook { symbol, timestamp_exchange, .. } => {
                 assert_eq!(symbol, "KRW-BTC");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Orderbook message"),
         }
@@ -197,10 +212,12 @@ mod tests {
             ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "KRW-BTC");
                 assert_eq!(sequence_id, "12345");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Trade message"),
         }

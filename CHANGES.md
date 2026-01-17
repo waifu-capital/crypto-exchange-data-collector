@@ -2,6 +2,105 @@
 
 ## 2026-01-17
 
+### Added: Production Hardening for Quant Systems
+
+**Files changed:** `src/models.rs`, `src/db.rs`, `src/websocket.rs`, `src/archive.rs`, `src/main.rs`, `src/metrics.rs`, `src/exchanges/mod.rs`, `src/exchanges/binance.rs`, `src/exchanges/coinbase.rs`, `src/exchanges/upbit.rs`, `src/exchanges/okx.rs`, `src/exchanges/bybit.rs`
+
+**Purpose:** Implement 6 critical production improvements identified in a quant expert review for time-series data integrity and operational reliability.
+
+#### 1. Exchange Timestamps Added
+
+**Problem:** Only stored collector receipt time. Couldn't measure network latency or do proper time-series analysis.
+
+**Solution:**
+- Added `timestamp_exchange` field (milliseconds) to `SnapshotData` and `ExchangeMessage`
+- Renamed `timestamp` to `timestamp_collector` (microseconds, our receipt time)
+- Updated database schema with both timestamp columns
+- Each exchange now extracts its native timestamp:
+  - **Binance:** `E` field (event time)
+  - **Coinbase:** `time` field (ISO8601 parsed)
+  - **Upbit:** `tms` (orderbook) / `ttms` (trades)
+  - **OKX:** `ts` field in data array
+  - **Bybit:** `ts` (message level) / `T` (trade level)
+
+#### 2. Sequence Gap Detection
+
+**Problem:** No tracking of missing messages in data streams.
+
+**Solution:**
+- Added `SequenceTracker` struct that tracks last seen sequence ID per `exchange:symbol:data_type`
+- Detects gaps when sequence jumps (e.g., received 105 after 100 = gap of 4)
+- Only works for numeric sequences; non-numeric IDs are skipped
+- Logs warnings with gap details (expected, received, gap_size)
+
+**New Prometheus metrics:**
+- `collector_sequence_gaps_total{exchange,symbol,data_type}` - count of gaps
+- `collector_sequence_gap_size{exchange,symbol,data_type}` - histogram of gap sizes
+
+#### 3. Latency Metrics
+
+**Problem:** No visibility into exchange-to-collector latency.
+
+**Solution:**
+- Records `collector_time_ms - timestamp_exchange` for each message
+- Only records positive latencies (clock skew can cause negative)
+
+**New Prometheus metric:**
+- `collector_latency_exchange_to_collector_ms{exchange,symbol,data_type}` - histogram with buckets 1, 5, 10, 25, 50, 100, 250, 500, 1000, 5000ms
+
+#### 4. Graceful Shutdown
+
+**Problem:** No cleanup on SIGTERM/SIGINT. In-flight messages lost, connections not closed cleanly.
+
+**Solution:**
+- Added `tokio::sync::broadcast` channel for shutdown coordination
+- All workers (WebSocket, DB, Archive) receive shutdown signal
+- Workers flush data and close connections cleanly
+- 30-second timeout for worker shutdown
+- Main function waits for `tokio::signal::ctrl_c()`
+
+**Shutdown behavior:**
+- DB worker flushes any buffered batch before stopping
+- WebSocket worker closes connection cleanly with `write.close()`
+- Archive scheduler completes current cycle if running, then stops
+
+#### 5. Non-Blocking Archive with Timeout
+
+**Problem:** Archive scheduler blocked the main task during S3 uploads.
+
+**Solution:**
+- Archive scheduler now runs as a spawned task (non-blocking)
+- Each archive cycle has a 5-minute timeout
+- Timeout failure increments `collector_archive_failures_total{stage="timeout"}`
+- Sleep between cycles respects shutdown signal
+
+#### 6. Atomic Archive Verification
+
+**Problem:** Data could be deleted after S3 upload even if verification failed.
+
+**Solution:**
+- After upload, issues HEAD request to verify object exists
+- **NEW:** Compares local file size with remote `content_length`
+- Only deletes local data if sizes match exactly
+- Size mismatch increments `collector_archive_failures_total{stage="verify_size"}`
+
+**New Prometheus metric:**
+- `collector_archive_failures_total{stage}` - failures by stage (fetch, parquet, upload, verify_size, verify_head, timeout)
+
+#### Verification
+
+```bash
+cargo build                   # Compiles with 13 warnings (all unused code)
+cargo test                    # 16 tests pass
+cargo test -- --ignored       # Live smoke tests pass
+```
+
+**Parquet schema change:** Column renamed from `timestamp` to `timestamp_collector`, new column `timestamp_exchange` added.
+
+**Database schema change:** Migration required - delete existing `.db` file before running.
+
+---
+
 ### Added: Live WebSocket Smoke Tests
 
 **Files changed:** `src/exchanges/mod.rs`, `src/exchanges/upbit.rs`

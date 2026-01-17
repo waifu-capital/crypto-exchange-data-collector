@@ -139,10 +139,16 @@ impl Exchange for Bybit {
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "0".to_string())
                 });
+            // ts = message timestamp in milliseconds
+            let timestamp_exchange = json
+                .get("ts")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Orderbook {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -160,10 +166,17 @@ impl Exchange for Bybit {
                 .and_then(|v| v.as_str())
                 .unwrap_or("0")
                 .to_string();
+            // T = trade timestamp in milliseconds
+            let timestamp_exchange = data
+                .and_then(|d| d.get("T"))
+                .and_then(|v| v.as_i64())
+                .or_else(|| json.get("ts").and_then(|v| v.as_i64()))
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -205,10 +218,12 @@ mod tests {
             ExchangeMessage::Orderbook {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(sequence_id, "123456789");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Orderbook message"),
         }
@@ -223,10 +238,12 @@ mod tests {
             ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "BTCUSDT");
                 assert_eq!(sequence_id, "2100000000007764175");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Trade message"),
         }

@@ -35,7 +35,8 @@ pub async fn init_database(db_pool: &SqlitePool) {
             symbol TEXT NOT NULL,
             data_type TEXT NOT NULL,
             exchange_sequence_id TEXT NOT NULL,
-            timestamp INTEGER NOT NULL,
+            timestamp_collector INTEGER NOT NULL,
+            timestamp_exchange INTEGER NOT NULL,
             data TEXT NOT NULL,
             UNIQUE(exchange, symbol, data_type, exchange_sequence_id)
         )"
@@ -50,14 +51,24 @@ pub async fn init_database(db_pool: &SqlitePool) {
 /// Background worker that batches and writes snapshots to the database
 pub async fn db_worker(
     db_pool: SqlitePool,
-    db_rx: &mut tokio::sync::mpsc::Receiver<SnapshotData>,
+    mut db_rx: tokio::sync::mpsc::Receiver<SnapshotData>,
     batch_interval_secs: u64,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
     let mut batch: Vec<SnapshotData> = Vec::new();
     let mut interval = interval(Duration::from_secs(batch_interval_secs));
 
     loop {
         tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("DB worker received shutdown signal");
+                // Flush any remaining data before shutting down
+                if !batch.is_empty() {
+                    info!(batch_size = batch.len(), "Flushing final batch before shutdown");
+                    flush_batch(&db_pool, &mut batch).await;
+                }
+                break;
+            }
             Some(snapshot) = db_rx.recv() => {
                 batch.push(snapshot);
                 // Update queue depth metric (approximate - batch size)
@@ -71,6 +82,8 @@ pub async fn db_worker(
             }
         }
     }
+
+    info!("DB worker stopped");
 }
 
 /// Flush a batch of snapshots to the database
@@ -94,13 +107,14 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
     for snapshot in batch.drain(..) {
         // INSERT OR IGNORE skips duplicates based on UNIQUE constraint
         if let Err(e) = sqlx::query(
-            "INSERT OR IGNORE INTO snapshots (exchange, symbol, data_type, exchange_sequence_id, timestamp, data) VALUES (?, ?, ?, ?, ?, ?)"
+            "INSERT OR IGNORE INTO snapshots (exchange, symbol, data_type, exchange_sequence_id, timestamp_collector, timestamp_exchange, data) VALUES (?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&snapshot.exchange)
         .bind(&snapshot.symbol)
         .bind(&snapshot.data_type)
         .bind(&snapshot.exchange_sequence_id)
-        .bind(snapshot.timestamp)
+        .bind(snapshot.timestamp_collector)
+        .bind(snapshot.timestamp_exchange)
         .bind(&snapshot.data)
         .execute(&mut *tx)
         .await {
@@ -138,8 +152,9 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
 }
 
 /// Fetch all snapshots from the database for archiving
-pub async fn fetch_all_snapshots(db_pool: &SqlitePool) -> Result<Vec<(String, String, String, String, i64, String)>, sqlx::Error> {
-    let rows = sqlx::query("SELECT exchange, symbol, data_type, exchange_sequence_id, timestamp, data FROM snapshots")
+/// Returns (exchange, symbol, data_type, exchange_sequence_id, timestamp_collector, timestamp_exchange, data)
+pub async fn fetch_all_snapshots(db_pool: &SqlitePool) -> Result<Vec<(String, String, String, String, i64, i64, String)>, sqlx::Error> {
+    let rows = sqlx::query("SELECT exchange, symbol, data_type, exchange_sequence_id, timestamp_collector, timestamp_exchange, data FROM snapshots")
         .fetch_all(db_pool)
         .await?;
 
@@ -151,7 +166,8 @@ pub async fn fetch_all_snapshots(db_pool: &SqlitePool) -> Result<Vec<(String, St
                 row.get::<String, _>("symbol"),
                 row.get::<String, _>("data_type"),
                 row.get::<String, _>("exchange_sequence_id"),
-                row.get::<i64, _>("timestamp"),
+                row.get::<i64, _>("timestamp_collector"),
+                row.get::<i64, _>("timestamp_exchange"),
                 row.get::<String, _>("data"),
             )
         })

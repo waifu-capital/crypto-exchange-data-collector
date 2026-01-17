@@ -133,10 +133,17 @@ impl Exchange for Okx {
                         .map(|s| s.to_string())
                 })
                 .unwrap_or_else(|| "0".to_string());
+            // ts = timestamp in milliseconds (as string)
+            let timestamp_exchange = data
+                .and_then(|d| d.get("ts"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Orderbook {
                 symbol: inst_id,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -149,10 +156,17 @@ impl Exchange for Okx {
                 .and_then(|v| v.as_str())
                 .unwrap_or("0")
                 .to_string();
+            // ts = timestamp in milliseconds (as string)
+            let timestamp_exchange = data
+                .and_then(|d| d.get("ts"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<i64>().ok())
+                .unwrap_or(0);
 
             return Ok(ExchangeMessage::Trade {
                 symbol: inst_id,
                 sequence_id,
+                timestamp_exchange,
                 data: msg.to_string(),
             });
         }
@@ -204,10 +218,12 @@ mod tests {
             ExchangeMessage::Orderbook {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "BTC-USDT");
                 assert_eq!(sequence_id, "123456789");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Orderbook message"),
         }
@@ -222,10 +238,12 @@ mod tests {
             ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "BTC-USDT");
                 assert_eq!(sequence_id, "130639474");
+                assert_eq!(timestamp_exchange, 1672515782136);
             }
             _ => panic!("Expected Trade message"),
         }

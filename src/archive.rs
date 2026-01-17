@@ -17,8 +17,8 @@ use tracing::{error, info, warn};
 use crate::config::Config;
 use crate::db::{delete_all_snapshots, fetch_all_snapshots};
 use crate::metrics::{
-    ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES, S3_UPLOAD_RETRIES,
-    SNAPSHOTS_ARCHIVED,
+    ARCHIVE_FAILURES, ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES,
+    S3_UPLOAD_RETRIES, SNAPSHOTS_ARCHIVED,
 };
 
 /// Create and configure the S3 client
@@ -88,22 +88,50 @@ pub async fn run_archive_scheduler(
     symbol: String,
     home_server_name: Option<String>,
     archive_interval_secs: u64,
+    mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
 ) {
-    loop {
-        archive_snapshots(
-            &db_pool,
-            &archive_dir,
-            &bucket_name,
-            &client,
-            &exchange,
-            &symbol,
-            home_server_name.as_deref(),
-        )
-        .await;
+    // Archive timeout (5 minutes max per cycle)
+    let archive_timeout = Duration::from_secs(300);
 
-        info!(sleep_secs = archive_interval_secs, "Sleeping until next archive");
-        sleep(Duration::from_secs(archive_interval_secs)).await;
+    loop {
+        // Check for shutdown before starting archive
+        if shutdown_rx.try_recv().is_ok() {
+            info!("Archive scheduler received shutdown signal");
+            break;
+        }
+
+        // Run archive with timeout
+        match tokio::time::timeout(
+            archive_timeout,
+            archive_snapshots(
+                &db_pool,
+                &archive_dir,
+                &bucket_name,
+                &client,
+                &exchange,
+                &symbol,
+                home_server_name.as_deref(),
+            )
+        ).await {
+            Ok(_) => { /* success */ }
+            Err(_) => {
+                ARCHIVE_FAILURES.with_label_values(&["timeout"]).inc();
+                error!("Archive operation timed out after 5 minutes");
+            }
+        }
+
+        // Sleep with shutdown check
+        let sleep_duration = Duration::from_secs(archive_interval_secs);
+        tokio::select! {
+            _ = shutdown_rx.recv() => {
+                info!("Archive scheduler received shutdown signal during sleep");
+                break;
+            }
+            _ = sleep(sleep_duration) => {}
+        }
     }
+
+    info!("Archive scheduler stopped");
 }
 
 /// Archive snapshots to Parquet and upload to S3
@@ -124,6 +152,7 @@ pub async fn archive_snapshots(
     let snapshots = match fetch_all_snapshots(db_pool).await {
         Ok(s) => s,
         Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
             error!(error = %e, "Failed to fetch snapshots for archive");
             return;
         }
@@ -136,11 +165,12 @@ pub async fn archive_snapshots(
 
     // Extract columns from snapshot tuples using multiunzip
     let snapshot_count = snapshots.len();
-    let (exchanges, symbols, data_types, seq_ids, timestamps, data_col): (
+    let (exchanges, symbols, data_types, seq_ids, timestamps_collector, timestamps_exchange, data_col): (
         Vec<String>,
         Vec<String>,
         Vec<String>,
         Vec<String>,
+        Vec<i64>,
         Vec<i64>,
         Vec<String>,
     ) = multiunzip(snapshots);
@@ -151,11 +181,13 @@ pub async fn archive_snapshots(
         Column::new("symbol".into(), symbols),
         Column::new("data_type".into(), data_types),
         Column::new("exchange_sequence_id".into(), seq_ids),
-        Column::new("timestamp".into(), timestamps),
+        Column::new("timestamp_collector".into(), timestamps_collector),
+        Column::new("timestamp_exchange".into(), timestamps_exchange),
         Column::new("data".into(), data_col),
     ]) {
         Ok(df) => df,
         Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
             error!(error = %e, "Failed to create DataFrame");
             return;
         }
@@ -184,6 +216,7 @@ pub async fn archive_snapshots(
     let mut file = match std::fs::File::create(&archive_file_path) {
         Ok(f) => f,
         Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
             error!(
                 error = %e,
                 path = %archive_file_path.display(),
@@ -194,6 +227,7 @@ pub async fn archive_snapshots(
     };
 
     if let Err(e) = ParquetWriter::new(&mut file).finish(&mut df) {
+        ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
         error!(
             error = %e,
             path = %archive_file_path.display(),
@@ -203,6 +237,16 @@ pub async fn archive_snapshots(
         let _ = std::fs::remove_file(&archive_file_path);
         return;
     }
+
+    // Get local file size for verification
+    let local_file_size = match std::fs::metadata(&archive_file_path) {
+        Ok(m) => m.len(),
+        Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
+            error!(error = %e, "Failed to get local file size");
+            return;
+        }
+    };
     info!(
         snapshot_count,
         path = %archive_file_path.display(),
@@ -213,6 +257,7 @@ pub async fn archive_snapshots(
     // Upload to S3
     let upload_start = Instant::now();
     if let Err(e) = upload_to_s3(&archive_file_path, bucket_name, &s3_key, client).await {
+        ARCHIVE_FAILURES.with_label_values(&["upload"]).inc();
         error!(error = %e, "Failed to upload to S3, will retry next cycle");
         S3_UPLOAD_FAILURES.inc();
         S3_UPLOAD_DURATION
@@ -224,7 +269,7 @@ pub async fn archive_snapshots(
         .with_label_values(&["success"])
         .observe(upload_start.elapsed().as_secs_f64());
 
-    // Verify upload succeeded before deleting local data
+    // Verify upload succeeded with size check before deleting local data
     match client
         .head_object()
         .bucket(bucket_name)
@@ -232,11 +277,25 @@ pub async fn archive_snapshots(
         .send()
         .await
     {
-        Ok(_) => {
+        Ok(head_resp) => {
+            // Verify file size matches
+            let remote_size = head_resp.content_length().unwrap_or(0) as u64;
+
+            if remote_size != local_file_size {
+                ARCHIVE_FAILURES.with_label_values(&["verify_size"]).inc();
+                error!(
+                    local_size = local_file_size,
+                    remote_size = remote_size,
+                    "Size mismatch after S3 upload, keeping local data"
+                );
+                return;
+            }
+
             info!(
                 bucket = bucket_name,
                 key = %s3_key,
-                "Verified S3 upload"
+                size = remote_size,
+                "Verified S3 upload (size matches)"
             );
 
             // Update metrics for successful archive
@@ -258,6 +317,7 @@ pub async fn archive_snapshots(
             info!("Deleted local data after verified upload");
         }
         Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["verify_head"]).inc();
             error!(
                 error = %e,
                 "Failed to verify S3 upload, keeping local data"

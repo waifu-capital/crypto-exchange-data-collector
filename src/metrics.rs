@@ -117,6 +117,48 @@ lazy_static! {
     ).expect("Failed to register S3_UPLOAD_RETRIES");
 
     // ===================
+    // Sequence Gap Metrics
+    // ===================
+
+    /// Total sequence gaps detected
+    pub static ref SEQUENCE_GAPS: CounterVec = register_counter_vec!(
+        "collector_sequence_gaps_total",
+        "Total sequence gaps detected",
+        &["exchange", "symbol", "data_type"]
+    ).expect("Failed to register SEQUENCE_GAPS");
+
+    /// Size distribution of detected gaps
+    pub static ref SEQUENCE_GAP_SIZE: HistogramVec = register_histogram_vec!(
+        "collector_sequence_gap_size",
+        "Size of detected sequence gaps",
+        &["exchange", "symbol", "data_type"],
+        vec![1.0, 2.0, 5.0, 10.0, 50.0, 100.0, 500.0, 1000.0]
+    ).expect("Failed to register SEQUENCE_GAP_SIZE");
+
+    // ===================
+    // Latency Metrics
+    // ===================
+
+    /// Latency from exchange timestamp to collector receipt (milliseconds)
+    pub static ref LATENCY_EXCHANGE_TO_COLLECTOR: HistogramVec = register_histogram_vec!(
+        "collector_latency_exchange_to_collector_ms",
+        "Latency from exchange timestamp to collector receipt",
+        &["exchange", "symbol", "data_type"],
+        vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0]
+    ).expect("Failed to register LATENCY_EXCHANGE_TO_COLLECTOR");
+
+    // ===================
+    // Archive Failure Metrics
+    // ===================
+
+    /// Archive failures by stage
+    pub static ref ARCHIVE_FAILURES: CounterVec = register_counter_vec!(
+        "collector_archive_failures_total",
+        "Archive failures by stage",
+        &["stage"]  // "fetch", "parquet", "upload", "verify_size", "verify_head", "timeout"
+    ).expect("Failed to register ARCHIVE_FAILURES");
+
+    // ===================
     // Application Metrics
     // ===================
 

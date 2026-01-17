@@ -37,12 +37,14 @@ pub enum ExchangeMessage {
     Orderbook {
         symbol: String,
         sequence_id: String,
+        timestamp_exchange: i64, // Exchange event time in milliseconds
         data: String,
     },
     /// Trade execution
     Trade {
         symbol: String,
         sequence_id: String,
+        timestamp_exchange: i64, // Exchange event time in milliseconds
         data: String,
     },
     /// Ping frame that needs a pong response

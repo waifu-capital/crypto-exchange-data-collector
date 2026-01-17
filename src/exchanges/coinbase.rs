@@ -2,9 +2,18 @@
 //!
 //! WebSocket documentation: https://docs.cdp.coinbase.com/exchange/websocket-feed/overview
 
+use chrono::DateTime;
 use serde_json::Value;
 
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
+
+/// Parse ISO8601 timestamp string to milliseconds since epoch
+fn parse_iso8601_to_millis(time_str: Option<&str>) -> i64 {
+    time_str
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|dt| dt.timestamp_millis())
+        .unwrap_or(0)
+}
 
 /// Coinbase exchange connector.
 pub struct Coinbase {
@@ -95,10 +104,15 @@ impl Exchange for Coinbase {
                     .and_then(|v| v.as_str())
                     .unwrap_or("0")
                     .to_string();
+                // Parse ISO8601 time to milliseconds
+                let timestamp_exchange = parse_iso8601_to_millis(
+                    json.get("time").and_then(|v| v.as_str())
+                );
 
                 Ok(ExchangeMessage::Orderbook {
                     symbol,
                     sequence_id,
+                    timestamp_exchange,
                     data: msg.to_string(),
                 })
             }
@@ -115,10 +129,15 @@ impl Exchange for Coinbase {
                     .and_then(|v| v.as_str())
                     .unwrap_or("0")
                     .to_string();
+                // Parse ISO8601 time to milliseconds
+                let timestamp_exchange = parse_iso8601_to_millis(
+                    json.get("time").and_then(|v| v.as_str())
+                );
 
                 Ok(ExchangeMessage::Orderbook {
                     symbol,
                     sequence_id,
+                    timestamp_exchange,
                     data: msg.to_string(),
                 })
             }
@@ -135,10 +154,15 @@ impl Exchange for Coinbase {
                     .map(|v| v.to_string())
                     .or_else(|| json.get("trade_id").map(|v| v.to_string()))
                     .unwrap_or_else(|| "0".to_string());
+                // Parse ISO8601 time to milliseconds
+                let timestamp_exchange = parse_iso8601_to_millis(
+                    json.get("time").and_then(|v| v.as_str())
+                );
 
                 Ok(ExchangeMessage::Trade {
                     symbol,
                     sequence_id,
+                    timestamp_exchange,
                     data: msg.to_string(),
                 })
             }
@@ -186,11 +210,12 @@ mod tests {
     #[test]
     fn test_parse_snapshot() {
         let coinbase = Coinbase::new();
-        let msg = r#"{"type":"snapshot","product_id":"BTC-USD","bids":[["10101.10","0.45054140"]],"asks":[["10102.55","0.57753524"]]}"#;
+        let msg = r#"{"type":"snapshot","product_id":"BTC-USD","time":"2023-01-01T00:03:02.136000Z","bids":[["10101.10","0.45054140"]],"asks":[["10102.55","0.57753524"]]}"#;
         let result = coinbase.parse_message(msg).unwrap();
         match result {
-            ExchangeMessage::Orderbook { symbol, .. } => {
+            ExchangeMessage::Orderbook { symbol, timestamp_exchange, .. } => {
                 assert_eq!(symbol, "BTC-USD");
+                assert_eq!(timestamp_exchange, 1672531382136);
             }
             _ => panic!("Expected Orderbook message"),
         }
@@ -199,16 +224,18 @@ mod tests {
     #[test]
     fn test_parse_match() {
         let coinbase = Coinbase::new();
-        let msg = r#"{"type":"match","trade_id":10,"sequence":50,"product_id":"BTC-USD","size":"5.23512","price":"400.23","side":"sell"}"#;
+        let msg = r#"{"type":"match","trade_id":10,"sequence":50,"product_id":"BTC-USD","time":"2023-01-01T00:03:02.136000Z","size":"5.23512","price":"400.23","side":"sell"}"#;
         let result = coinbase.parse_message(msg).unwrap();
         match result {
             ExchangeMessage::Trade {
                 symbol,
                 sequence_id,
+                timestamp_exchange,
                 ..
             } => {
                 assert_eq!(symbol, "BTC-USD");
                 assert_eq!(sequence_id, "50");
+                assert_eq!(timestamp_exchange, 1672531382136);
             }
             _ => panic!("Expected Trade message"),
         }
