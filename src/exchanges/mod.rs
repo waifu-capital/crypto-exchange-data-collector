@@ -118,14 +118,13 @@ pub trait Exchange: Send + Sync {
     /// the message cannot be parsed.
     fn parse_message(&self, msg: &str) -> Result<ExchangeMessage, ExchangeError>;
 
-    /// Normalizes the symbol format for this exchange.
+    /// Normalizes the symbol to a consistent format for storage and logging.
     ///
-    /// Different exchanges use different conventions:
-    /// - Binance: "btcusdt" (lowercase, no separator)
-    /// - Coinbase: "BTC-USD" (uppercase, hyphen)
-    /// - Upbit: "KRW-BTC" (quote-base order)
+    /// All symbols are normalized to lowercase without separators (e.g., "btcusdt").
+    /// This ensures consistent storage across all exchanges regardless of their
+    /// native symbol format (BTC-USD, BTC_USDT, etc.).
     fn normalize_symbol(&self, symbol: &str) -> String {
-        symbol.to_string()
+        symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
 }
 

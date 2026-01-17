@@ -135,47 +135,8 @@ impl Exchange for Upbit {
     }
 
     fn normalize_symbol(&self, symbol: &str) -> String {
-        // Upbit uses QUOTE-BASE format (e.g., KRW-BTC), uppercase with hyphen
-        // Quote priority: KRW > USDT > BTC > ETH (KRW is always quote if present)
-        let upper = symbol.to_uppercase();
-
-        // Helper to get quote priority (lower = higher priority as quote)
-        let quote_priority = |s: &str| -> Option<usize> {
-            ["KRW", "USDT", "BTC", "ETH"]
-                .iter()
-                .position(|&q| q == s)
-        };
-
-        // If already has hyphen, check if it's in correct order
-        if upper.contains('-') {
-            let parts: Vec<&str> = upper.split('-').collect();
-            if parts.len() == 2 {
-                let p0 = quote_priority(parts[0]);
-                let p1 = quote_priority(parts[1]);
-
-                // If second part has higher quote priority, swap
-                if let (Some(pri0), Some(pri1)) = (p0, p1) {
-                    if pri1 < pri0 {
-                        return format!("{}-{}", parts[1], parts[0]);
-                    }
-                } else if p1.is_some() && p0.is_none() {
-                    // Second is a quote, first is not - swap
-                    return format!("{}-{}", parts[1], parts[0]);
-                }
-            }
-            return upper;
-        }
-
-        // Try to detect and add hyphen
-        // Common patterns: KRWBTC -> KRW-BTC
-        let prefixes = ["KRW", "USDT", "BTC", "ETH"];
-        for prefix in prefixes {
-            if upper.starts_with(prefix) && upper.len() > prefix.len() {
-                return format!("{}-{}", prefix, &upper[prefix.len()..]);
-            }
-        }
-
-        upper
+        // Normalize to lowercase without separators for consistent storage/logging
+        symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
 }
 
@@ -186,9 +147,9 @@ mod tests {
     #[test]
     fn test_normalize_symbol() {
         let upbit = Upbit::new();
-        assert_eq!(upbit.normalize_symbol("KRW-BTC"), "KRW-BTC");
-        assert_eq!(upbit.normalize_symbol("krw-btc"), "KRW-BTC");
-        assert_eq!(upbit.normalize_symbol("BTC-KRW"), "KRW-BTC");
+        assert_eq!(upbit.normalize_symbol("KRW-BTC"), "krwbtc");
+        assert_eq!(upbit.normalize_symbol("krw-btc"), "krwbtc");
+        assert_eq!(upbit.normalize_symbol("BTC-KRW"), "btckrw");
     }
 
     #[test]

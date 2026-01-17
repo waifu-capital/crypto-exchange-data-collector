@@ -192,10 +192,8 @@ impl Exchange for Bybit {
     }
 
     fn normalize_symbol(&self, symbol: &str) -> String {
-        // Bybit uses uppercase without separator: BTCUSDT
-        symbol
-            .to_uppercase()
-            .replace(['-', '_', '/'], "")
+        // Normalize to lowercase without separators for consistent storage/logging
+        symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
 }
 
@@ -206,9 +204,9 @@ mod tests {
     #[test]
     fn test_normalize_symbol() {
         let bybit = Bybit::new();
-        assert_eq!(bybit.normalize_symbol("btc-usdt"), "BTCUSDT");
-        assert_eq!(bybit.normalize_symbol("BTC_USDT"), "BTCUSDT");
-        assert_eq!(bybit.normalize_symbol("BTCUSDT"), "BTCUSDT");
+        assert_eq!(bybit.normalize_symbol("btc-usdt"), "btcusdt");
+        assert_eq!(bybit.normalize_symbol("BTC_USDT"), "btcusdt");
+        assert_eq!(bybit.normalize_symbol("BTCUSDT"), "btcusdt");
     }
 
     #[test]

@@ -177,21 +177,8 @@ impl Exchange for Coinbase {
     }
 
     fn normalize_symbol(&self, symbol: &str) -> String {
-        // Coinbase uses uppercase with hyphen: BTC-USD
-        let cleaned = symbol.to_uppercase().replace(['_', '/'], "-");
-        // Ensure there's a hyphen between base and quote
-        if !cleaned.contains('-') && cleaned.len() >= 6 {
-            // Try to split at common positions (3 or 4 char base)
-            if cleaned.ends_with("USD") || cleaned.ends_with("EUR") || cleaned.ends_with("GBP") {
-                let (base, quote) = cleaned.split_at(cleaned.len() - 3);
-                return format!("{}-{}", base, quote);
-            }
-            if cleaned.ends_with("USDT") || cleaned.ends_with("USDC") {
-                let (base, quote) = cleaned.split_at(cleaned.len() - 4);
-                return format!("{}-{}", base, quote);
-            }
-        }
-        cleaned
+        // Normalize to lowercase without separators for consistent storage/logging
+        symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
 }
 
@@ -202,9 +189,9 @@ mod tests {
     #[test]
     fn test_normalize_symbol() {
         let coinbase = Coinbase::new();
-        assert_eq!(coinbase.normalize_symbol("btcusd"), "BTC-USD");
-        assert_eq!(coinbase.normalize_symbol("BTC-USD"), "BTC-USD");
-        assert_eq!(coinbase.normalize_symbol("eth_eur"), "ETH-EUR");
+        assert_eq!(coinbase.normalize_symbol("btcusd"), "btcusd");
+        assert_eq!(coinbase.normalize_symbol("BTC-USD"), "btcusd");
+        assert_eq!(coinbase.normalize_symbol("eth_eur"), "etheur");
     }
 
     #[test]

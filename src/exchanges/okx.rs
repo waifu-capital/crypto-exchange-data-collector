@@ -177,25 +177,8 @@ impl Exchange for Okx {
     }
 
     fn normalize_symbol(&self, symbol: &str) -> String {
-        // OKX uses uppercase with hyphen: BTC-USDT
-        let upper = symbol.to_uppercase();
-
-        // If already has hyphen, return as-is
-        if upper.contains('-') {
-            return upper;
-        }
-
-        // Try to add hyphen for common patterns
-        // BTCUSDT -> BTC-USDT, ETHBTC -> ETH-BTC
-        let suffixes = ["USDT", "USDC", "USD", "BTC", "ETH", "EUR"];
-        for suffix in suffixes {
-            if upper.ends_with(suffix) && upper.len() > suffix.len() {
-                let base = &upper[..upper.len() - suffix.len()];
-                return format!("{}-{}", base, suffix);
-            }
-        }
-
-        upper
+        // Normalize to lowercase without separators for consistent storage/logging
+        symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
 }
 
@@ -206,9 +189,9 @@ mod tests {
     #[test]
     fn test_normalize_symbol() {
         let okx = Okx::new();
-        assert_eq!(okx.normalize_symbol("btcusdt"), "BTC-USDT");
-        assert_eq!(okx.normalize_symbol("BTC-USDT"), "BTC-USDT");
-        assert_eq!(okx.normalize_symbol("ETHBTC"), "ETH-BTC");
+        assert_eq!(okx.normalize_symbol("btcusdt"), "btcusdt");
+        assert_eq!(okx.normalize_symbol("BTC-USDT"), "btcusdt");
+        assert_eq!(okx.normalize_symbol("ETHBTC"), "ethbtc");
     }
 
     #[test]

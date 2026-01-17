@@ -179,7 +179,7 @@ impl Exchange for Binance {
     }
 
     fn normalize_symbol(&self, symbol: &str) -> String {
-        // Binance uses lowercase without separators: btcusdt
+        // Normalize to lowercase without separators for consistent storage/logging
         symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
 }

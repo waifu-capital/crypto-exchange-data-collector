@@ -34,6 +34,41 @@ save_event(&db_tx, exchange_name, &normalized_symbol, DataType::Orderbook, ...);
 
 ---
 
+### Improved: Consistent Symbol Normalization Across All Exchanges
+
+**Files changed:** `src/exchanges/mod.rs`, `src/exchanges/binance.rs`, `src/exchanges/coinbase.rs`, `src/exchanges/okx.rs`, `src/exchanges/bybit.rs`, `src/exchanges/upbit.rs`
+
+**Problem:** Each exchange's `normalize_symbol` function returned symbols in different formats:
+- Binance: `btcusdt` (lowercase, no separator)
+- Coinbase: `BTC-USD` (uppercase, hyphen)
+- OKX: `BTC-USDT` (uppercase, hyphen)
+- Bybit: `BTCUSDT` (uppercase, no separator)
+- Upbit: `KRW-BTC` (uppercase, hyphen, quote-base order)
+
+This inconsistency made it harder to query data across exchanges and created confusing logs/metrics.
+
+**Solution:** Standardized all `normalize_symbol` implementations to return lowercase without separators:
+
+```rust
+fn normalize_symbol(&self, symbol: &str) -> String {
+    symbol.to_lowercase().replace(['-', '_', '/'], "")
+}
+```
+
+**Examples:**
+| Input | Before (varied) | After (consistent) |
+|-------|-----------------|-------------------|
+| `BTC-USD` | `BTC-USD` (Coinbase) | `btcusd` |
+| `BTC-USDT` | `BTC-USDT` (OKX) | `btcusdt` |
+| `BTCUSDT` | `BTCUSDT` (Bybit) | `btcusdt` |
+| `KRW-BTC` | `KRW-BTC` (Upbit) | `krwbtc` |
+
+**Note:** This only affects storage, logging, and metrics. Each exchange's API calls (`websocket_url`, `build_subscribe_messages`) still use the exchange's native format internally.
+
+**Impact:** Consistent symbol format across all exchanges for easier cross-exchange queries and cleaner logs/metrics.
+
+---
+
 ### Improved: Separate WebSocket Connections Per Feed Type
 
 **Files changed:** `src/main.rs`, `src/websocket.rs`, `src/exchanges/mod.rs`
