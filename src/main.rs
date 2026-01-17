@@ -86,23 +86,21 @@ async fn main() {
     // Clean up old log files on startup
     cleanup_old_logs("logs", config.log_retention_days);
 
-    // Parse feed types
-    let feeds = parse_feeds(&config.feeds);
-    if feeds.is_empty() {
-        panic!("No valid feeds configured. Set feeds = [\"orderbook\", \"trades\"] in config.toml");
-    }
-
     info!(
         market_pairs = config.market_pairs.len(),
-        feeds = ?feeds,
         aws_region = %config.aws_region,
         log_retention_days = config.log_retention_days,
         "Starting crypto exchange data collector"
     );
 
-    // Log all configured market pairs
+    // Log all configured market pairs with their feeds
     for pair in &config.market_pairs {
-        info!(exchange = %pair.exchange, symbol = %pair.symbol, "Configured market pair");
+        info!(
+            exchange = %pair.exchange,
+            symbol = %pair.symbol,
+            feeds = ?pair.feeds,
+            "Configured market pair"
+        );
     }
 
     // Initialize AWS client
@@ -117,7 +115,8 @@ async fn main() {
 
     // Create channel for market events (sized for all market pairs * feeds)
     // Each (pair, feed) combination gets its own worker
-    let channel_size = 1000 * config.market_pairs.len() * feeds.len();
+    let total_workers: usize = config.market_pairs.iter().map(|p| p.feeds.len()).sum();
+    let channel_size = 1000 * total_workers.max(1);
     let (db_tx, db_rx) = channel::<MarketEvent>(channel_size);
 
     // Create shutdown broadcast channel
@@ -147,7 +146,19 @@ async fn main() {
     // This isolates failure domains - if orderbook feed fails, trades continue (and vice versa)
     let mut ws_handles: Vec<(MarketPair, FeedType, tokio::task::JoinHandle<()>)> = Vec::new();
     for pair in &config.market_pairs {
-        for feed in &feeds {
+        // Parse feeds for this specific market
+        let market_feeds = parse_feeds(&pair.feeds);
+        if market_feeds.is_empty() {
+            warn!(
+                exchange = %pair.exchange,
+                symbol = %pair.symbol,
+                configured_feeds = ?pair.feeds,
+                "No valid feeds for market, skipping"
+            );
+            continue;
+        }
+
+        for feed in market_feeds {
             let exchange = create_exchange(&pair.exchange).unwrap_or_else(|| {
                 panic!(
                     "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
@@ -157,12 +168,11 @@ async fn main() {
 
             let websocket_tx = db_tx.clone();
             let symbol = pair.symbol.clone();
-            let feed_vec = vec![*feed]; // Single feed per worker
+            let feed_vec = vec![feed]; // Single feed per worker
             let ws_config = ws_config.clone();
             let conn_state = conn_state.clone();
             let shutdown_rx = shutdown_tx.subscribe();
             let pair_clone = pair.clone();
-            let feed_clone = *feed;
 
             info!(
                 exchange = %pair.exchange,
@@ -176,7 +186,7 @@ async fn main() {
                     .await;
             });
 
-            ws_handles.push((pair_clone, feed_clone, handle));
+            ws_handles.push((pair_clone, feed, handle));
         }
     }
 

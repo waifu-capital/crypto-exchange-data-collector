@@ -2,6 +2,97 @@
 
 ## 2026-01-17
 
+### Added: Per-Market Feed Configuration
+
+**Files changed:** `src/config.rs`, `src/main.rs`, `config.toml`
+
+**Problem:** Coinbase's `level2` (orderbook) channel requires authentication since August 2023. The alternative `level2_batch` channel only provides incremental updates, not periodic snapshots like Binance's `@depth20`. This made Coinbase orderbook collection non-functional without API credentials.
+
+**Decision:** Skip Coinbase orderbook entirely. Only collect Coinbase trades. Implement per-market feed selection in config.
+
+**Solution:** Added optional `feeds` field to market config in `config.toml`:
+
+```toml
+[[markets]]
+exchange = "coinbase"
+symbols = ["BTC-USD", "ETH-USD"]
+feeds = ["trades"]  # Only trades, no orderbook
+
+[[markets]]
+exchange = "binance"
+symbols = ["btcusdt", "ethusdt"]
+# feeds defaults to ["orderbook", "trades"] if not specified
+```
+
+**Changes:**
+
+1. **`src/config.rs`:**
+   - Added `feeds` field to `MarketConfig` with default `["orderbook", "trades"]`
+   - Added `feeds` field to `MarketPair` struct
+   - Flattening logic now includes per-market feeds
+
+2. **`src/main.rs`:**
+   - Removed global feeds parsing
+   - Worker spawning now uses per-market feeds
+   - Logs configured feeds for each market pair
+
+3. **`config.toml`:**
+   - Coinbase configured with `feeds = ["trades"]` only
+   - Binance uses default (both orderbook and trades)
+
+**Impact:** Coinbase now works correctly (trades only). Each exchange can have its own feed configuration without affecting others.
+
+---
+
+### Fixed: Exchange Subscription Silent Failure (Coinbase, OKX, Upbit, Bybit)
+
+**Files changed:** `src/exchanges/coinbase.rs`, `src/exchanges/okx.rs`, `src/exchanges/upbit.rs`, `src/exchanges/bybit.rs`, `src/websocket.rs`
+
+**Problem:** Multiple exchanges silently failed to receive data - connections succeeded, no errors in logs, health endpoint showed healthy, but no data was written to the database. Affected exchanges: Coinbase, OKX, Upbit, Bybit.
+
+**Root causes:**
+
+1. **Wrong symbol format in subscriptions:** The `build_subscribe_messages()` function used `normalize_symbol()` which converts symbols to lowercase without separators (e.g., "BTC-USD" → "btcusd"). However, each exchange API expects symbols in their native format:
+
+   | Exchange | Expected Format | Was Sending |
+   |----------|----------------|-------------|
+   | Coinbase | `BTC-USD` (uppercase, dash) | `btcusd` |
+   | OKX | `BTC-USDT` (uppercase, dash) | `btcusdt` |
+   | Upbit | `KRW-BTC` (uppercase, dash) | `krwbtc` |
+   | Bybit | `BTCUSDT` (uppercase, no separator) | `btcusdt` |
+
+   Exchanges silently ignored invalid symbol subscriptions.
+
+2. **No warning for failed subscriptions:** The message timeout only triggered when NO messages were received. But exchanges like Coinbase send heartbeats regardless of subscription success, so the connection appeared healthy while no data flowed.
+
+**Solution:**
+
+1. **Use exchange-native symbol format in subscriptions:**
+   ```rust
+   // Coinbase, OKX, Upbit - uppercase with original format
+   let api_symbol = symbol.to_uppercase();
+
+   // Bybit - uppercase without separators
+   let api_symbol = symbol.to_uppercase().replace(['-', '_', '/'], "");
+   ```
+   Note: `normalize_symbol()` is now only used for storage/logging, not API calls.
+
+2. **Added data timeout detection:**
+   - Track `last_data_received` separately from message timeout
+   - Only reset when receiving actual data (Orderbook/Trade), not control messages (heartbeats)
+   - Warn if no data for `message_timeout_secs`
+   - Reconnect if no data for 3x timeout
+
+**New log messages:**
+```
+WARN No data received - subscription may have failed  exchange=coinbase symbol=btcusd feed=orderbook elapsed_secs=30
+ERROR Extended data timeout - reconnecting  exchange=coinbase symbol=btcusd feed=orderbook elapsed_secs=90
+```
+
+**Impact:** Fixes silent data loss on Coinbase, OKX, Upbit, and Bybit. Provides early warning when subscriptions fail.
+
+---
+
 ### Fixed: Binance Orderbook Symbol Shows "unknown" in Database
 
 **Files changed:** `src/websocket.rs`

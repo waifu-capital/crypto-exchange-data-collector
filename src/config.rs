@@ -19,8 +19,7 @@ pub struct ConfigFile {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct CollectorConfig {
-    #[serde(default = "default_feeds")]
-    pub feeds: Vec<String>,
+    // Note: Per-market feeds are now in MarketConfig, not here
     #[serde(default = "default_batch_interval")]
     pub batch_interval_secs: u64,
     #[serde(default = "default_archive_interval")]
@@ -92,12 +91,16 @@ pub struct WebSocketConfig {
 pub struct MarketConfig {
     pub exchange: String,
     pub symbols: Vec<String>,
+    /// Feeds to collect for this market (defaults to ["orderbook", "trades"])
+    #[serde(default = "default_market_feeds")]
+    pub feeds: Vec<String>,
+}
+
+fn default_market_feeds() -> Vec<String> {
+    vec!["orderbook".to_string(), "trades".to_string()]
 }
 
 // Default value functions
-fn default_feeds() -> Vec<String> {
-    vec!["orderbook".to_string()]
-}
 fn default_batch_interval() -> u64 {
     5
 }
@@ -137,6 +140,8 @@ fn default_max_retry() -> u64 {
 pub struct MarketPair {
     pub exchange: String,
     pub symbol: String,
+    /// Feeds to collect for this market pair
+    pub feeds: Vec<String>,
 }
 
 /// Application configuration
@@ -147,9 +152,8 @@ pub struct Config {
     pub aws_region: String,
     pub bucket_name: String,
     pub home_server_name: Option<String>,
-    // Markets to collect
+    // Markets to collect (each MarketPair has its own feeds)
     pub market_pairs: Vec<MarketPair>,
-    pub feeds: Vec<String>,
     // Paths
     pub database_path: PathBuf,
     pub archive_dir: PathBuf,
@@ -192,14 +196,16 @@ impl Config {
         let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
         let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY must be set");
 
-        // Flatten markets into pairs
+        // Flatten markets into pairs (each symbol gets the market's feeds)
         let market_pairs: Vec<MarketPair> = file
             .markets
             .iter()
             .flat_map(|m| {
-                m.symbols.iter().map(|s| MarketPair {
+                let feeds = m.feeds.clone();
+                m.symbols.iter().map(move |s| MarketPair {
                     exchange: m.exchange.to_lowercase(),
                     symbol: s.clone(),
+                    feeds: feeds.clone(),
                 })
             })
             .collect();
@@ -226,7 +232,6 @@ impl Config {
             bucket_name: file.aws.bucket,
             home_server_name: file.aws.home_server_name,
             market_pairs,
-            feeds: file.collector.feeds,
             database_path,
             archive_dir,
             batch_interval_secs: file.collector.batch_interval_secs,

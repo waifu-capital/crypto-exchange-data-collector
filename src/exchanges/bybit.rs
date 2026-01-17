@@ -79,16 +79,18 @@ impl Exchange for Bybit {
     }
 
     fn build_subscribe_messages(&self, symbol: &str, feeds: &[FeedType]) -> Vec<String> {
-        let normalized = self.normalize_symbol(symbol);
+        // Bybit expects uppercase without separators: "BTCUSDT"
+        // Note: normalize_symbol() is for storage/logging only, not API calls
+        let api_symbol = symbol.to_uppercase().replace(['-', '_', '/'], "");
         let mut args: Vec<String> = Vec::new();
 
         for feed in feeds {
             match feed {
                 FeedType::Orderbook => {
-                    args.push(format!("orderbook.{}.{}", self.depth as u16, normalized));
+                    args.push(format!("orderbook.{}.{}", self.depth as u16, api_symbol));
                 }
                 FeedType::Trades => {
-                    args.push(format!("publicTrade.{}", normalized));
+                    args.push(format!("publicTrade.{}", api_symbol));
                 }
             }
         }

@@ -4,8 +4,8 @@
 #   AWS_SECRET_KEY - AWS secret access key
 
 [collector]
-# Data feeds to collect: "orderbook", "trades"
-feeds = ["orderbook", "trades"]
+# Note: Per-market feeds are now configured in each [[markets]] section
+# (Legacy global feeds setting is deprecated)
 # How often to flush batched data to SQLite (seconds)
 batch_interval_secs = 5
 # How often to archive to S3 (seconds, 1 hour = 3600)
@@ -43,11 +43,20 @@ max_retry_delay_secs = 60
 [[markets]]
 exchange = "binance"
 symbols = ["btcusdt", "ethusdt", "solusdt"]
+# feeds defaults to ["orderbook", "trades"] if not specified
 
-# [[markets]]
-# exchange = "coinbase"
-# symbols = ["BTC-USD", "ETH-USD"]
+[[markets]]
+exchange = "coinbase"
+symbols = ["BTC-USD", "ETH-USD"]
+# Coinbase level2 (orderbook) requires authentication since Aug 2023
+# Only collect trades for Coinbase
+# also coinbase sends you full book and then diffs, this is different
+# from binance, which sends you snapshots. at the time of writing,
+# we have no replay logic for coinbase. so leaving out orderbook
+# for now
+feeds = ["trades"]
 
 # [[markets]]
 # exchange = "bybit"
 # symbols = ["BTCUSDT"]
+# feeds = ["orderbook", "trades"]

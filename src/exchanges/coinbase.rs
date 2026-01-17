@@ -72,10 +72,11 @@ impl Exchange for Coinbase {
             return vec![];
         }
 
-        let normalized = self.normalize_symbol(symbol);
+        // Coinbase expects uppercase with dashes: "BTC-USD"
+        // Note: normalize_symbol() is for storage/logging only, not API calls
         vec![serde_json::json!({
             "type": "subscribe",
-            "product_ids": [normalized],
+            "product_ids": [symbol.to_uppercase()],
             "channels": channels
         })
         .to_string()]

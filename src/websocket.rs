@@ -214,7 +214,38 @@ pub async fn websocket_worker(
                     }
                 }
 
+                // Track when we last received actual data (orderbook/trade), not control messages
+                let mut last_data_received = Instant::now();
+                let mut data_timeout_warned = false;
+
                 loop {
+                    // Check for data timeout (separate from message timeout)
+                    // This catches silent failures where connection is alive (heartbeats) but no data flows
+                    let data_elapsed = last_data_received.elapsed();
+                    if data_elapsed > message_timeout && !data_timeout_warned {
+                        warn!(
+                            exchange = exchange_name,
+                            symbol = %normalized_symbol,
+                            feed = feed_str,
+                            elapsed_secs = data_elapsed.as_secs(),
+                            "No data received - subscription may have failed"
+                        );
+                        data_timeout_warned = true;
+                    }
+                    // Reconnect if no data for 3x timeout (connection alive but subscription failed)
+                    if data_elapsed > message_timeout * 3 {
+                        error!(
+                            exchange = exchange_name,
+                            symbol = %normalized_symbol,
+                            feed = feed_str,
+                            elapsed_secs = data_elapsed.as_secs(),
+                            "Extended data timeout - reconnecting"
+                        );
+                        MESSAGE_TIMEOUTS
+                            .with_label_values(&[exchange_name, &normalized_symbol])
+                            .inc();
+                        break;
+                    }
                     // Check for shutdown signal
                     if shutdown_rx.try_recv().is_ok() {
                         info!(
@@ -305,6 +336,9 @@ pub async fn websocket_worker(
                                             &data,
                                         );
                                         parse_tracker.record_success();
+                                        // Reset data timeout - we received actual data
+                                        last_data_received = Instant::now();
+                                        data_timeout_warned = false;
                                     }
                                     Ok(ExchangeMessage::Trade {
                                         symbol: _sym,
@@ -348,6 +382,9 @@ pub async fn websocket_worker(
                                             &data,
                                         );
                                         parse_tracker.record_success();
+                                        // Reset data timeout - we received actual data
+                                        last_data_received = Instant::now();
+                                        data_timeout_warned = false;
                                     }
                                     Ok(ExchangeMessage::Ping(data)) => {
                                         debug!(

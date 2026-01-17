@@ -67,7 +67,9 @@ impl Exchange for Okx {
     }
 
     fn build_subscribe_messages(&self, symbol: &str, feeds: &[FeedType]) -> Vec<String> {
-        let normalized = self.normalize_symbol(symbol);
+        // OKX expects uppercase with dashes: "BTC-USDT"
+        // Note: normalize_symbol() is for storage/logging only, not API calls
+        let api_symbol = symbol.to_uppercase();
         let mut args: Vec<Value> = Vec::new();
 
         for feed in feeds {
@@ -75,13 +77,13 @@ impl Exchange for Okx {
                 FeedType::Orderbook => {
                     args.push(serde_json::json!({
                         "channel": self.book_channel.as_str(),
-                        "instId": normalized
+                        "instId": api_symbol
                     }));
                 }
                 FeedType::Trades => {
                     args.push(serde_json::json!({
                         "channel": "trades",
-                        "instId": normalized
+                        "instId": api_symbol
                     }));
                 }
             }

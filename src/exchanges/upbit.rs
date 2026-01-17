@@ -34,7 +34,9 @@ impl Exchange for Upbit {
     }
 
     fn build_subscribe_messages(&self, symbol: &str, feeds: &[FeedType]) -> Vec<String> {
-        let normalized = self.normalize_symbol(symbol);
+        // Upbit expects uppercase with dashes: "KRW-BTC"
+        // Note: normalize_symbol() is for storage/logging only, not API calls
+        let api_symbol = symbol.to_uppercase();
         let ticket = Uuid::new_v4().to_string();
         let mut messages = Vec::new();
 
@@ -48,7 +50,7 @@ impl Exchange for Upbit {
             // Note: "SIMPLE" format sends JSON text; "DEFAULT" sends binary
             let msg = serde_json::json!([
                 {"ticket": ticket},
-                {"type": type_name, "codes": [normalized]},
+                {"type": type_name, "codes": [api_symbol]},
                 {"format": "SIMPLE"}
             ]);
             messages.push(msg.to_string());
