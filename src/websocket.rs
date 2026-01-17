@@ -255,7 +255,7 @@ pub async fn websocket_worker(
                                 // Parse message using exchange-specific logic
                                 match exchange.parse_message(&text) {
                                     Ok(ExchangeMessage::Orderbook {
-                                        symbol: sym,
+                                        symbol: _sym,
                                         sequence_id,
                                         timestamp_exchange_us,
                                         data,
@@ -288,7 +288,7 @@ pub async fn websocket_worker(
                                         save_event(
                                             &db_tx,
                                             exchange_name,
-                                            &sym,
+                                            &normalized_symbol,
                                             DataType::Orderbook,
                                             &sequence_id,
                                             collector_time_us,
@@ -298,7 +298,7 @@ pub async fn websocket_worker(
                                         parse_tracker.record_success();
                                     }
                                     Ok(ExchangeMessage::Trade {
-                                        symbol: sym,
+                                        symbol: _sym,
                                         sequence_id,
                                         timestamp_exchange_us,
                                         data,
@@ -331,7 +331,7 @@ pub async fn websocket_worker(
                                         save_event(
                                             &db_tx,
                                             exchange_name,
-                                            &sym,
+                                            &normalized_symbol,
                                             DataType::Trade,
                                             &sequence_id,
                                             collector_time_us,

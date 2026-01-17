@@ -2,6 +2,38 @@
 
 ## 2026-01-17
 
+### Fixed: Binance Orderbook Symbol Shows "unknown" in Database
+
+**Files changed:** `src/websocket.rs`
+
+**Problem:** For Binance orderbook data, the `symbol` field in the database was stored as "unknown", while trade data had the correct symbol. This was specific to Binance but could affect other exchanges with similar message formats.
+
+**Root cause:** Binance's partial depth stream (`@depth20@100ms`) doesn't include the symbol in the message payload - it only contains `lastUpdateId`, `E` (event time), `bids`, and `asks`. The code tried to extract the symbol from the `"s"` field which doesn't exist for orderbook updates:
+
+```rust
+let symbol = json
+    .get("s")
+    .and_then(|v| v.as_str())
+    .unwrap_or("unknown")  // <- always "unknown" for orderbooks
+    .to_string();
+```
+
+Trade messages include `"s": "BTCUSDT"` in the payload, so they parsed correctly.
+
+**Solution:** In `websocket.rs`, changed `save_event` calls to use `&normalized_symbol` (the symbol we subscribed to) instead of the symbol extracted from the message (`&sym`). This is reliable because each WebSocket worker handles a single symbol configured at startup.
+
+```rust
+// Before
+save_event(&db_tx, exchange_name, &sym, DataType::Orderbook, ...);
+
+// After
+save_event(&db_tx, exchange_name, &normalized_symbol, DataType::Orderbook, ...);
+```
+
+**Impact:** Both orderbook and trade data now correctly store the symbol in the database.
+
+---
+
 ### Refactored: Multi-Exchange Architecture + Data Model Improvements
 
 **Files changed:** `Cargo.toml`, `src/config.rs`, `src/models.rs`, `src/db.rs`, `src/websocket.rs`, `src/archive.rs`, `src/main.rs`, `config.toml` (new)
