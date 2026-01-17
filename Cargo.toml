@@ -20,3 +20,8 @@ tokio-retry = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tracing-appender = "0.2"
+
+# Observability
+prometheus = "0.13"
+lazy_static = "1.5"
+axum = "0.8"

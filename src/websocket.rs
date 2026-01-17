@@ -42,8 +42,11 @@ impl ExponentialBackoff {
     }
 }
 
+use crate::metrics::{
+    LAST_MESSAGE_TIMESTAMP, MESSAGES_DROPPED, MESSAGES_RECEIVED, MESSAGE_TIMEOUTS,
+    WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
+};
 use crate::models::SnapshotData;
-use crate::utils::increment_dropped_snapshots;
 
 /// WebSocket worker that connects to Binance and streams orderbook data
 pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String) {
@@ -57,6 +60,9 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
         match connect_async(&url).await {
             Ok((ws_stream, _)) => {
                 info!(symbol = %market_symbol, "Connected to Binance WebSocket");
+                WEBSOCKET_CONNECTED
+                    .with_label_values(&["binance", &market_symbol])
+                    .set(1.0);
                 backoff.reset(); // Reset backoff on successful connection
                 let (mut write, mut read) = ws_stream.split();
 
@@ -92,6 +98,20 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                                 };
 
                                 let exchange_sequence_id = snapshot["lastUpdateId"].to_string();
+
+                                // Update metrics
+                                MESSAGES_RECEIVED
+                                    .with_label_values(&["binance", &market_symbol, "orderbook"])
+                                    .inc();
+                                LAST_MESSAGE_TIMESTAMP
+                                    .with_label_values(&["binance", &market_symbol])
+                                    .set(
+                                        SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs_f64(),
+                                    );
+
                                 save_snapshot(
                                     &db_tx,
                                     "binance",
@@ -117,10 +137,16 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                         }
                         Ok(Some(Err(e))) => {
                             error!(error = %e, "WebSocket error");
+                            WEBSOCKET_CONNECTED
+                                .with_label_values(&["binance", &market_symbol])
+                                .set(0.0);
                             break;
                         }
                         Ok(None) => {
                             info!(symbol = %market_symbol, "WebSocket stream ended");
+                            WEBSOCKET_CONNECTED
+                                .with_label_values(&["binance", &market_symbol])
+                                .set(0.0);
                             break;
                         }
                         Err(_) => {
@@ -129,6 +155,12 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
                                 timeout_secs = MESSAGE_TIMEOUT.as_secs(),
                                 "Message timeout - connection may be stale, reconnecting"
                             );
+                            MESSAGE_TIMEOUTS
+                                .with_label_values(&["binance", &market_symbol])
+                                .inc();
+                            WEBSOCKET_CONNECTED
+                                .with_label_values(&["binance", &market_symbol])
+                                .set(0.0);
                             break;
                         }
                     }
@@ -140,6 +172,9 @@ pub async fn websocket_worker(db_tx: Sender<SnapshotData>, market_symbol: String
         }
 
         let delay = backoff.next_delay();
+        WEBSOCKET_RECONNECTS
+            .with_label_values(&["binance", &market_symbol])
+            .inc();
         info!(
             symbol = %market_symbol,
             delay_secs = delay.as_secs(),
@@ -174,9 +209,9 @@ fn save_snapshot(
     match db_tx.try_send(data) {
         Ok(_) => {}
         Err(_) => {
-            let count = increment_dropped_snapshots();
+            MESSAGES_DROPPED.inc();
             warn!(
-                total_dropped = count,
+                total_dropped = MESSAGES_DROPPED.get() as u64,
                 "Channel full, dropped snapshot"
             );
         }

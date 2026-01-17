@@ -1,11 +1,12 @@
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use tokio::time::interval;
 use tracing::{error, info, warn};
 
+use crate::metrics::{CHANNEL_QUEUE_DEPTH, DB_INSERT_ERRORS, DB_SNAPSHOTS_WRITTEN, DB_WRITE_DURATION};
 use crate::models::SnapshotData;
 
 /// Create a SQLite connection pool
@@ -59,10 +60,13 @@ pub async fn db_worker(
         tokio::select! {
             Some(snapshot) = db_rx.recv() => {
                 batch.push(snapshot);
+                // Update queue depth metric (approximate - batch size)
+                CHANNEL_QUEUE_DEPTH.set(batch.len() as f64);
             },
             _ = interval.tick() => {
                 if !batch.is_empty() {
                     flush_batch(&db_pool, &mut batch).await;
+                    CHANNEL_QUEUE_DEPTH.set(0.0);
                 }
             }
         }
@@ -72,11 +76,15 @@ pub async fn db_worker(
 /// Flush a batch of snapshots to the database
 async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
     let batch_size = batch.len();
+    let start = Instant::now();
 
     let tx = match db_pool.begin().await {
         Ok(tx) => tx,
         Err(e) => {
             error!(error = %e, "Failed to begin transaction, retrying next interval");
+            DB_WRITE_DURATION
+                .with_label_values(&["transaction_begin_error"])
+                .observe(start.elapsed().as_secs_f64());
             return;
         }
     };
@@ -97,6 +105,7 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
         .execute(&mut *tx)
         .await {
             insert_errors += 1;
+            DB_INSERT_ERRORS.inc();
             error!(error = %e, "Failed to insert snapshot");
         }
     }
@@ -107,12 +116,24 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<SnapshotData>) {
             batch_size,
             "Failed to commit transaction, snapshots may be lost"
         );
-    } else if insert_errors > 0 {
-        warn!(
-            insert_errors,
-            batch_size,
-            "Committed batch with insert errors"
-        );
+        DB_WRITE_DURATION
+            .with_label_values(&["commit_error"])
+            .observe(start.elapsed().as_secs_f64());
+    } else {
+        let duration = start.elapsed().as_secs_f64();
+        DB_WRITE_DURATION
+            .with_label_values(&["success"])
+            .observe(duration);
+        DB_SNAPSHOTS_WRITTEN.inc_by((batch_size - insert_errors) as f64);
+
+        if insert_errors > 0 {
+            warn!(
+                insert_errors,
+                batch_size,
+                duration_ms = duration * 1000.0,
+                "Committed batch with insert errors"
+            );
+        }
     }
 }
 

@@ -68,6 +68,106 @@ With 100ms message frequency from Binance, if no message arrives for 30+ seconds
 
 ---
 
+### Added: Prometheus Metrics and HTTP Health Endpoints
+
+**Files changed:** `Cargo.toml`, `src/metrics.rs` (new), `src/http.rs` (new), `src/config.rs`, `src/main.rs`, `src/websocket.rs`, `src/db.rs`, `src/archive.rs`, `src/utils.rs`
+
+**Problem:** The system had only stdout/file logging visible in Portainer. For a multi-exchange data collector, operators need:
+- Real-time visibility into per-exchange connection health
+- Message throughput and drop rates
+- Database write latency histograms
+- S3 upload success/failure tracking
+- HTTP health endpoint for Docker/K8s probes
+
+**Solution:** Implemented Prometheus metrics with axum HTTP server:
+
+1. **New dependencies:**
+   ```toml
+   prometheus = "0.13"
+   lazy_static = "1.5"
+   axum = "0.8"
+   ```
+
+2. **Metrics exposed (`/metrics` endpoint on port 9090):**
+
+   **WebSocket metrics:**
+   - `collector_websocket_connected{exchange,symbol}` - connection status gauge
+   - `collector_websocket_reconnects_total{exchange,symbol}` - reconnection counter
+   - `collector_last_message_timestamp_seconds{exchange,symbol}` - staleness detection
+   - `collector_messages_received_total{exchange,symbol,data_type}` - throughput counter
+   - `collector_messages_dropped_total` - backpressure indicator
+   - `collector_message_timeouts_total{exchange,symbol}` - stale connection events
+
+   **Database metrics:**
+   - `collector_channel_queue_depth` - batch buffer size
+   - `collector_db_write_seconds{operation}` - write latency histogram
+   - `collector_db_snapshots_written_total` - successful writes
+   - `collector_db_insert_errors_total` - insert failures
+
+   **Archive metrics:**
+   - `collector_archives_completed_total` - successful archive cycles
+   - `collector_snapshots_archived_total` - records archived to S3
+   - `collector_s3_upload_seconds{status}` - upload latency histogram
+   - `collector_s3_upload_failures_total` - upload failures
+   - `collector_s3_upload_retries_total` - retry attempts
+
+   **Application metrics:**
+   - `collector_start_timestamp_seconds` - uptime calculation
+
+3. **HTTP endpoints:**
+   - `GET /metrics` - Prometheus scrape endpoint
+   - `GET /health` - JSON health status with connection states
+   - `GET /ready` - Simple readiness probe
+
+4. **Health endpoint response:**
+   ```json
+   {
+     "status": "healthy",
+     "uptime_seconds": 3847,
+     "connections": {"up": 1, "total": 1},
+     "messages_dropped": 0
+   }
+   ```
+
+5. **Configuration:**
+   ```bash
+   METRICS_PORT=9090  # Default port for HTTP server
+   ```
+
+**Grafana integration:**
+Add Prometheus as a data source, then create dashboards with:
+- Messages/sec by exchange (stacked graph)
+- Connection status (up/down indicator)
+- Last message age (staleness alert)
+- DB write latency percentiles (p50, p95, p99)
+- S3 upload success rate
+
+**Docker Compose addition:**
+```yaml
+prometheus:
+  image: prom/prometheus:latest
+  volumes:
+    - ./prometheus.yml:/etc/prometheus/prometheus.yml
+  ports:
+    - "9091:9090"
+
+grafana:
+  image: grafana/grafana:latest
+  ports:
+    - "3000:3000"
+```
+
+**Benefits:**
+- Real-time per-exchange visibility
+- Latency histograms for performance analysis
+- Health endpoint for container orchestration
+- Industry-standard Prometheus format
+- Zero-overhead when not scraped
+
+**Impact:** Production-ready observability. Operators can now monitor all exchanges in Grafana, set alerts for connection issues or high drop rates, and integrate with existing monitoring infrastructure.
+
+---
+
 ### Added: Log File Retention Management
 
 **Files changed:** `src/config.rs`, `src/utils.rs`, `src/main.rs`

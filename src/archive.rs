@@ -1,5 +1,5 @@
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
@@ -11,6 +11,10 @@ use tokio_retry::Retry;
 use tracing::{error, info, warn};
 
 use crate::db::{delete_all_snapshots, fetch_all_snapshots};
+use crate::metrics::{
+    ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES, S3_UPLOAD_RETRIES,
+    SNAPSHOTS_ARCHIVED,
+};
 
 /// Create S3 bucket if it doesn't exist
 pub async fn create_bucket_if_not_exists(client: &Client, bucket_name: &str, region: &str) {
@@ -178,11 +182,19 @@ pub async fn archive_snapshots(
     );
 
     // Upload to S3
+    let upload_start = Instant::now();
     if let Err(e) = upload_to_s3(&archive_file_path, bucket_name, &archive_file_name, client).await
     {
         error!(error = %e, "Failed to upload to S3, will retry next cycle");
+        S3_UPLOAD_FAILURES.inc();
+        S3_UPLOAD_DURATION
+            .with_label_values(&["failure"])
+            .observe(upload_start.elapsed().as_secs_f64());
         return;
     }
+    S3_UPLOAD_DURATION
+        .with_label_values(&["success"])
+        .observe(upload_start.elapsed().as_secs_f64());
 
     // Verify upload succeeded before deleting local data
     match client
@@ -198,6 +210,11 @@ pub async fn archive_snapshots(
                 key = archive_file_name,
                 "Verified S3 upload"
             );
+
+            // Update metrics for successful archive
+            ARCHIVES_COMPLETED.inc();
+            SNAPSHOTS_ARCHIVED.inc_by(snapshots.len() as f64);
+
             if let Err(e) = delete_all_snapshots(db_pool).await {
                 error!(error = %e, "Failed to delete snapshots from database");
                 // Data is safe in S3, but duplicates may occur next cycle
@@ -249,6 +266,7 @@ pub async fn upload_to_s3(
 
         async move {
             if attempt > 1 {
+                S3_UPLOAD_RETRIES.inc();
                 info!(attempt, key = %s3_key, "Retrying S3 upload");
             }
 

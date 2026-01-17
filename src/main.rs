@@ -1,6 +1,8 @@
 mod archive;
 mod config;
 mod db;
+mod http;
+mod metrics;
 mod models;
 mod utils;
 mod websocket;
@@ -19,6 +21,8 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use crate::archive::{create_bucket_if_not_exists, run_archive_scheduler};
 use crate::config::Config;
 use crate::db::{create_pool, db_worker, init_database};
+use crate::http::run_http_server;
+use crate::metrics::init_metrics;
 use crate::models::SnapshotData;
 use crate::utils::cleanup_old_logs;
 use crate::websocket::websocket_worker;
@@ -61,6 +65,9 @@ async fn main() {
 
     // Initialize structured logging
     init_tracing();
+
+    // Initialize metrics
+    init_metrics();
 
     // Load configuration
     let config = Config::from_env();
@@ -109,6 +116,12 @@ async fn main() {
     // Spawn liveness probe
     tokio::spawn(async move {
         run_liveness_probe().await;
+    });
+
+    // Spawn metrics HTTP server (port 9090 by default)
+    let metrics_port = config.metrics_port;
+    tokio::spawn(async move {
+        run_http_server(Some(metrics_port)).await;
     });
 
     // Spawn periodic log cleanup task (runs once per day)

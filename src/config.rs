@@ -13,6 +13,7 @@ pub struct Config {
     pub batch_interval_secs: u64,
     pub home_server_name: Option<String>,
     pub log_retention_days: u64,
+    pub metrics_port: u16,
 }
 
 impl Config {
@@ -40,6 +41,11 @@ impl Config {
             .parse::<u64>()
             .unwrap_or(1);
 
+        let metrics_port = env::var("METRICS_PORT")
+            .unwrap_or_else(|_| "9090".to_string())
+            .parse::<u16>()
+            .unwrap_or(9090);
+
         // Ensure directories exist
         std::fs::create_dir_all(&base_path).expect("Failed to create base data directory");
         std::fs::create_dir_all(&archive_dir).expect("Failed to create archive directory");
@@ -55,6 +61,7 @@ impl Config {
             batch_interval_secs,
             home_server_name,
             log_retention_days,
+            metrics_port,
         }
     }
 }
