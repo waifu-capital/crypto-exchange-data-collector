@@ -9,7 +9,7 @@
 # How often to flush batched data to SQLite (seconds)
 batch_interval_secs = 5
 # How often to archive to S3 (seconds, 1 hour = 3600)
-archive_interval_secs = 600
+archive_interval_secs = 3600
 # Prometheus metrics HTTP port
 metrics_port = 9090
 # How many days to keep log files
@@ -29,9 +29,20 @@ path = "data/collector.db"
 # Local directory for temporary Parquet files before S3 upload
 dir = "data/archive"
 
+[storage]
+# Storage mode: "s3" (default), "local", or "both"
+# - s3: Upload to S3 only (delete local temp files after upload)
+# - local: Persist to local disk only (no S3, AWS credentials not required)
+# - both: Upload to S3 AND keep a local copy
+mode = "local"
+# Directory for persistent local Parquet storage (hierarchical structure)
+# Only used when mode is "local" or "both"
+# Structure: {local_path}/{exchange}/{symbol}/{data_type}/{date}/{timestamp}.parquet
+local_path = "data/parquet"
+
 [websocket]
 # Timeout before considering a connection stale and reconnecting (seconds)
-message_timeout_secs = 30
+message_timeout_secs = 120
 # Initial delay before retrying a failed connection (seconds)
 initial_retry_delay_secs = 5
 # Maximum delay between retry attempts with exponential backoff (seconds)
@@ -42,12 +53,12 @@ max_retry_delay_secs = 60
 
 [[markets]]
 exchange = "binance"
-symbols = ["btcusdt", "ethusdt"]
+symbols = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
 # feeds defaults to ["orderbook", "trades"] if not specified
 
 [[markets]]
 exchange = "coinbase"
-symbols = ["BTC-USD", "ETH-USD"]
+symbols = ["BTC-USD", "ETH-USD", "SOL-USD", "XRP-USD"]
 # Coinbase level2 (orderbook) requires authentication since Aug 2023
 # Set COINBASE_API_KEY and COINBASE_API_SECRET env vars for orderbook access
 # Without credentials, only trades will be collected (orderbook subscription skipped)
@@ -55,12 +66,12 @@ feeds = ["orderbook", "trades"]
 
 [[markets]]
 exchange = "bybit"
-symbols = ["BTCUSDT", "ETHUSDT"]
+symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 feeds = ["orderbook", "trades"]
 
 [[markets]]
 exchange = "okx"
-symbols = ["BTC-USDT", "ETH-USDT"]
+symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT"]
 feeds = ["orderbook", "trades"]
 
 # this doesn't work

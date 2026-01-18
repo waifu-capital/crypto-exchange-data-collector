@@ -111,11 +111,13 @@ async fn main() {
         );
     }
 
-    // Initialize AWS client
+    // Initialize AWS client (optional for local-only storage)
     let client = create_s3_client(&config).await;
 
-    // Ensure S3 bucket exists
-    create_bucket_if_not_exists(&client, &config.bucket_name, &config.aws_region).await;
+    // Ensure S3 bucket exists (only if S3 client is available)
+    if let Some(ref s3_client) = client {
+        create_bucket_if_not_exists(s3_client, &config.bucket_name, &config.aws_region).await;
+    }
 
     // Initialize database
     let db_pool = create_pool(&config.database_path).await;
@@ -239,6 +241,8 @@ async fn main() {
     let archive_handle = {
         let db_pool = db_pool.clone();
         let archive_dir = config.archive_dir;
+        let storage_mode = config.storage_mode;
+        let local_storage_path = config.local_storage_path;
         let bucket_name = config.bucket_name;
         let home_server_name = config.home_server_name;
         let archive_interval_secs = config.archive_interval_secs;
@@ -247,6 +251,8 @@ async fn main() {
             run_archive_scheduler(
                 db_pool,
                 archive_dir,
+                storage_mode,
+                local_storage_path,
                 bucket_name,
                 client,
                 home_server_name,

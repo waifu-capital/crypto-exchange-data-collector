@@ -2,6 +2,36 @@ use serde::Deserialize;
 use std::env;
 use std::path::PathBuf;
 
+/// Storage mode for Parquet files
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StorageMode {
+    /// Upload to S3 only (delete local after upload) - default behavior
+    #[default]
+    S3,
+    /// Persist to local disk only (no S3)
+    Local,
+    /// Both: upload to S3 AND keep a local copy
+    Both,
+}
+
+impl<'de> Deserialize<'de> for StorageMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        match s.to_lowercase().as_str() {
+            "s3" => Ok(StorageMode::S3),
+            "local" => Ok(StorageMode::Local),
+            "both" => Ok(StorageMode::Both),
+            _ => Err(serde::de::Error::custom(format!(
+                "Invalid storage mode '{}'. Expected: s3, local, or both",
+                s
+            ))),
+        }
+    }
+}
+
 /// TOML config file structure
 #[derive(Debug, Deserialize)]
 pub struct ConfigFile {
@@ -12,6 +42,8 @@ pub struct ConfigFile {
     pub database: DatabaseConfig,
     #[serde(default)]
     pub archive: ArchiveConfig,
+    #[serde(default)]
+    pub storage: StorageConfig,
     #[serde(default)]
     pub websocket: WebSocketConfig,
     pub markets: Vec<MarketConfig>,
@@ -75,6 +107,30 @@ impl Default for ArchiveConfig {
             dir: default_archive_dir(),
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+pub struct StorageConfig {
+    /// Storage mode: "s3" (default), "local", or "both"
+    #[serde(default)]
+    pub mode: StorageMode,
+    /// Directory for persistent local Parquet storage (hierarchical structure)
+    /// Only used when mode is "local" or "both"
+    #[serde(default = "default_local_storage_path")]
+    pub local_path: String,
+}
+
+impl Default for StorageConfig {
+    fn default() -> Self {
+        Self {
+            mode: StorageMode::default(),
+            local_path: default_local_storage_path(),
+        }
+    }
+}
+
+fn default_local_storage_path() -> String {
+    "data/parquet".to_string()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -146,9 +202,13 @@ pub struct MarketPair {
 
 /// Application configuration
 pub struct Config {
+    // Storage settings
+    pub storage_mode: StorageMode,
+    pub local_storage_path: PathBuf,
     // AWS credentials (from env vars for security)
-    pub aws_access_key: String,
-    pub aws_secret_key: String,
+    // Optional when storage_mode is Local
+    pub aws_access_key: Option<String>,
+    pub aws_secret_key: Option<String>,
     pub aws_region: String,
     pub bucket_name: String,
     pub home_server_name: Option<String>,
@@ -196,9 +256,24 @@ impl Config {
             panic!("Failed to parse config file '{}': {}", config_path, e)
         });
 
+        let storage_mode = file.storage.mode;
+
         // AWS credentials from environment (not in TOML for security)
-        let aws_access_key = env::var("AWS_ACCESS_KEY").expect("AWS_ACCESS_KEY must be set");
-        let aws_secret_key = env::var("AWS_SECRET_KEY").expect("AWS_SECRET_KEY must be set");
+        // Required for S3 and Both modes, optional for Local mode
+        let (aws_access_key, aws_secret_key) = match storage_mode {
+            StorageMode::Local => {
+                // AWS credentials optional for local-only storage
+                (env::var("AWS_ACCESS_KEY").ok(), env::var("AWS_SECRET_KEY").ok())
+            }
+            StorageMode::S3 | StorageMode::Both => {
+                // AWS credentials required for S3 storage
+                let key = env::var("AWS_ACCESS_KEY")
+                    .expect("AWS_ACCESS_KEY must be set when storage.mode is 's3' or 'both'");
+                let secret = env::var("AWS_SECRET_KEY")
+                    .expect("AWS_SECRET_KEY must be set when storage.mode is 's3' or 'both'");
+                (Some(key), Some(secret))
+            }
+        };
 
         // Coinbase API credentials from environment (optional)
         // Required for level2 (orderbook) channel authentication
@@ -256,6 +331,7 @@ impl Config {
         let curr_dir = env::current_dir().expect("Failed to get current directory");
         let database_path = curr_dir.join(&file.database.path);
         let archive_dir = curr_dir.join(&file.archive.dir);
+        let local_storage_path = curr_dir.join(&file.storage.local_path);
 
         // Ensure directories exist
         if let Some(parent) = database_path.parent() {
@@ -263,7 +339,15 @@ impl Config {
         }
         std::fs::create_dir_all(&archive_dir).expect("Failed to create archive directory");
 
+        // Create local storage directory if using local or both mode
+        if matches!(storage_mode, StorageMode::Local | StorageMode::Both) {
+            std::fs::create_dir_all(&local_storage_path)
+                .expect("Failed to create local storage directory");
+        }
+
         Self {
+            storage_mode,
+            local_storage_path,
             aws_access_key,
             aws_secret_key,
             aws_region: file.aws.region,
