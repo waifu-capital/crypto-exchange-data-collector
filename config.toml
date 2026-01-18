@@ -57,3 +57,15 @@ feeds = ["orderbook", "trades"]
 exchange = "bybit"
 symbols = ["BTCUSDT", "ETHUSDT"]
 feeds = ["orderbook", "trades"]
+
+[[markets]]
+exchange = "okx"
+symbols = ["BTC-USDT", "ETH-USDT"]
+feeds = ["orderbook", "trades"]
+
+# this doesn't work
+# you can only use it if you are in a specific region? https://global-docs.upbit.com/reference/websocket-orderbook
+# [[markets]]
+# exchange = "upbit"
+# symbols = ["SGD-BTC", "SGD-ETH"]
+# feeds = ["orderbook", "trades"]

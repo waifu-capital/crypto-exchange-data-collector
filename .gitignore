@@ -29,5 +29,6 @@ target
 data/
 logs/
 cdp_api_key.json
+cdp_api_key.pem
 coinbase_key.pem
 coinbase_key_pkcs8.pem

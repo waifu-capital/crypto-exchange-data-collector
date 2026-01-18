@@ -1,0 +1,15 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Scrape the crypto collector
+  - job_name: 'crypto-collector'
+    static_configs:
+      - targets: ['app:9090']
+    metrics_path: /metrics
+
+  # Scrape Prometheus itself (for debugging)
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
