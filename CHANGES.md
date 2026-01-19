@@ -2,6 +2,25 @@
 
 ## 2026-01-19
 
+### Fixed: Docker Compose logs not visible on host
+
+**Files changed:** `docker-compose.yml`
+
+**Problem:** Logs written to `/app/logs/` inside the container were not accessible from the host machine. The `docker-compose.yml` mounted `./data` for database persistence but not the logs directory.
+
+**Solution:** Added volume mount for logs:
+```yaml
+volumes:
+  - ./logs:/app/logs
+```
+
+**Result:**
+- JSON logs now appear in `./logs/` on the host
+- Logs persist across container restarts
+- `docker logs <container>` still shows pretty-printed stdout logs
+
+---
+
 ### Fixed: Stale .env.example with Unused Variables
 
 **Files changed:** `.env.example`
