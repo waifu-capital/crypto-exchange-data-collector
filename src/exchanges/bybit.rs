@@ -3,6 +3,7 @@
 //! WebSocket documentation: https://bybit-exchange.github.io/docs/v5/websocket/public/orderbook
 
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
@@ -196,6 +197,13 @@ impl Exchange for Bybit {
     fn normalize_symbol(&self, symbol: &str) -> String {
         // Normalize to lowercase without separators for consistent storage/logging
         symbol.to_lowercase().replace(['-', '_', '/'], "")
+    }
+
+    fn build_ping_message(&self) -> Option<Message> {
+        // Bybit requires client-initiated JSON ping messages every 20 seconds
+        // Server responds with {"op":"pong",...}
+        // Connection times out after ~10 minutes without pings
+        Some(Message::Text(r#"{"op":"ping"}"#.into()))
     }
 }
 

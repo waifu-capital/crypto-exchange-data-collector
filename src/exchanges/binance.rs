@@ -3,6 +3,7 @@
 //! WebSocket documentation: https://developers.binance.com/docs/binance-spot-api-docs/web-socket-streams
 
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
@@ -198,6 +199,13 @@ impl Exchange for Binance {
     fn normalize_symbol(&self, symbol: &str) -> String {
         // Normalize to lowercase without separators for consistent storage/logging
         symbol.to_lowercase().replace(['-', '_', '/'], "")
+    }
+
+    fn build_ping_message(&self) -> Option<Message> {
+        // Binance server initiates PINGs every 20 seconds
+        // We just need to respond with PONGs (handled by tokio-tungstenite)
+        // No client-initiated pings needed
+        None
     }
 }
 

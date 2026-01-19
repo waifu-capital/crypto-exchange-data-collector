@@ -13,6 +13,7 @@ use std::fmt;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use tokio::net::TcpStream;
+use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Type alias for WebSocket write half
@@ -126,6 +127,18 @@ pub trait Exchange: Send + Sync {
     fn normalize_symbol(&self, symbol: &str) -> String {
         symbol.to_lowercase().replace(['-', '_', '/'], "")
     }
+
+    /// Builds a ping message for connection keepalive.
+    ///
+    /// Returns `Some(Message)` if this exchange requires client-initiated pings,
+    /// or `None` if the server initiates pings (e.g., Binance).
+    ///
+    /// Different exchanges use different ping mechanisms:
+    /// - Binance: Server sends protocol PING, we respond (return None)
+    /// - Coinbase: Client sends protocol PING frames (return Message::Ping)
+    /// - OKX: Client sends text "ping" (return Message::Text)
+    /// - Bybit: Client sends JSON ping (return Message::Text)
+    fn build_ping_message(&self) -> Option<Message>;
 }
 
 /// Coinbase API credentials for authenticated channels.

@@ -3,6 +3,7 @@
 //! WebSocket documentation: https://www.okx.com/docs-v5/en/#order-book-trading-ws
 
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
@@ -101,6 +102,11 @@ impl Exchange for Okx {
     }
 
     fn parse_message(&self, msg: &str) -> Result<ExchangeMessage, ExchangeError> {
+        // OKX responds to "ping" with literal text "pong"
+        if msg == "pong" {
+            return Ok(ExchangeMessage::Pong);
+        }
+
         let json: Value =
             serde_json::from_str(msg).map_err(|e| ExchangeError::Parse(e.to_string()))?;
 
@@ -181,6 +187,13 @@ impl Exchange for Okx {
     fn normalize_symbol(&self, symbol: &str) -> String {
         // Normalize to lowercase without separators for consistent storage/logging
         symbol.to_lowercase().replace(['-', '_', '/'], "")
+    }
+
+    fn build_ping_message(&self) -> Option<Message> {
+        // OKX requires client-initiated text "ping" messages
+        // Server responds with text "pong"
+        // Connection times out after 30 seconds without client pings
+        Some(Message::Text("ping".into()))
     }
 }
 

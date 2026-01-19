@@ -2,6 +2,41 @@
 
 ## 2026-01-19
 
+### Fixed: WebSocket Connection Drops for Coinbase and OKX (PING/PONG Keepalive)
+
+**Files changed:**
+- `src/exchanges/mod.rs` - Added `build_ping_message()` to Exchange trait
+- `src/exchanges/binance.rs` - Returns `None` (server initiates pings)
+- `src/exchanges/coinbase.rs` - Returns `Message::Ping(vec![])` (protocol-level)
+- `src/exchanges/okx.rs` - Returns `Message::Text("ping")` + parses "pong" response
+- `src/exchanges/bybit.rs` - Returns `Message::Text(r#"{"op":"ping"}"#)`
+- `src/exchanges/upbit.rs` - Returns `None` (not configured)
+- `src/websocket.rs` - Added 20-second ping timer with `tokio::select!`
+- `src/metrics.rs` - Added `WEBSOCKET_PINGS_SENT` and `WEBSOCKET_PONGS_RECEIVED` counters
+- `grafana/provisioning/dashboards/collector.json` - Added ping/pong rate panels
+
+**Problem:** Coinbase and OKX WebSocket connections were being abruptly closed with "connection reset without closing handshake" errors. Investigation revealed different exchanges have different keepalive requirements:
+
+| Exchange | Keepalive Mechanism | Timeout |
+|----------|--------------------|---------|
+| Binance | Server sends protocol PING → We respond with PONG | 60s |
+| Coinbase | We send **protocol-level PING frames** | ~100s |
+| OKX | We send text `"ping"` → Receive `"pong"` | 30s |
+| Bybit | We send JSON `{"op":"ping"}` → Receive pong JSON | 10 min |
+
+**Root cause:** Our code only responded to server-initiated PINGs (Binance model). Coinbase, OKX, and Bybit require **client-initiated** pings. Without sending pings, OKX connections died after 30 seconds and Coinbase after ~100 seconds.
+
+**Solution:**
+1. Added `build_ping_message()` method to Exchange trait - each exchange returns its specific ping format (or None if server initiates)
+2. Added 20-second ping interval timer in the WebSocket message loop using `tokio::select!`
+3. Added OKX "pong" response parsing (literal text "pong")
+4. Added new metrics: `collector_websocket_pings_sent_total` and `collector_websocket_pongs_received_total`
+5. Added Grafana panels for ping/pong rates by exchange
+
+**Impact:** Connections should now remain stable without unexpected disconnections. Ping/pong metrics provide visibility into keepalive health.
+
+---
+
 ### Fixed: Grafana Reconnects Panel Not Showing Data for Some Exchanges
 
 **Files changed:** `grafana/provisioning/dashboards/collector.json`

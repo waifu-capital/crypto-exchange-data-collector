@@ -3,6 +3,7 @@
 //! WebSocket documentation: https://docs.upbit.com/reference/websocket-orderbook
 
 use serde_json::Value;
+use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
@@ -139,6 +140,12 @@ impl Exchange for Upbit {
     fn normalize_symbol(&self, symbol: &str) -> String {
         // Normalize to lowercase without separators for consistent storage/logging
         symbol.to_lowercase().replace(['-', '_', '/'], "")
+    }
+
+    fn build_ping_message(&self) -> Option<Message> {
+        // Upbit ping/pong requirements not documented
+        // Currently disabled in config, return None for now
+        None
     }
 }
 

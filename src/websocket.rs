@@ -11,7 +11,8 @@ use tracing::{debug, error, info, warn};
 use crate::exchanges::{Exchange, ExchangeMessage, FeedType};
 use crate::metrics::{
     LAST_MESSAGE_TIMESTAMP, LATENCY_EXCHANGE_TO_COLLECTOR, MESSAGES_DROPPED, MESSAGES_RECEIVED,
-    MESSAGE_TIMEOUTS, PARSE_CIRCUIT_BREAKS, WEBSOCKET_CONNECTED, WEBSOCKET_RECONNECTS,
+    MESSAGE_TIMEOUTS, PARSE_CIRCUIT_BREAKS, WEBSOCKET_CONNECTED, WEBSOCKET_PINGS_SENT,
+    WEBSOCKET_PONGS_RECEIVED, WEBSOCKET_RECONNECTS,
 };
 use crate::models::{ConnectionState, DataType, MarketEvent};
 
@@ -220,6 +221,12 @@ pub async fn websocket_worker(
                 let mut last_data_received = Instant::now();
                 let mut data_timeout_warned = false;
 
+                // Ping timer for keepalive (20 seconds for OKX's 30s timeout)
+                let ping_interval = Duration::from_secs(20);
+                let mut ping_timer = tokio::time::interval(ping_interval);
+                // Skip the first tick which fires immediately
+                ping_timer.tick().await;
+
                 loop {
                     // Check for data timeout (separate from message timeout)
                     // This catches silent failures where connection is alive (heartbeats) but no data flows
@@ -273,7 +280,35 @@ pub async fn websocket_worker(
                         return;
                     }
 
-                    match timeout(message_timeout, read.next()).await {
+                    tokio::select! {
+                        // Ping timer for keepalive
+                        _ = ping_timer.tick() => {
+                            // Send exchange-specific ping for keepalive
+                            if let Some(ping_msg) = exchange.build_ping_message() {
+                                if let Err(e) = write.send(ping_msg).await {
+                                    error!(
+                                        exchange = exchange_name,
+                                        symbol = %normalized_symbol,
+                                        error = %e,
+                                        "Failed to send ping, reconnecting"
+                                    );
+                                    break;
+                                }
+                                WEBSOCKET_PINGS_SENT
+                                    .with_label_values(&[exchange_name, &normalized_symbol])
+                                    .inc();
+                                debug!(
+                                    exchange = exchange_name,
+                                    symbol = %normalized_symbol,
+                                    "Sent keepalive ping"
+                                );
+                            }
+                            continue;
+                        }
+
+                        // Message receive with timeout
+                        result = timeout(message_timeout, read.next()) => {
+                            match result {
                         Ok(Some(Ok(msg))) => {
                             if msg.is_text() {
                                 let text = match msg.into_text() {
@@ -399,7 +434,10 @@ pub async fn websocket_worker(
                                         }
                                     }
                                     Ok(ExchangeMessage::Pong) => {
-                                        debug!(exchange = exchange_name, "Received pong");
+                                        debug!(exchange = exchange_name, symbol = %normalized_symbol, "Received app-level pong");
+                                        WEBSOCKET_PONGS_RECEIVED
+                                            .with_label_values(&[exchange_name, &normalized_symbol])
+                                            .inc();
                                     }
                                     Ok(ExchangeMessage::Other(other)) => {
                                         // Subscription confirmations, heartbeats, etc.
@@ -435,7 +473,10 @@ pub async fn websocket_worker(
                                 }
                                 debug!(exchange = exchange_name, "Sent pong frame");
                             } else if msg.is_pong() {
-                                debug!(exchange = exchange_name, "Received pong frame");
+                                debug!(exchange = exchange_name, symbol = %normalized_symbol, "Received protocol pong frame");
+                                WEBSOCKET_PONGS_RECEIVED
+                                    .with_label_values(&[exchange_name, &normalized_symbol])
+                                    .inc();
                             } else if msg.is_binary() {
                                 // Some exchanges send binary messages (e.g., OKX compressed)
                                 debug!(
@@ -483,6 +524,8 @@ pub async fn websocket_worker(
                                 .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
                             break;
+                        }
+                    }
                         }
                     }
                 }

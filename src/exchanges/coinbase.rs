@@ -11,6 +11,8 @@ use serde::Serialize;
 use serde_json::Value;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use tokio_tungstenite::tungstenite::Message;
+
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
 /// Parse ISO8601 timestamp string to microseconds since epoch
@@ -353,6 +355,12 @@ impl Exchange for Coinbase {
     fn normalize_symbol(&self, symbol: &str) -> String {
         // Normalize to lowercase without separators for consistent storage/logging
         symbol.to_lowercase().replace(['-', '_', '/'], "")
+    }
+
+    fn build_ping_message(&self) -> Option<Message> {
+        // Coinbase requires client-initiated WebSocket protocol-level PING frames (RFC 6455)
+        // Connections timeout after ~100 seconds without client pings
+        Some(Message::Ping(vec![].into()))
     }
 }
 

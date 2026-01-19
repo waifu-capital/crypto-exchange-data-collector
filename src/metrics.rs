@@ -50,6 +50,20 @@ lazy_static! {
         &["exchange", "symbol"]
     ).expect("Failed to register MESSAGE_TIMEOUTS");
 
+    /// Total pings sent by collector for connection keepalive
+    pub static ref WEBSOCKET_PINGS_SENT: CounterVec = register_counter_vec!(
+        "collector_websocket_pings_sent_total",
+        "Total ping messages sent by collector for keepalive",
+        &["exchange", "symbol"]
+    ).expect("Failed to register WEBSOCKET_PINGS_SENT");
+
+    /// Total pongs received (responses to our pings)
+    pub static ref WEBSOCKET_PONGS_RECEIVED: CounterVec = register_counter_vec!(
+        "collector_websocket_pongs_received_total",
+        "Total pong responses received from exchanges",
+        &["exchange", "symbol"]
+    ).expect("Failed to register WEBSOCKET_PONGS_RECEIVED");
+
     // ===================
     // Database Metrics
     // ===================
