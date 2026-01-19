@@ -19,7 +19,7 @@ log_retention_days = 1
 region = "us-west-2"
 bucket = "crypto-exchange-data-collector"
 # Optional: identifier for this server (appears in S3 path)
-# home_server_name = "prod-1"
+home_server_name = "cherry-wondrous-mongrel"
 
 [database]
 # SQLite database path (relative to working directory)
