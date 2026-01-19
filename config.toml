@@ -92,8 +92,18 @@ feeds = ["orderbook", "trades"]
 
 [[markets]]
 exchange = "okx"
-symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT"]
+symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
 feeds = ["orderbook", "trades"]
+
+[[markets]]
+exchange = "okx"
+symbols = ["XRP-USDT"]
+feeds = ["orderbook", "trades"]
+# XRP-USDT has lower trading volume, so we use a longer timeout to avoid
+# unnecessary reconnects when no data is received for extended periods.
+# Default uses global websocket.message_timeout_secs (120s, reconnect after 6 min).
+# With 600s, reconnect happens after 30 minutes of no data.
+data_timeout_secs = 600
 
 # this doesn't work
 # you can only use it if you are in a specific region? https://global-docs.upbit.com/reference/websocket-orderbook

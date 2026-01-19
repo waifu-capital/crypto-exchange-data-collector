@@ -199,16 +199,18 @@ async fn main() {
             let conn_state = conn_state.clone();
             let shutdown_rx = shutdown_tx.subscribe();
             let pair_clone = pair.clone();
+            let data_timeout_secs = pair.data_timeout_secs;
 
             info!(
                 exchange = %pair.exchange,
                 symbol = %pair.symbol,
                 feed = feed.as_str(),
+                data_timeout_override = ?data_timeout_secs,
                 "Spawning WebSocket worker"
             );
 
             let handle = tokio::spawn(async move {
-                websocket_worker(exchange, websocket_tx, symbol, feed_vec, ws_config, conn_state, shutdown_rx)
+                websocket_worker(exchange, websocket_tx, symbol, feed_vec, ws_config, conn_state, shutdown_rx, data_timeout_secs)
                     .await;
             });
 

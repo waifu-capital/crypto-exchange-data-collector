@@ -142,11 +142,14 @@ pub async fn websocket_worker(
     ws_config: WsConfig,
     conn_state: ConnectionState,
     mut shutdown_rx: tokio::sync::broadcast::Receiver<()>,
+    data_timeout_override_secs: Option<u64>,
 ) {
     let exchange_name = exchange.name();
     let normalized_symbol = exchange.normalize_symbol(&symbol);
     let url = exchange.websocket_url(&symbol);
-    let message_timeout = Duration::from_secs(ws_config.message_timeout_secs);
+    // Use per-market data timeout if provided, otherwise fall back to global config
+    let data_timeout_secs = data_timeout_override_secs.unwrap_or(ws_config.message_timeout_secs);
+    let message_timeout = Duration::from_secs(data_timeout_secs);
     let mut backoff = ExponentialBackoff::new(
         ws_config.initial_retry_delay_secs,
         ws_config.max_retry_delay_secs,

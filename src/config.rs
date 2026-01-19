@@ -156,6 +156,11 @@ pub struct MarketConfig {
     /// - wss://data-stream.binance.vision/ws (market data, may bypass geo-restrictions)
     /// - wss://stream.binance.us:9443/ws (US, different trading pairs)
     pub base_url: Option<String>,
+    /// Optional data timeout override for low-volume pairs (seconds)
+    /// If no trades/orderbook updates are received for 3x this value, the connection is
+    /// considered stale and will reconnect. Useful for low-volume pairs like XRP-USDT.
+    /// Default: uses global websocket.message_timeout_secs
+    pub data_timeout_secs: Option<u64>,
 }
 
 fn default_market_feeds() -> Vec<String> {
@@ -206,6 +211,8 @@ pub struct MarketPair {
     pub feeds: Vec<String>,
     /// Optional WebSocket base URL override (exchange-specific)
     pub base_url: Option<String>,
+    /// Optional data timeout override for low-volume pairs (seconds)
+    pub data_timeout_secs: Option<u64>,
 }
 
 /// Application configuration
@@ -317,18 +324,20 @@ impl Config {
             None
         };
 
-        // Flatten markets into pairs (each symbol gets the market's feeds and base_url)
+        // Flatten markets into pairs (each symbol gets the market's feeds, base_url, and timeout)
         let market_pairs: Vec<MarketPair> = file
             .markets
             .iter()
             .flat_map(|m| {
                 let feeds = m.feeds.clone();
                 let base_url = m.base_url.clone();
+                let data_timeout_secs = m.data_timeout_secs;
                 m.symbols.iter().map(move |s| MarketPair {
                     exchange: m.exchange.to_lowercase(),
                     symbol: s.clone(),
                     feeds: feeds.clone(),
                     base_url: base_url.clone(),
+                    data_timeout_secs,
                 })
             })
             .collect();

@@ -2,6 +2,39 @@
 
 ## 2026-01-19
 
+### Added: Per-Market Data Timeout Configuration
+
+**Files changed:** `src/config.rs`, `src/websocket.rs`, `src/main.rs`, `config.toml`
+
+**Problem:** Low-volume trading pairs like XRP-USDT on OKX trigger unnecessary reconnects. The code reconnects if no actual market data (trades/orderbook updates) is received for 3x the `message_timeout_secs` (default: 6 minutes). Heartbeats and subscription confirmations don't reset this timer.
+
+**Solution:** Added optional `data_timeout_secs` per market in `config.toml`:
+
+```toml
+[[markets]]
+exchange = "okx"
+symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+# Uses global websocket.message_timeout_secs (120s, reconnect after 6 min)
+
+[[markets]]
+exchange = "okx"
+symbols = ["XRP-USDT"]
+data_timeout_secs = 600  # 10 min timeout, reconnect after 30 min no data
+```
+
+**Changes:**
+- `config.rs`: Added `data_timeout_secs` field to `MarketConfig` and `MarketPair`
+- `websocket.rs`: Accept per-market timeout override, fall back to global config
+- `main.rs`: Pass `data_timeout_secs` from market pair to websocket worker
+- `config.toml`: Split OKX XRP-USDT into separate section with longer timeout
+
+**Behavior:**
+- If `data_timeout_secs` is set: uses that value for data timeout
+- If not set: uses global `websocket.message_timeout_secs`
+- Reconnection happens after 3x the timeout with no data
+
+---
+
 ### Added: Configurable Binance WebSocket Endpoint for Geo-Restrictions
 
 **Files changed:** `src/config.rs`, `src/exchanges/binance.rs`, `src/exchanges/mod.rs`, `src/main.rs`, `config.toml`
