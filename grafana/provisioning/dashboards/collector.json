@@ -86,12 +86,12 @@
       "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         {
-          "expr": "increase(collector_websocket_reconnects_total[1h])",
+          "expr": "increase(collector_websocket_reconnects_total[$__range])",
           "legendFormat": "{{exchange}} / {{symbol}}",
           "refId": "A"
         }
       ],
-      "title": "Reconnects (1h)",
+      "title": "Reconnects",
       "type": "timeseries"
     },
     {

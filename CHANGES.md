@@ -2,6 +2,44 @@
 
 ## 2026-01-19
 
+### Fixed: Grafana Reconnects Panel Not Showing Data for Some Exchanges
+
+**Files changed:** `grafana/provisioning/dashboards/collector.json`
+
+**Problem:** The Grafana reconnects panel showed 0 for Coinbase despite the raw Prometheus query returning correct values. OKX showed correct reconnect counts.
+
+**Root cause:** The dashboard used `increase(collector_websocket_reconnects_total[1h])` which has limitations:
+- `increase()` requires at least 2 data points within the window
+- Counter resets (pod restarts) cause `increase()` to return 0 or negative values
+- Sparse reconnects may not have enough samples in the 1h window
+
+**Solution:** Changed the query to use the dashboard's time range variable:
+```json
+"expr": "increase(collector_websocket_reconnects_total[$__range])"
+```
+
+Also updated panel title from "Reconnects (1h)" to "Reconnects" since it now adapts to the selected time range.
+
+---
+
+### Removed: Unused SEQUENCE_* Metrics
+
+**Files changed:** `src/metrics.rs`
+
+**Problem:** Four SEQUENCE_* metrics were defined but never used anywhere in the codebase:
+- `collector_sequence_gaps_total`
+- `collector_sequence_gap_size`
+- `collector_sequence_out_of_order_total`
+- `collector_sequence_duplicates_total`
+
+These were originally planned for sequence tracking but the implementation was never completed.
+
+**Solution:** Removed all four metric definitions from `src/metrics.rs`.
+
+**Impact:** Reduces binary size slightly and eliminates confusion about metrics that appear in `/metrics` output but are always 0.
+
+---
+
 ### Fixed: Critical Memory Leak in Archive System (4GB+ RAM Usage)
 
 **Files changed:** `src/db.rs`, `src/archive.rs`
