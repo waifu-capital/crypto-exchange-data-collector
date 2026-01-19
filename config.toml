@@ -34,7 +34,7 @@ dir = "data/archive"
 # - s3: Upload to S3 only (delete local temp files after upload)
 # - local: Persist to local disk only (no S3, AWS credentials not required)
 # - both: Upload to S3 AND keep a local copy
-mode = "local"
+mode = "s3"
 # Directory for persistent local Parquet storage (hierarchical structure)
 # Only used when mode is "local" or "both"
 # Structure: {local_path}/{exchange}/{symbol}/{data_type}/{date}/{timestamp}.parquet

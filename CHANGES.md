@@ -2,6 +2,34 @@
 
 ## 2026-01-19
 
+### Fixed: Stale .env.example with Unused Variables
+
+**Files changed:** `.env.example`
+
+**Problem:** `.env.example` contained several variables that were either unused or misleading:
+- `BINANCE_API_KEY` / `BINANCE_SECRET_KEY` - never read by the code
+- `HOME_SERVER_NAME` - documented as env var but actually read from `config.toml`
+- `MARKET_SYMBOL` - legacy variable, markets are now configured in `config.toml`
+
+**Solution:** Cleaned up `.env.example` to only show variables that are actually read from environment:
+- `AWS_ACCESS_KEY`, `AWS_SECRET_KEY`, `AWS_REGION` - required for S3 storage
+- `COINBASE_API_KEY`, `COINBASE_API_SECRET_FILE` - optional for Coinbase orderbook auth
+
+**Note:** `home_server_name` is already documented in `config.toml` under `[aws]` section:
+```toml
+[aws]
+region = "us-west-2"
+bucket = "crypto-exchange-data-collector"
+# Optional: identifier for this server (appears in S3 path)
+# home_server_name = "prod-1"
+```
+
+When set, it adds a server identifier to the S3 key path:
+- Without: `{exchange}/{symbol}/{data_type}/{date}/{timestamp}.parquet`
+- With: `{exchange}/{symbol}/{data_type}/{server}/{date}/{timestamp}.parquet`
+
+---
+
 ### Fixed: Binance Double Subscription Causing Duplicate Messages
 
 **Files changed:** `src/exchanges/binance.rs`
