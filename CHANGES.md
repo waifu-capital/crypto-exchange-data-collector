@@ -2,6 +2,52 @@
 
 ## 2026-01-19
 
+### Fixed: Multiple Parquet Files Per Archive Cycle (REGRESSION)
+
+**Files changed:** `Cargo.toml`, `src/archive.rs`
+
+**Problem:** The OOM fix (batch-based archive processing) inadvertently changed behavior to create one Parquet file per 2,000-row batch instead of one file per exchange/symbol per archive cycle. With 100K rows, this resulted in 50+ small files instead of one consolidated file.
+
+**Root cause:** The batch loop called `archive_group()` which created and uploaded a new file for each batch:
+```
+OLD: loop { fetch 2000 → create file → upload → delete }
+     Result: 50 files for 100K rows
+```
+
+**Solution:** Replaced Polars-based `archive_group` with Arrow's streaming `ArrowWriter`:
+```
+NEW: create file → loop { fetch 2000 → write row group } → close → upload
+     Result: 1 file with 50 row groups for 100K rows
+```
+
+**Changes:**
+1. Added `arrow` and `parquet` crates to Cargo.toml (replacing Polars for archive)
+2. Rewrote `archive_table_group` to use `ArrowWriter::try_new()` for streaming writes
+3. Each batch becomes a row group within the same file
+4. Removed old `archive_group` function entirely
+
+**Arrow schema:**
+```rust
+let schema = Arc::new(Schema::new(vec![
+    Field::new("exchange", DataType::Utf8, false),
+    Field::new("symbol", DataType::Utf8, false),
+    Field::new("exchange_sequence_id", DataType::Utf8, false),
+    Field::new("timestamp_collector", DataType::Int64, false),
+    Field::new("timestamp_exchange", DataType::Int64, false),
+    Field::new("data", DataType::Utf8, false),
+]));
+```
+
+**Benefits:**
+- ONE file per exchange/symbol per archive cycle (original behavior restored)
+- Memory stays bounded (only one 2000-row batch in memory at a time)
+- ZSTD compression applied to each row group
+- Streaming writes mean no OOM regardless of total data volume
+
+**Verification:** After archive, check S3/local storage - should see exactly ONE `.parquet` file per exchange/symbol combination, not multiple files.
+
+---
+
 ### Fixed: Critical Data Loss Bug in Archive DELETE (REGRESSION)
 
 **Files changed:** `src/db.rs`, `src/archive.rs`

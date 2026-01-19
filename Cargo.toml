@@ -16,6 +16,8 @@ toml = "0.8"
 tokio = { version = "1.49.0", features = ["full"] }
 tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 polars = { version = "0.52.0", features = ["parquet"] }
+arrow = "54"
+parquet = { version = "54", features = ["arrow", "snap", "zstd"] }
 rand = "0.9.2"
 chrono = "0.4.43"
 tokio-retry = "0.3"

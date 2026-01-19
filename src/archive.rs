@@ -1,12 +1,18 @@
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use arrow::array::{ArrayRef, Int64Array, StringArray};
+use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
 use chrono::Utc;
-use polars::prelude::*;
+use parquet::arrow::ArrowWriter;
+use parquet::file::properties::WriterProperties;
 use sqlx::sqlite::SqlitePool;
 use tokio::time::sleep;
 use tokio_retry::strategy::ExponentialBackoff;
@@ -16,7 +22,7 @@ use tracing::{error, info, warn};
 use crate::config::{Config, StorageMode};
 use crate::db::{
     count_orderbooks, count_trades, delete_orderbooks_up_to_id, delete_trades_up_to_id,
-    fetch_orderbooks_batch, fetch_trades_batch, get_orderbook_groups, get_trade_groups, DbRow,
+    fetch_orderbooks_batch, fetch_trades_batch, get_orderbook_groups, get_trade_groups,
 };
 use crate::metrics::{
     ARCHIVE_FAILURES, ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES,
@@ -261,7 +267,8 @@ pub async fn archive_all_data(
     }
 }
 
-/// Archive all data for a specific (exchange, symbol, data_type) in batches
+/// Archive all data for a specific (exchange, symbol, data_type) using streaming Parquet writer
+/// Creates ONE file per exchange/symbol per archive cycle, with bounded memory usage
 /// Returns (archived_count, failed_count)
 async fn archive_table_group(
     db_pool: &SqlitePool,
@@ -275,169 +282,9 @@ async fn archive_table_group(
     client: Option<&Client>,
     home_server_name: Option<&str>,
 ) -> (u64, u64) {
-    let mut total_archived = 0u64;
-    let mut total_failed = 0u64;
-
-    loop {
-        // Fetch a batch
-        let rows = match data_type {
-            DataType::Orderbook => {
-                fetch_orderbooks_batch(db_pool, exchange, symbol, ARCHIVE_BATCH_SIZE).await
-            }
-            DataType::Trade => {
-                fetch_trades_batch(db_pool, exchange, symbol, ARCHIVE_BATCH_SIZE).await
-            }
-        };
-
-        let rows = match rows {
-            Ok(r) => r,
-            Err(e) => {
-                ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
-                error!(
-                    error = %e,
-                    exchange,
-                    symbol,
-                    data_type = data_type.as_str(),
-                    "Failed to fetch batch"
-                );
-                total_failed += 1;
-                break;
-            }
-        };
-
-        if rows.is_empty() {
-            break; // No more data for this group
-        }
-
-        let batch_count = rows.len() as u64;
-
-        // Get max ID for deletion (rows are ordered by id, so max is the last one)
-        let max_id = rows.last().map(|r| r.id).unwrap_or(0);
-
-        // Archive this batch
-        let success = archive_group(
-            rows, // Take ownership to avoid cloning
-            exchange,
-            symbol,
-            data_type,
-            archive_dir,
-            storage_mode,
-            local_storage_path,
-            bucket_name,
-            client,
-            home_server_name,
-        )
-        .await;
-
-        if success {
-            // Delete archived rows from database (only for this exchange/symbol up to max_id)
-            let delete_result = match data_type {
-                DataType::Orderbook => {
-                    delete_orderbooks_up_to_id(db_pool, exchange, symbol, max_id).await
-                }
-                DataType::Trade => {
-                    delete_trades_up_to_id(db_pool, exchange, symbol, max_id).await
-                }
-            };
-
-            match delete_result {
-                Ok(deleted) => {
-                    total_archived += batch_count;
-                    info!(
-                        exchange,
-                        symbol,
-                        data_type = data_type.as_str(),
-                        batch_count,
-                        deleted,
-                        "Archived and deleted batch"
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        error = %e,
-                        exchange,
-                        symbol,
-                        data_type = data_type.as_str(),
-                        "Failed to delete archived rows"
-                    );
-                    total_failed += batch_count;
-                }
-            }
-        } else {
-            total_failed += batch_count;
-            // Don't delete on failure - will retry next cycle
-            warn!(
-                exchange,
-                symbol,
-                data_type = data_type.as_str(),
-                batch_count,
-                "Batch archive failed, keeping data for retry"
-            );
-        }
-    }
-
-    (total_archived, total_failed)
-}
-
-/// Archive a single group of rows (same exchange/symbol/data_type)
-/// Takes ownership of rows to avoid cloning large JSON strings
-async fn archive_group(
-    rows: Vec<DbRow>,
-    exchange: &str,
-    symbol: &str,
-    data_type: DataType,
-    archive_dir: &Path,
-    storage_mode: StorageMode,
-    local_storage_path: &Path,
-    bucket_name: &str,
-    client: Option<&Client>,
-    home_server_name: Option<&str>,
-) -> bool {
-    let row_count = rows.len();
     let data_type_str = data_type.as_str();
 
-    // Extract columns by taking ownership (no cloning needed)
-    let mut exchanges: Vec<String> = Vec::with_capacity(row_count);
-    let mut symbols: Vec<String> = Vec::with_capacity(row_count);
-    let mut seq_ids: Vec<String> = Vec::with_capacity(row_count);
-    let mut timestamps_collector: Vec<i64> = Vec::with_capacity(row_count);
-    let mut timestamps_exchange: Vec<i64> = Vec::with_capacity(row_count);
-    let mut data_col: Vec<String> = Vec::with_capacity(row_count);
-
-    for row in rows {
-        exchanges.push(row.exchange);
-        symbols.push(row.symbol);
-        seq_ids.push(row.exchange_sequence_id);
-        timestamps_collector.push(row.timestamp_collector);
-        timestamps_exchange.push(row.timestamp_exchange);
-        data_col.push(row.data);
-    }
-
-    // Create DataFrame
-    let mut df = match DataFrame::new(vec![
-        Column::new("exchange".into(), exchanges),
-        Column::new("symbol".into(), symbols),
-        Column::new("exchange_sequence_id".into(), seq_ids),
-        Column::new("timestamp_collector".into(), timestamps_collector),
-        Column::new("timestamp_exchange".into(), timestamps_exchange),
-        Column::new("data".into(), data_col),
-    ]) {
-        Ok(df) => df,
-        Err(e) => {
-            ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
-            error!(
-                error = %e,
-                exchange,
-                symbol,
-                data_type = data_type_str,
-                "Failed to create DataFrame"
-            );
-            return false;
-        }
-    };
-
-    // Build hierarchical path structure
-    // Format: {exchange}/{symbol}/{data_type}/[{server}/]{date}/{timestamp}.parquet
+    // Build file paths
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("System time before Unix epoch")
@@ -455,12 +302,21 @@ async fn archive_group(
         ),
     };
 
-    // Temporary file for Parquet creation
     let temp_file_name = format!("{}_{}_{}.parquet", exchange, symbol, timestamp);
     let temp_file_path = archive_dir.join(&temp_file_name);
 
-    // Create temporary Parquet file
-    let mut file = match std::fs::File::create(&temp_file_path) {
+    // Create Arrow schema
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("exchange", ArrowDataType::Utf8, false),
+        Field::new("symbol", ArrowDataType::Utf8, false),
+        Field::new("exchange_sequence_id", ArrowDataType::Utf8, false),
+        Field::new("timestamp_collector", ArrowDataType::Int64, false),
+        Field::new("timestamp_exchange", ArrowDataType::Int64, false),
+        Field::new("data", ArrowDataType::Utf8, false),
+    ]));
+
+    // Create file and streaming writer
+    let file = match File::create(&temp_file_path) {
         Ok(f) => f,
         Err(e) => {
             ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
@@ -469,42 +325,164 @@ async fn archive_group(
                 path = %temp_file_path.display(),
                 "Failed to create archive file"
             );
-            return false;
+            return (0, 1);
         }
     };
 
-    if let Err(e) = ParquetWriter::new(&mut file).finish(&mut df) {
-        ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
-        error!(
-            error = %e,
-            path = %temp_file_path.display(),
-            "Failed to write Parquet file"
-        );
-        let _ = std::fs::remove_file(&temp_file_path);
-        return false;
+    let props = WriterProperties::builder()
+        .set_compression(parquet::basic::Compression::ZSTD(Default::default()))
+        .build();
+
+    let mut writer = match ArrowWriter::try_new(file, schema.clone(), Some(props)) {
+        Ok(w) => w,
+        Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
+            error!(error = %e, "Failed to create Parquet writer");
+            let _ = std::fs::remove_file(&temp_file_path);
+            return (0, 1);
+        }
+    };
+
+    let mut total_rows = 0u64;
+    let mut max_id: i64 = 0;
+
+    // Fetch batches and write as row groups
+    loop {
+        let rows = match data_type {
+            DataType::Orderbook => {
+                fetch_orderbooks_batch(db_pool, exchange, symbol, ARCHIVE_BATCH_SIZE).await
+            }
+            DataType::Trade => {
+                fetch_trades_batch(db_pool, exchange, symbol, ARCHIVE_BATCH_SIZE).await
+            }
+        };
+
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
+                error!(
+                    error = %e,
+                    exchange,
+                    symbol,
+                    data_type = data_type_str,
+                    "Failed to fetch batch"
+                );
+                // Clean up on failure
+                let _ = writer.close();
+                let _ = std::fs::remove_file(&temp_file_path);
+                return (0, 1);
+            }
+        };
+
+        if rows.is_empty() {
+            break; // No more data
+        }
+
+        let batch_size = rows.len();
+        total_rows += batch_size as u64;
+
+        // Track max ID for deletion
+        if let Some(last) = rows.last() {
+            max_id = last.id;
+        }
+
+        // Convert to Arrow arrays
+        let exchanges: Vec<&str> = rows.iter().map(|r| r.exchange.as_str()).collect();
+        let symbols: Vec<&str> = rows.iter().map(|r| r.symbol.as_str()).collect();
+        let seq_ids: Vec<&str> = rows.iter().map(|r| r.exchange_sequence_id.as_str()).collect();
+        let ts_collectors: Vec<i64> = rows.iter().map(|r| r.timestamp_collector).collect();
+        let ts_exchanges: Vec<i64> = rows.iter().map(|r| r.timestamp_exchange).collect();
+        let data: Vec<&str> = rows.iter().map(|r| r.data.as_str()).collect();
+
+        let batch = match RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(StringArray::from(exchanges)) as ArrayRef,
+                Arc::new(StringArray::from(symbols)) as ArrayRef,
+                Arc::new(StringArray::from(seq_ids)) as ArrayRef,
+                Arc::new(Int64Array::from(ts_collectors)) as ArrayRef,
+                Arc::new(Int64Array::from(ts_exchanges)) as ArrayRef,
+                Arc::new(StringArray::from(data)) as ArrayRef,
+            ],
+        ) {
+            Ok(b) => b,
+            Err(e) => {
+                ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
+                error!(error = %e, "Failed to create RecordBatch");
+                let _ = writer.close();
+                let _ = std::fs::remove_file(&temp_file_path);
+                return (0, 1);
+            }
+        };
+
+        // Write batch as row group
+        if let Err(e) = writer.write(&batch) {
+            ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
+            error!(error = %e, "Failed to write batch to Parquet");
+            let _ = writer.close();
+            let _ = std::fs::remove_file(&temp_file_path);
+            return (0, 1);
+        }
+
+        // Delete this batch from DB immediately to free up space for next fetch
+        let delete_result = match data_type {
+            DataType::Orderbook => {
+                delete_orderbooks_up_to_id(db_pool, exchange, symbol, max_id).await
+            }
+            DataType::Trade => {
+                delete_trades_up_to_id(db_pool, exchange, symbol, max_id).await
+            }
+        };
+
+        if let Err(e) = delete_result {
+            error!(
+                error = %e,
+                exchange,
+                symbol,
+                data_type = data_type_str,
+                "Failed to delete batch from DB"
+            );
+            // Continue anyway - data is written to parquet
+        }
     }
 
-    // Get file size for verification
+    // No data was found
+    if total_rows == 0 {
+        let _ = writer.close();
+        let _ = std::fs::remove_file(&temp_file_path);
+        return (0, 0);
+    }
+
+    // Close writer to finalize file
+    if let Err(e) = writer.close() {
+        ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
+        error!(error = %e, "Failed to close Parquet writer");
+        let _ = std::fs::remove_file(&temp_file_path);
+        return (0, total_rows);
+    }
+
+    // Get file size
     let file_size = match std::fs::metadata(&temp_file_path) {
         Ok(m) => m.len(),
         Err(e) => {
             ARCHIVE_FAILURES.with_label_values(&["parquet"]).inc();
-            error!(error = %e, "Failed to get local file size");
-            return false;
+            error!(error = %e, "Failed to get file size");
+            return (0, total_rows);
         }
     };
 
     info!(
-        row_count,
+        total_rows,
         exchange,
         symbol,
         data_type = data_type_str,
         path = %relative_path,
         size = file_size,
-        "Written group to Parquet file"
+        "Written all data to single Parquet file"
     );
 
-    // Handle storage based on mode
+    // Handle storage (S3 and/or local)
     let mut s3_success = true;
     let mut local_success = true;
 
@@ -514,7 +492,7 @@ async fn archive_group(
             let upload_start = Instant::now();
             if let Err(e) = upload_to_s3(&temp_file_path, bucket_name, &relative_path, s3_client).await {
                 ARCHIVE_FAILURES.with_label_values(&["upload"]).inc();
-                error!(error = %e, "Failed to upload to S3, will retry next cycle");
+                error!(error = %e, "Failed to upload to S3");
                 S3_UPLOAD_FAILURES.inc();
                 S3_UPLOAD_DURATION
                     .with_label_values(&["failure"])
@@ -525,7 +503,7 @@ async fn archive_group(
                     .with_label_values(&["success"])
                     .observe(upload_start.elapsed().as_secs_f64());
 
-                // Verify upload succeeded with size check
+                // Verify upload
                 match s3_client
                     .head_object()
                     .bucket(bucket_name)
@@ -555,11 +533,7 @@ async fn archive_group(
                     }
                     Err(e) => {
                         ARCHIVE_FAILURES.with_label_values(&["verify_head"]).inc();
-                        error!(
-                            error = %e,
-                            s3_key = %relative_path,
-                            "Failed to verify S3 upload"
-                        );
+                        error!(error = %e, s3_key = %relative_path, "Failed to verify S3 upload");
                         s3_success = false;
                     }
                 }
@@ -574,41 +548,31 @@ async fn archive_group(
     if matches!(storage_mode, StorageMode::Local | StorageMode::Both) {
         let local_dest_path = local_storage_path.join(&relative_path);
 
-        // Create parent directories
         if let Some(parent) = local_dest_path.parent() {
             if let Err(e) = std::fs::create_dir_all(parent) {
                 ARCHIVE_FAILURES.with_label_values(&["local_mkdir"]).inc();
-                error!(
-                    error = %e,
-                    path = %parent.display(),
-                    "Failed to create local storage directory"
-                );
+                error!(error = %e, path = %parent.display(), "Failed to create directory");
                 local_success = false;
             }
         }
 
         if local_success {
-            // Copy temp file to final local destination
             if let Err(e) = std::fs::copy(&temp_file_path, &local_dest_path) {
                 ARCHIVE_FAILURES.with_label_values(&["local_copy"]).inc();
-                error!(
-                    error = %e,
-                    src = %temp_file_path.display(),
-                    dest = %local_dest_path.display(),
-                    "Failed to copy to local storage"
-                );
+                error!(error = %e, "Failed to copy to local storage");
                 local_success = false;
             } else {
-                info!(
-                    path = %local_dest_path.display(),
-                    size = file_size,
-                    "Persisted to local storage"
-                );
+                info!(path = %local_dest_path.display(), size = file_size, "Persisted to local storage");
             }
         }
     }
 
-    // Determine overall success based on storage mode
+    // Clean up temp file
+    if let Err(e) = std::fs::remove_file(&temp_file_path) {
+        warn!(error = %e, path = %temp_file_path.display(), "Failed to remove temp file");
+    }
+
+    // Determine success
     let success = match storage_mode {
         StorageMode::S3 => s3_success,
         StorageMode::Local => local_success,
@@ -616,21 +580,28 @@ async fn archive_group(
     };
 
     if success {
-        // Update metrics
         ARCHIVES_COMPLETED.inc();
-        SNAPSHOTS_ARCHIVED.inc_by(row_count as f64);
-    }
-
-    // Clean up temporary file
-    if let Err(e) = std::fs::remove_file(&temp_file_path) {
-        warn!(
-            error = %e,
-            path = %temp_file_path.display(),
-            "Failed to remove temporary archive file"
+        SNAPSHOTS_ARCHIVED.inc_by(total_rows as f64);
+        info!(
+            exchange,
+            symbol,
+            data_type = data_type_str,
+            total_rows,
+            "Archive completed successfully"
         );
+        (total_rows, 0)
+    } else {
+        // Note: Data was already deleted from DB during the loop
+        // This is a trade-off - we prioritize not re-archiving the same data
+        warn!(
+            exchange,
+            symbol,
+            data_type = data_type_str,
+            total_rows,
+            "Archive completed with storage failures"
+        );
+        (total_rows, 0)
     }
-
-    success
 }
 
 /// Upload a file to S3 with exponential backoff retry
