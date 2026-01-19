@@ -203,15 +203,65 @@ pub struct DbRow {
     pub data: String,
 }
 
-/// Fetch all orderbooks from the database for archiving
-pub async fn fetch_all_orderbooks(db_pool: &SqlitePool) -> Result<Vec<DbRow>, sqlx::Error> {
+/// Represents a unique (exchange, symbol) combination in the database
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ExchangeSymbol {
+    pub exchange: String,
+    pub symbol: String,
+}
+
+/// Get distinct (exchange, symbol) pairs from orderbooks table
+pub async fn get_orderbook_groups(db_pool: &SqlitePool) -> Result<Vec<ExchangeSymbol>, sqlx::Error> {
+    let rows = sqlx::query("SELECT DISTINCT exchange, symbol FROM orderbooks")
+        .fetch_all(db_pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| ExchangeSymbol {
+            exchange: row.get("exchange"),
+            symbol: row.get("symbol"),
+        })
+        .collect())
+}
+
+/// Get distinct (exchange, symbol) pairs from trades table
+pub async fn get_trade_groups(db_pool: &SqlitePool) -> Result<Vec<ExchangeSymbol>, sqlx::Error> {
+    let rows = sqlx::query("SELECT DISTINCT exchange, symbol FROM trades")
+        .fetch_all(db_pool)
+        .await?;
+
+    Ok(rows
+        .iter()
+        .map(|row| ExchangeSymbol {
+            exchange: row.get("exchange"),
+            symbol: row.get("symbol"),
+        })
+        .collect())
+}
+
+/// Fetch a batch of orderbooks for a specific exchange/symbol
+/// Returns rows ordered by id, limited to batch_size
+pub async fn fetch_orderbooks_batch(
+    db_pool: &SqlitePool,
+    exchange: &str,
+    symbol: &str,
+    batch_size: i64,
+) -> Result<Vec<DbRow>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data FROM orderbooks",
+        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data
+         FROM orderbooks
+         WHERE exchange = ? AND symbol = ?
+         ORDER BY id
+         LIMIT ?",
     )
+    .bind(exchange)
+    .bind(symbol)
+    .bind(batch_size)
     .fetch_all(db_pool)
     .await?;
 
-    let events = rows
+    Ok(rows
         .iter()
         .map(|row| DbRow {
             exchange: row.get("exchange"),
@@ -222,20 +272,31 @@ pub async fn fetch_all_orderbooks(db_pool: &SqlitePool) -> Result<Vec<DbRow>, sq
             timestamp_exchange: row.get("timestamp_exchange"),
             data: row.get("data"),
         })
-        .collect();
-
-    Ok(events)
+        .collect())
 }
 
-/// Fetch all trades from the database for archiving
-pub async fn fetch_all_trades(db_pool: &SqlitePool) -> Result<Vec<DbRow>, sqlx::Error> {
+/// Fetch a batch of trades for a specific exchange/symbol
+/// Returns rows ordered by id, limited to batch_size
+pub async fn fetch_trades_batch(
+    db_pool: &SqlitePool,
+    exchange: &str,
+    symbol: &str,
+    batch_size: i64,
+) -> Result<Vec<DbRow>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data FROM trades",
+        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data
+         FROM trades
+         WHERE exchange = ? AND symbol = ?
+         ORDER BY id
+         LIMIT ?",
     )
+    .bind(exchange)
+    .bind(symbol)
+    .bind(batch_size)
     .fetch_all(db_pool)
     .await?;
 
-    let events = rows
+    Ok(rows
         .iter()
         .map(|row| DbRow {
             exchange: row.get("exchange"),
@@ -246,23 +307,77 @@ pub async fn fetch_all_trades(db_pool: &SqlitePool) -> Result<Vec<DbRow>, sqlx::
             timestamp_exchange: row.get("timestamp_exchange"),
             data: row.get("data"),
         })
-        .collect();
-
-    Ok(events)
+        .collect())
 }
 
-/// Delete all orderbooks from the database after successful archive
-pub async fn delete_all_orderbooks(db_pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM orderbooks")
-        .execute(db_pool)
+/// Delete orderbooks for a specific exchange/symbol by their sequence IDs
+pub async fn delete_orderbooks_by_seq_ids(
+    db_pool: &SqlitePool,
+    exchange: &str,
+    symbol: &str,
+    seq_ids: &[String],
+) -> Result<u64, sqlx::Error> {
+    if seq_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Build placeholders for IN clause
+    let placeholders: Vec<&str> = seq_ids.iter().map(|_| "?").collect();
+    let query = format!(
+        "DELETE FROM orderbooks WHERE exchange = ? AND symbol = ? AND exchange_sequence_id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut q = sqlx::query(&query).bind(exchange).bind(symbol);
+    for seq_id in seq_ids {
+        q = q.bind(seq_id);
+    }
+
+    let result = q.execute(db_pool).await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete trades for a specific exchange/symbol by their sequence IDs
+pub async fn delete_trades_by_seq_ids(
+    db_pool: &SqlitePool,
+    exchange: &str,
+    symbol: &str,
+    seq_ids: &[String],
+) -> Result<u64, sqlx::Error> {
+    if seq_ids.is_empty() {
+        return Ok(0);
+    }
+
+    // Build placeholders for IN clause
+    let placeholders: Vec<&str> = seq_ids.iter().map(|_| "?").collect();
+    let query = format!(
+        "DELETE FROM trades WHERE exchange = ? AND symbol = ? AND exchange_sequence_id IN ({})",
+        placeholders.join(", ")
+    );
+
+    let mut q = sqlx::query(&query).bind(exchange).bind(symbol);
+    for seq_id in seq_ids {
+        q = q.bind(seq_id);
+    }
+
+    let result = q.execute(db_pool).await?;
+    Ok(result.rows_affected())
+}
+
+/// Get total count of rows in orderbooks table (for logging)
+pub async fn count_orderbooks(db_pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query("SELECT COUNT(*) as count FROM orderbooks")
+        .fetch_one(db_pool)
         .await?;
-    Ok(())
+    Ok(row.get("count"))
 }
 
-/// Delete all trades from the database after successful archive
-pub async fn delete_all_trades(db_pool: &SqlitePool) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM trades").execute(db_pool).await?;
-    Ok(())
+/// Get total count of rows in trades table (for logging)
+pub async fn count_trades(db_pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    let row = sqlx::query("SELECT COUNT(*) as count FROM trades")
+        .fetch_one(db_pool)
+        .await?;
+    Ok(row.get("count"))
 }
 
 /// Categorize a SQLx error for metrics tracking

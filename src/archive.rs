@@ -1,15 +1,10 @@
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use aws_config::meta::region::RegionProviderChain;
 use aws_sdk_s3::config::{BehaviorVersion, Region};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client;
-
-/// Track last successfully archived max timestamp to prevent duplicates
-static LAST_ARCHIVE_MAX_TIMESTAMP: AtomicI64 = AtomicI64::new(0);
 use chrono::Utc;
 use polars::prelude::*;
 use sqlx::sqlite::SqlitePool;
@@ -20,7 +15,8 @@ use tracing::{error, info, warn};
 
 use crate::config::{Config, StorageMode};
 use crate::db::{
-    delete_all_orderbooks, delete_all_trades, fetch_all_orderbooks, fetch_all_trades, DbRow,
+    count_orderbooks, count_trades, delete_orderbooks_by_seq_ids, delete_trades_by_seq_ids,
+    fetch_orderbooks_batch, fetch_trades_batch, get_orderbook_groups, get_trade_groups, DbRow,
 };
 use crate::metrics::{
     ARCHIVE_FAILURES, ARCHIVES_COMPLETED, S3_UPLOAD_DURATION, S3_UPLOAD_FAILURES,
@@ -164,7 +160,11 @@ pub async fn run_archive_scheduler(
     info!("Archive scheduler stopped");
 }
 
+/// Batch size for archive operations - limits memory usage
+const ARCHIVE_BATCH_SIZE: i64 = 10_000;
+
 /// Archive all data from both orderbooks and trades tables
+/// Processes data in batches to limit memory usage
 /// Groups data by (exchange, symbol, data_type) and creates separate Parquet files
 pub async fn archive_all_data(
     db_pool: &SqlitePool,
@@ -175,79 +175,150 @@ pub async fn archive_all_data(
     client: Option<&Client>,
     home_server_name: Option<&str>,
 ) {
-    // Fetch from both tables
-    let orderbooks = match fetch_all_orderbooks(db_pool).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
-            error!(error = %e, "Failed to fetch orderbooks for archive");
-            return;
-        }
-    };
+    // Get counts for logging
+    let orderbook_count = count_orderbooks(db_pool).await.unwrap_or(0);
+    let trade_count = count_trades(db_pool).await.unwrap_or(0);
 
-    let trades = match fetch_all_trades(db_pool).await {
-        Ok(rows) => rows,
-        Err(e) => {
-            ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
-            error!(error = %e, "Failed to fetch trades for archive");
-            return;
-        }
-    };
-
-    if orderbooks.is_empty() && trades.is_empty() {
+    if orderbook_count == 0 && trade_count == 0 {
         info!("No data to archive");
         return;
     }
 
-    // Combine all rows
-    let all_rows: Vec<DbRow> = orderbooks.into_iter().chain(trades.into_iter()).collect();
-    let total_count = all_rows.len();
-
-    // Get max timestamp for duplicate prevention
-    let max_collector_ts = all_rows
-        .iter()
-        .map(|r| r.timestamp_collector)
-        .max()
-        .unwrap_or(0);
-    let last_archived = LAST_ARCHIVE_MAX_TIMESTAMP.load(Ordering::SeqCst);
-
-    // Check for duplicate archive scenario
-    if max_collector_ts > 0 && max_collector_ts <= last_archived {
-        warn!(
-            last_archived,
-            current_max = max_collector_ts,
-            "Skipping archive - data appears to already be archived (retry scenario)"
-        );
-        // Delete from DB since data is already in S3
-        if let Err(e) = delete_all_orderbooks(db_pool).await {
-            error!(error = %e, "Failed to clean up already-archived orderbooks");
-        }
-        if let Err(e) = delete_all_trades(db_pool).await {
-            error!(error = %e, "Failed to clean up already-archived trades");
-        }
-        return;
-    }
-
-    // Group rows by (exchange, symbol, data_type)
-    let mut groups: HashMap<(String, String, DataType), Vec<DbRow>> = HashMap::new();
-    for row in all_rows {
-        let key = (row.exchange.clone(), row.symbol.clone(), row.data_type);
-        groups.entry(key).or_default().push(row);
-    }
-
     info!(
-        total_count,
-        groups = groups.len(),
-        "Archiving data in groups"
+        orderbook_count,
+        trade_count,
+        batch_size = ARCHIVE_BATCH_SIZE,
+        "Starting batch archive"
     );
 
-    // Process each group
-    let mut all_uploads_succeeded = true;
-    for ((exchange, symbol, data_type), rows) in groups {
+    let mut total_archived = 0u64;
+    let mut total_failed = 0u64;
+
+    // Process orderbooks by (exchange, symbol) groups
+    let orderbook_groups = match get_orderbook_groups(db_pool).await {
+        Ok(groups) => groups,
+        Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
+            error!(error = %e, "Failed to get orderbook groups");
+            return;
+        }
+    };
+
+    for group in orderbook_groups {
+        let (archived, failed) = archive_table_group(
+            db_pool,
+            &group.exchange,
+            &group.symbol,
+            DataType::Orderbook,
+            archive_dir,
+            storage_mode,
+            local_storage_path,
+            bucket_name,
+            client,
+            home_server_name,
+        )
+        .await;
+        total_archived += archived;
+        total_failed += failed;
+    }
+
+    // Process trades by (exchange, symbol) groups
+    let trade_groups = match get_trade_groups(db_pool).await {
+        Ok(groups) => groups,
+        Err(e) => {
+            ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
+            error!(error = %e, "Failed to get trade groups");
+            return;
+        }
+    };
+
+    for group in trade_groups {
+        let (archived, failed) = archive_table_group(
+            db_pool,
+            &group.exchange,
+            &group.symbol,
+            DataType::Trade,
+            archive_dir,
+            storage_mode,
+            local_storage_path,
+            bucket_name,
+            client,
+            home_server_name,
+        )
+        .await;
+        total_archived += archived;
+        total_failed += failed;
+    }
+
+    if total_failed > 0 {
+        warn!(
+            total_archived,
+            total_failed,
+            "Archive completed with some failures"
+        );
+    } else {
+        info!(total_archived, "Archive completed successfully");
+    }
+}
+
+/// Archive all data for a specific (exchange, symbol, data_type) in batches
+/// Returns (archived_count, failed_count)
+async fn archive_table_group(
+    db_pool: &SqlitePool,
+    exchange: &str,
+    symbol: &str,
+    data_type: DataType,
+    archive_dir: &Path,
+    storage_mode: StorageMode,
+    local_storage_path: &Path,
+    bucket_name: &str,
+    client: Option<&Client>,
+    home_server_name: Option<&str>,
+) -> (u64, u64) {
+    let mut total_archived = 0u64;
+    let mut total_failed = 0u64;
+
+    loop {
+        // Fetch a batch
+        let rows = match data_type {
+            DataType::Orderbook => {
+                fetch_orderbooks_batch(db_pool, exchange, symbol, ARCHIVE_BATCH_SIZE).await
+            }
+            DataType::Trade => {
+                fetch_trades_batch(db_pool, exchange, symbol, ARCHIVE_BATCH_SIZE).await
+            }
+        };
+
+        let rows = match rows {
+            Ok(r) => r,
+            Err(e) => {
+                ARCHIVE_FAILURES.with_label_values(&["fetch"]).inc();
+                error!(
+                    error = %e,
+                    exchange,
+                    symbol,
+                    data_type = data_type.as_str(),
+                    "Failed to fetch batch"
+                );
+                total_failed += 1;
+                break;
+            }
+        };
+
+        if rows.is_empty() {
+            break; // No more data for this group
+        }
+
+        let batch_count = rows.len() as u64;
+
+        // Collect sequence IDs before archiving (for deletion)
+        let seq_ids: Vec<String> = rows.iter().map(|r| r.exchange_sequence_id.clone()).collect();
+
+        // Archive this batch
         let success = archive_group(
-            &rows,
-            &exchange,
-            &symbol,
+            rows, // Take ownership to avoid cloning
+            exchange,
+            symbol,
             data_type,
             archive_dir,
             storage_mode,
@@ -258,30 +329,60 @@ pub async fn archive_all_data(
         )
         .await;
 
-        if !success {
-            all_uploads_succeeded = false;
+        if success {
+            // Delete archived rows from database
+            let delete_result = match data_type {
+                DataType::Orderbook => {
+                    delete_orderbooks_by_seq_ids(db_pool, exchange, symbol, &seq_ids).await
+                }
+                DataType::Trade => {
+                    delete_trades_by_seq_ids(db_pool, exchange, symbol, &seq_ids).await
+                }
+            };
+
+            match delete_result {
+                Ok(deleted) => {
+                    total_archived += batch_count;
+                    info!(
+                        exchange,
+                        symbol,
+                        data_type = data_type.as_str(),
+                        batch_count,
+                        deleted,
+                        "Archived and deleted batch"
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        error = %e,
+                        exchange,
+                        symbol,
+                        data_type = data_type.as_str(),
+                        "Failed to delete archived rows"
+                    );
+                    total_failed += batch_count;
+                }
+            }
+        } else {
+            total_failed += batch_count;
+            // Don't delete on failure - will retry next cycle
+            warn!(
+                exchange,
+                symbol,
+                data_type = data_type.as_str(),
+                batch_count,
+                "Batch archive failed, keeping data for retry"
+            );
         }
     }
 
-    // Only delete from DB if ALL uploads succeeded
-    if all_uploads_succeeded {
-        if let Err(e) = delete_all_orderbooks(db_pool).await {
-            error!(error = %e, "Failed to delete orderbooks from database");
-        }
-        if let Err(e) = delete_all_trades(db_pool).await {
-            error!(error = %e, "Failed to delete trades from database");
-        }
-        // Update last archived timestamp after successful delete
-        LAST_ARCHIVE_MAX_TIMESTAMP.store(max_collector_ts, Ordering::SeqCst);
-        info!(total_count, "Successfully archived and cleaned up all data");
-    } else {
-        warn!("Some uploads failed, keeping data in database for retry");
-    }
+    (total_archived, total_failed)
 }
 
 /// Archive a single group of rows (same exchange/symbol/data_type)
+/// Takes ownership of rows to avoid cloning large JSON strings
 async fn archive_group(
-    rows: &[DbRow],
+    rows: Vec<DbRow>,
     exchange: &str,
     symbol: &str,
     data_type: DataType,
@@ -295,13 +396,22 @@ async fn archive_group(
     let row_count = rows.len();
     let data_type_str = data_type.as_str();
 
-    // Extract columns
-    let exchanges: Vec<String> = rows.iter().map(|r| r.exchange.clone()).collect();
-    let symbols: Vec<String> = rows.iter().map(|r| r.symbol.clone()).collect();
-    let seq_ids: Vec<String> = rows.iter().map(|r| r.exchange_sequence_id.clone()).collect();
-    let timestamps_collector: Vec<i64> = rows.iter().map(|r| r.timestamp_collector).collect();
-    let timestamps_exchange: Vec<i64> = rows.iter().map(|r| r.timestamp_exchange).collect();
-    let data_col: Vec<String> = rows.iter().map(|r| r.data.clone()).collect();
+    // Extract columns by taking ownership (no cloning needed)
+    let mut exchanges: Vec<String> = Vec::with_capacity(row_count);
+    let mut symbols: Vec<String> = Vec::with_capacity(row_count);
+    let mut seq_ids: Vec<String> = Vec::with_capacity(row_count);
+    let mut timestamps_collector: Vec<i64> = Vec::with_capacity(row_count);
+    let mut timestamps_exchange: Vec<i64> = Vec::with_capacity(row_count);
+    let mut data_col: Vec<String> = Vec::with_capacity(row_count);
+
+    for row in rows {
+        exchanges.push(row.exchange);
+        symbols.push(row.symbol);
+        seq_ids.push(row.exchange_sequence_id);
+        timestamps_collector.push(row.timestamp_collector);
+        timestamps_exchange.push(row.timestamp_exchange);
+        data_col.push(row.data);
+    }
 
     // Create DataFrame
     let mut df = match DataFrame::new(vec![

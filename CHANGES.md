@@ -2,6 +2,47 @@
 
 ## 2026-01-19
 
+### Fixed: Critical Memory Leak in Archive System (4GB+ RAM Usage)
+
+**Files changed:** `src/db.rs`, `src/archive.rs`
+
+**Problem:** The archive system loaded the **entire database into memory** before processing, causing 4GB+ RAM usage and database issues on long-running servers. The memory growth was unbounded - the longer the collector ran between archives, the more memory it consumed.
+
+**Root cause:** `archive_all_data()` called `fetch_all_orderbooks()` and `fetch_all_trades()` which used `fetch_all()` to load every row into a `Vec<DbRow>`. With hours of data from multiple exchanges, this could be millions of rows × ~1KB each = gigabytes of RAM. Additionally, the data was duplicated multiple times:
+1. Loaded into `all_rows` vector
+2. Grouped into a HashMap by (exchange, symbol, data_type)
+3. Cloned again when building Parquet columns
+
+**Solution:** Implemented batch-based archive processing:
+
+1. **New paginated fetch functions in `db.rs`:**
+   - `get_orderbook_groups()` / `get_trade_groups()` - Get distinct (exchange, symbol) pairs
+   - `fetch_orderbooks_batch()` / `fetch_trades_batch()` - Fetch limited batches (10K rows max)
+   - `delete_orderbooks_by_seq_ids()` / `delete_trades_by_seq_ids()` - Delete specific archived rows
+   - `count_orderbooks()` / `count_trades()` - For logging
+
+2. **Rewritten `archive_all_data()` in `archive.rs`:**
+   - Process each (exchange, symbol) group independently
+   - Fetch batch of 10,000 rows → Archive to Parquet → Delete from DB → Repeat
+   - Memory stays bounded regardless of total data volume
+
+3. **Optimized `archive_group()` to avoid cloning:**
+   - Takes ownership of `Vec<DbRow>` instead of borrowing
+   - Single pass through rows to extract columns (no `.clone()` calls)
+
+**Memory impact:**
+
+| Scenario | Before | After |
+|----------|--------|-------|
+| 1M rows in DB | ~2-4 GB RAM | ~50-100 MB RAM |
+| 10M rows in DB | ~20-40 GB (OOM) | ~50-100 MB RAM |
+
+**Batch size:** Configurable via `ARCHIVE_BATCH_SIZE` constant (default: 10,000 rows)
+
+**Behavior change:** Archives now delete rows incrementally as each batch is archived, rather than deleting all at once at the end. This is safer - if the process crashes mid-archive, only the successfully archived data is deleted.
+
+---
+
 ### Added: Per-Market Data Timeout Configuration
 
 **Files changed:** `src/config.rs`, `src/websocket.rs`, `src/main.rs`, `config.toml`
