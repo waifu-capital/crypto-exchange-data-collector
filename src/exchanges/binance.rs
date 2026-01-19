@@ -45,15 +45,10 @@ impl Exchange for Binance {
         "binance"
     }
 
-    fn websocket_url(&self, symbol: &str) -> String {
-        // Binance uses URL-based subscriptions for simple cases
-        // For multiple streams, use the combined stream endpoint
-        format!(
-            "wss://stream.binance.com:9443/ws/{}@depth{}@{}ms",
-            symbol.to_lowercase(),
-            self.depth_levels,
-            self.update_speed_ms
-        )
+    fn websocket_url(&self, _symbol: &str) -> String {
+        // Use base endpoint; subscriptions handled via build_subscribe_messages()
+        // This avoids double-subscription (URL auto-subscribes + explicit SUBSCRIBE message)
+        "wss://stream.binance.com:9443/ws".to_string()
     }
 
     fn build_subscribe_messages(&self, symbol: &str, feeds: &[FeedType]) -> Vec<String> {
@@ -192,7 +187,7 @@ mod tests {
     fn test_websocket_url() {
         let binance = Binance::new();
         let url = binance.websocket_url("btcusdt");
-        assert!(url.contains("btcusdt@depth20@100ms"));
+        assert_eq!(url, "wss://stream.binance.com:9443/ws");
     }
 
     #[test]

@@ -1,5 +1,46 @@
 # Changelog
 
+## 2026-01-19
+
+### Fixed: Binance Double Subscription Causing Duplicate Messages
+
+**Files changed:** `src/exchanges/binance.rs`
+
+**Problem:** Binance orderbook messages showed a constant 40 msg/sec in Grafana instead of the expected 20 msg/sec (2 symbols × 10 updates/sec at @100ms interval). The rate was exactly 2× expected.
+
+**Root cause:** Double subscription to the same stream:
+
+1. `websocket_url()` returned `wss://stream.binance.com:9443/ws/btcusdt@depth20@100ms` which **auto-subscribes** via the URL path
+2. `build_subscribe_messages()` then sent `{"method":"SUBSCRIBE","params":["btcusdt@depth20@100ms"]}` which subscribed **again**
+
+Binance sent each orderbook update twice due to this redundant subscription.
+
+**Solution:** Changed `websocket_url()` to return the base WebSocket endpoint:
+
+```rust
+// Before
+fn websocket_url(&self, symbol: &str) -> String {
+    format!(
+        "wss://stream.binance.com:9443/ws/{}@depth{}@{}ms",
+        symbol.to_lowercase(),
+        self.depth_levels,
+        self.update_speed_ms
+    )
+}
+
+// After
+fn websocket_url(&self, _symbol: &str) -> String {
+    // Use base endpoint; subscriptions handled via build_subscribe_messages()
+    "wss://stream.binance.com:9443/ws".to_string()
+}
+```
+
+Now all subscriptions are handled exclusively via `build_subscribe_messages()`, eliminating the duplicate.
+
+**Impact:** Binance orderbook msg/sec drops from ~40 to ~20 (correct rate). No more duplicate messages being stored.
+
+---
+
 ## 2026-01-17
 
 ### Added: COINBASE_API_SECRET_FILE Environment Variable
