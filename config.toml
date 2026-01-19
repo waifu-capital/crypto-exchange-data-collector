@@ -42,7 +42,7 @@ local_path = "data/parquet"
 
 [websocket]
 # Timeout before considering a connection stale and reconnecting (seconds)
-message_timeout_secs = 120
+message_timeout_secs = 180
 # Initial delay before retrying a failed connection (seconds)
 initial_retry_delay_secs = 5
 # Maximum delay between retry attempts with exponential backoff (seconds)
@@ -89,21 +89,19 @@ feeds = ["orderbook", "trades"]
 exchange = "bybit"
 symbols = ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"]
 feeds = ["orderbook", "trades"]
+# Bybit markets can have lower activity during off-peak hours
+# Default uses global websocket.message_timeout_secs (180s, reconnect after 9 min).
+# With 200s, reconnect happens after 10 minutes of no data.
+data_timeout_secs = 200
 
 [[markets]]
 exchange = "okx"
-symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"]
+symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT", "XRP-USDT"]
 feeds = ["orderbook", "trades"]
-
-[[markets]]
-exchange = "okx"
-symbols = ["XRP-USDT"]
-feeds = ["orderbook", "trades"]
-# XRP-USDT has lower trading volume, so we use a longer timeout to avoid
-# unnecessary reconnects when no data is received for extended periods.
-# Default uses global websocket.message_timeout_secs (120s, reconnect after 6 min).
-# With 600s, reconnect happens after 30 minutes of no data.
-data_timeout_secs = 600
+# OKX markets can have lower activity during off-peak hours
+# Default uses global websocket.message_timeout_secs (180s, reconnect after 9 min).
+# With 200s, reconnect happens after 10 minutes of no data.
+data_timeout_secs = 200
 
 # this doesn't work
 # you can only use it if you are in a specific region? https://global-docs.upbit.com/reference/websocket-orderbook
