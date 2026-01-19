@@ -50,6 +50,14 @@ pub async fn init_database(db_pool: &SqlitePool) {
         .await
         .ok();
 
+    // Index for exchange/symbol queries (critical for archive performance)
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_orderbooks_exchange_symbol ON orderbooks(exchange, symbol)",
+    )
+    .execute(db_pool)
+    .await
+    .ok();
+
     // Trades table
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS trades (
@@ -72,6 +80,14 @@ pub async fn init_database(db_pool: &SqlitePool) {
         .execute(db_pool)
         .await
         .ok();
+
+    // Index for exchange/symbol queries (critical for archive performance)
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_trades_exchange_symbol ON trades(exchange, symbol)",
+    )
+    .execute(db_pool)
+    .await
+    .ok();
 
     info!("Database initialized with WAL mode and separate orderbooks/trades tables");
 }
@@ -313,33 +329,41 @@ pub async fn fetch_trades_batch(
         .collect())
 }
 
-/// Delete orderbooks by ID range (inclusive)
-/// Much faster than IN clause with thousands of IDs since it uses the primary key index
-pub async fn delete_orderbooks_by_id_range(
+/// Delete orderbooks for a specific exchange/symbol up to (and including) max_id
+/// Uses exchange/symbol filter to avoid deleting rows from other exchanges
+pub async fn delete_orderbooks_up_to_id(
     db_pool: &SqlitePool,
-    min_id: i64,
+    exchange: &str,
+    symbol: &str,
     max_id: i64,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM orderbooks WHERE id BETWEEN ? AND ?")
-        .bind(min_id)
-        .bind(max_id)
-        .execute(db_pool)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM orderbooks WHERE exchange = ? AND symbol = ? AND id <= ?",
+    )
+    .bind(exchange)
+    .bind(symbol)
+    .bind(max_id)
+    .execute(db_pool)
+    .await?;
     Ok(result.rows_affected())
 }
 
-/// Delete trades by ID range (inclusive)
-/// Much faster than IN clause with thousands of IDs since it uses the primary key index
-pub async fn delete_trades_by_id_range(
+/// Delete trades for a specific exchange/symbol up to (and including) max_id
+/// Uses exchange/symbol filter to avoid deleting rows from other exchanges
+pub async fn delete_trades_up_to_id(
     db_pool: &SqlitePool,
-    min_id: i64,
+    exchange: &str,
+    symbol: &str,
     max_id: i64,
 ) -> Result<u64, sqlx::Error> {
-    let result = sqlx::query("DELETE FROM trades WHERE id BETWEEN ? AND ?")
-        .bind(min_id)
-        .bind(max_id)
-        .execute(db_pool)
-        .await?;
+    let result = sqlx::query(
+        "DELETE FROM trades WHERE exchange = ? AND symbol = ? AND id <= ?",
+    )
+    .bind(exchange)
+    .bind(symbol)
+    .bind(max_id)
+    .execute(db_pool)
+    .await?;
     Ok(result.rows_affected())
 }
 

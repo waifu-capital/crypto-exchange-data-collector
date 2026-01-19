@@ -2,6 +2,44 @@
 
 ## 2026-01-19
 
+### Fixed: Critical Data Loss Bug in Archive DELETE (REGRESSION)
+
+**Files changed:** `src/db.rs`, `src/archive.rs`
+
+**Problem:** The previous ID-range deletion fix caused **catastrophic data loss**. When archiving, DELETE affected 20x more rows than were actually archived:
+
+```
+SELECT ... WHERE exchange = 'binance' AND symbol = 'btcusdt' LIMIT 10000  → 10,000 rows
+DELETE FROM orderbooks WHERE id BETWEEN 1 AND 40000                       → 208,318 rows deleted!
+```
+
+**Root cause:** Rows from different exchanges/symbols are interleaved by auto-increment ID:
+- ID 1: binance/btcusdt
+- ID 2: coinbase/btcusd
+- ID 3: okx/btcusdt
+- ID 4: binance/btcusdt
+- ...
+
+When fetching 10,000 rows for one exchange/symbol, the IDs are sparse (1, 4, 8, 12...). The `DELETE WHERE id BETWEEN min AND max` had no exchange/symbol filter, so it deleted ALL rows in that ID range including rows from other exchanges that were never archived.
+
+**Solution:**
+1. Changed DELETE to include exchange/symbol filter:
+   ```sql
+   DELETE FROM orderbooks WHERE exchange = ? AND symbol = ? AND id <= ?
+   ```
+2. Added indexes on `(exchange, symbol)` for both tables to speed up queries
+3. Reduced `ARCHIVE_BATCH_SIZE` from 10,000 to 2,000 to minimize lock contention
+
+**Why this works:**
+- `SELECT ... WHERE exchange=? AND symbol=? ORDER BY id LIMIT 2000` gets the oldest 2,000 rows for that specific exchange/symbol
+- The max_id from these rows is the cutoff point
+- `DELETE ... WHERE exchange=? AND symbol=? AND id <= max_id` deletes exactly those rows
+- Rows from other exchanges are never touched
+
+**Verification:** After this fix, the `rows_affected` in DELETE logs should equal the `rows_returned` from SELECT (both ~2,000).
+
+---
+
 ### Fixed: Archive Timeout and Excessive "?" Logging
 
 **Files changed:** `src/db.rs`, `src/archive.rs`

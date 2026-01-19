@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::config::{Config, StorageMode};
 use crate::db::{
-    count_orderbooks, count_trades, delete_orderbooks_by_id_range, delete_trades_by_id_range,
+    count_orderbooks, count_trades, delete_orderbooks_up_to_id, delete_trades_up_to_id,
     fetch_orderbooks_batch, fetch_trades_batch, get_orderbook_groups, get_trade_groups, DbRow,
 };
 use crate::metrics::{
@@ -161,7 +161,7 @@ pub async fn run_archive_scheduler(
 }
 
 /// Batch size for archive operations - limits memory usage
-const ARCHIVE_BATCH_SIZE: i64 = 10_000;
+const ARCHIVE_BATCH_SIZE: i64 = 2_000;
 
 /// Archive all data from both orderbooks and trades tables
 /// Processes data in batches to limit memory usage
@@ -311,8 +311,7 @@ async fn archive_table_group(
 
         let batch_count = rows.len() as u64;
 
-        // Get ID range for deletion (rows are ordered by id)
-        let min_id = rows.first().map(|r| r.id).unwrap_or(0);
+        // Get max ID for deletion (rows are ordered by id, so max is the last one)
         let max_id = rows.last().map(|r| r.id).unwrap_or(0);
 
         // Archive this batch
@@ -331,13 +330,13 @@ async fn archive_table_group(
         .await;
 
         if success {
-            // Delete archived rows from database by ID range
+            // Delete archived rows from database (only for this exchange/symbol up to max_id)
             let delete_result = match data_type {
                 DataType::Orderbook => {
-                    delete_orderbooks_by_id_range(db_pool, min_id, max_id).await
+                    delete_orderbooks_up_to_id(db_pool, exchange, symbol, max_id).await
                 }
                 DataType::Trade => {
-                    delete_trades_by_id_range(db_pool, min_id, max_id).await
+                    delete_trades_up_to_id(db_pool, exchange, symbol, max_id).await
                 }
             };
 
