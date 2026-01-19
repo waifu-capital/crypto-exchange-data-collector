@@ -6,30 +6,52 @@ use serde_json::Value;
 
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
+/// Default Binance WebSocket endpoint
+const DEFAULT_BASE_URL: &str = "wss://stream.binance.com:9443/ws";
+
 /// Binance exchange connector.
 pub struct Binance {
     /// Depth levels for orderbook (5, 10, or 20)
     depth_levels: u8,
     /// Update speed in milliseconds (100 or 1000)
     update_speed_ms: u16,
+    /// WebSocket base URL (configurable for geo-restrictions)
+    base_url: String,
 }
 
 impl Binance {
     /// Creates a new Binance exchange with default settings.
     ///
-    /// Defaults: 20 depth levels, 100ms updates
+    /// Defaults: 20 depth levels, 100ms updates, international endpoint
     pub fn new() -> Self {
         Self {
             depth_levels: 20,
             update_speed_ms: 100,
+            base_url: DEFAULT_BASE_URL.to_string(),
+        }
+    }
+
+    /// Creates a Binance exchange with a custom WebSocket base URL.
+    ///
+    /// Use this to bypass geo-restrictions:
+    /// - `wss://stream.binance.com:9443/ws` - international (default, blocked from US)
+    /// - `wss://data-stream.binance.vision/ws` - market data only, may bypass geo-restrictions
+    /// - `wss://stream.binance.us:9443/ws` - US endpoint (different trading pairs)
+    pub fn with_base_url(base_url: String) -> Self {
+        Self {
+            depth_levels: 20,
+            update_speed_ms: 100,
+            base_url,
         }
     }
 
     /// Creates a Binance exchange with custom depth and speed.
+    #[allow(dead_code)]
     pub fn with_config(depth_levels: u8, update_speed_ms: u16) -> Self {
         Self {
             depth_levels,
             update_speed_ms,
+            base_url: DEFAULT_BASE_URL.to_string(),
         }
     }
 }
@@ -48,7 +70,7 @@ impl Exchange for Binance {
     fn websocket_url(&self, _symbol: &str) -> String {
         // Use base endpoint; subscriptions handled via build_subscribe_messages()
         // This avoids double-subscription (URL auto-subscribes + explicit SUBSCRIBE message)
-        "wss://stream.binance.com:9443/ws".to_string()
+        self.base_url.clone()
     }
 
     fn build_subscribe_messages(&self, symbol: &str, feeds: &[FeedType]) -> Vec<String> {
@@ -188,6 +210,11 @@ mod tests {
         let binance = Binance::new();
         let url = binance.websocket_url("btcusdt");
         assert_eq!(url, "wss://stream.binance.com:9443/ws");
+
+        // Test custom URL
+        let binance_us = Binance::with_base_url("wss://stream.binance.us:9443/ws".to_string());
+        let url_us = binance_us.websocket_url("btcusd");
+        assert_eq!(url_us, "wss://stream.binance.us:9443/ws");
     }
 
     #[test]

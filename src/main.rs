@@ -18,7 +18,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use crate::archive::{create_bucket_if_not_exists, create_s3_client, run_archive_scheduler};
 use crate::config::{Config, MarketPair};
 use crate::db::{create_pool, db_worker, init_database};
-use crate::exchanges::{create_exchange, CoinbaseCredentials, FeedType};
+use crate::exchanges::{create_exchange, CoinbaseCredentials, ExchangeConfig, FeedType};
 use crate::http::{run_http_server, run_liveness_probe};
 use crate::metrics::init_metrics;
 use crate::models::{new_connection_state, MarketEvent};
@@ -180,7 +180,12 @@ async fn main() {
         }
 
         for feed in market_feeds {
-            let exchange = create_exchange(&pair.exchange, &coinbase_creds).unwrap_or_else(|| {
+            // Build exchange config with per-market base_url override
+            let exchange_config = ExchangeConfig {
+                coinbase_creds: coinbase_creds.clone(),
+                binance_base_url: pair.base_url.clone(),
+            };
+            let exchange = create_exchange(&pair.exchange, &exchange_config).unwrap_or_else(|| {
                 panic!(
                     "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
                     pair.exchange

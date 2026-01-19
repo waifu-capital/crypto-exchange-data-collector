@@ -150,6 +150,12 @@ pub struct MarketConfig {
     /// Feeds to collect for this market (defaults to ["orderbook", "trades"])
     #[serde(default = "default_market_feeds")]
     pub feeds: Vec<String>,
+    /// Optional WebSocket base URL override (exchange-specific)
+    /// Currently only used for Binance to support different endpoints:
+    /// - wss://stream.binance.com:9443/ws (international, default)
+    /// - wss://data-stream.binance.vision/ws (market data, may bypass geo-restrictions)
+    /// - wss://stream.binance.us:9443/ws (US, different trading pairs)
+    pub base_url: Option<String>,
 }
 
 fn default_market_feeds() -> Vec<String> {
@@ -198,6 +204,8 @@ pub struct MarketPair {
     pub symbol: String,
     /// Feeds to collect for this market pair
     pub feeds: Vec<String>,
+    /// Optional WebSocket base URL override (exchange-specific)
+    pub base_url: Option<String>,
 }
 
 /// Application configuration
@@ -309,16 +317,18 @@ impl Config {
             None
         };
 
-        // Flatten markets into pairs (each symbol gets the market's feeds)
+        // Flatten markets into pairs (each symbol gets the market's feeds and base_url)
         let market_pairs: Vec<MarketPair> = file
             .markets
             .iter()
             .flat_map(|m| {
                 let feeds = m.feeds.clone();
+                let base_url = m.base_url.clone();
                 m.symbols.iter().map(move |s| MarketPair {
                     exchange: m.exchange.to_lowercase(),
                     symbol: s.clone(),
                     feeds: feeds.clone(),
+                    base_url: base_url.clone(),
                 })
             })
             .collect();

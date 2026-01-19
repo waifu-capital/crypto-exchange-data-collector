@@ -145,19 +145,34 @@ impl CoinbaseCredentials {
     }
 }
 
+/// Exchange-specific configuration options
+#[derive(Clone, Default)]
+pub struct ExchangeConfig {
+    /// Coinbase API credentials for authenticated channels
+    pub coinbase_creds: CoinbaseCredentials,
+    /// Optional Binance WebSocket base URL override (for geo-restrictions)
+    pub binance_base_url: Option<String>,
+}
+
 /// Creates an exchange instance by name.
 ///
 /// # Arguments
 /// * `name` - Exchange name: "binance", "coinbase", "upbit", "okx", "bybit"
-/// * `coinbase_creds` - Optional Coinbase API credentials for authenticated channels
+/// * `config` - Exchange-specific configuration options
 ///
 /// # Returns
 /// `Some(Box<dyn Exchange>)` if the name is recognized, `None` otherwise.
-pub fn create_exchange(name: &str, coinbase_creds: &CoinbaseCredentials) -> Option<Box<dyn Exchange>> {
+pub fn create_exchange(name: &str, config: &ExchangeConfig) -> Option<Box<dyn Exchange>> {
     match name.to_lowercase().as_str() {
-        "binance" => Some(Box::new(binance::Binance::new())),
+        "binance" => {
+            if let Some(base_url) = &config.binance_base_url {
+                Some(Box::new(binance::Binance::with_base_url(base_url.clone())))
+            } else {
+                Some(Box::new(binance::Binance::new()))
+            }
+        }
         "coinbase" => {
-            if let (Some(key), Some(secret)) = (&coinbase_creds.api_key, &coinbase_creds.api_secret) {
+            if let (Some(key), Some(secret)) = (&config.coinbase_creds.api_key, &config.coinbase_creds.api_secret) {
                 Some(Box::new(coinbase::Coinbase::with_credentials(key.clone(), secret.clone())))
             } else {
                 Some(Box::new(coinbase::Coinbase::new()))

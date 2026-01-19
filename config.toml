@@ -55,6 +55,27 @@ max_retry_delay_secs = 60
 exchange = "binance"
 symbols = ["btcusdt", "ethusdt", "solusdt", "xrpusdt"]
 # feeds defaults to ["orderbook", "trades"] if not specified
+#
+# Binance WebSocket endpoint (optional)
+# Default: wss://stream.binance.com:9443/ws
+#
+# IMPORTANT: If running from a US-based server (AWS EC2 us-east-1, etc.),
+# you will get "451 Unavailable For Legal Reasons" because Binance geo-blocks
+# US IP addresses from stream.binance.com.
+#
+# Alternative endpoints:
+#
+# 1. data-stream.binance.vision (RECOMMENDED for US servers)
+#    Market data endpoint that may bypass geo-restrictions.
+#    Same trading pairs as international Binance.
+#    base_url = "wss://data-stream.binance.vision/ws"
+#
+# 2. stream.binance.us (Binance.US)
+#    US-regulated exchange. NOTE: Different trading pairs!
+#    Uses USD pairs (e.g., BTCUSD) not USDT pairs (BTCUSDT).
+#    base_url = "wss://stream.binance.us:9443/ws"
+#
+# base_url = "wss://stream.binance.com:9443/ws"
 
 [[markets]]
 exchange = "coinbase"

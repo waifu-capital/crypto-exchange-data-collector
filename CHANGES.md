@@ -2,6 +2,46 @@
 
 ## 2026-01-19
 
+### Added: Configurable Binance WebSocket Endpoint for Geo-Restrictions
+
+**Files changed:** `src/config.rs`, `src/exchanges/binance.rs`, `src/exchanges/mod.rs`, `src/main.rs`, `config.toml`
+
+**Problem:** Binance blocks US IP addresses from `stream.binance.com` with HTTP 451 "Unavailable For Legal Reasons". AWS EC2 instances in US regions cannot connect to the default Binance WebSocket endpoint.
+
+**Solution:** Added configurable `base_url` option per market in `config.toml`:
+
+```toml
+[[markets]]
+exchange = "binance"
+symbols = ["btcusdt", "ethusdt"]
+# Override WebSocket endpoint for geo-restricted servers:
+base_url = "wss://data-stream.binance.vision/ws"
+```
+
+**Available endpoints:**
+| Endpoint | Use Case |
+|----------|----------|
+| `wss://stream.binance.com:9443/ws` | International (default, blocked from US) |
+| `wss://data-stream.binance.vision/ws` | Market data only, may bypass geo-restrictions |
+| `wss://stream.binance.us:9443/ws` | US endpoint (different trading pairs: USD not USDT) |
+
+**Changes:**
+- `config.rs`: Added `base_url` field to `MarketConfig` and `MarketPair`
+- `binance.rs`: Added `base_url` field and `with_base_url()` constructor
+- `mod.rs`: Added `ExchangeConfig` struct, updated `create_exchange()` signature
+- `main.rs`: Pass per-market `base_url` to exchange factory
+- `config.toml`: Added documented `base_url` option with explanation
+
+**Usage for US servers:**
+```toml
+[[markets]]
+exchange = "binance"
+symbols = ["btcusdt", "ethusdt"]
+base_url = "wss://data-stream.binance.vision/ws"
+```
+
+---
+
 ### Fixed: Docker Compose logs not visible on host
 
 **Files changed:** `docker-compose.yml`
