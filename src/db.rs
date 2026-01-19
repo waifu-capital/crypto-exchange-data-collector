@@ -194,6 +194,7 @@ async fn flush_batch(db_pool: &SqlitePool, batch: &mut Vec<MarketEvent>) {
 
 /// Row data returned from database queries
 pub struct DbRow {
+    pub id: i64,
     pub exchange: String,
     pub symbol: String,
     pub data_type: DataType,
@@ -249,7 +250,7 @@ pub async fn fetch_orderbooks_batch(
     batch_size: i64,
 ) -> Result<Vec<DbRow>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data
+        "SELECT id, exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data
          FROM orderbooks
          WHERE exchange = ? AND symbol = ?
          ORDER BY id
@@ -264,6 +265,7 @@ pub async fn fetch_orderbooks_batch(
     Ok(rows
         .iter()
         .map(|row| DbRow {
+            id: row.get("id"),
             exchange: row.get("exchange"),
             symbol: row.get("symbol"),
             data_type: DataType::Orderbook,
@@ -284,7 +286,7 @@ pub async fn fetch_trades_batch(
     batch_size: i64,
 ) -> Result<Vec<DbRow>, sqlx::Error> {
     let rows = sqlx::query(
-        "SELECT exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data
+        "SELECT id, exchange, symbol, exchange_sequence_id, timestamp_collector, timestamp_exchange, data
          FROM trades
          WHERE exchange = ? AND symbol = ?
          ORDER BY id
@@ -299,6 +301,7 @@ pub async fn fetch_trades_batch(
     Ok(rows
         .iter()
         .map(|row| DbRow {
+            id: row.get("id"),
             exchange: row.get("exchange"),
             symbol: row.get("symbol"),
             data_type: DataType::Trade,
@@ -310,57 +313,33 @@ pub async fn fetch_trades_batch(
         .collect())
 }
 
-/// Delete orderbooks for a specific exchange/symbol by their sequence IDs
-pub async fn delete_orderbooks_by_seq_ids(
+/// Delete orderbooks by ID range (inclusive)
+/// Much faster than IN clause with thousands of IDs since it uses the primary key index
+pub async fn delete_orderbooks_by_id_range(
     db_pool: &SqlitePool,
-    exchange: &str,
-    symbol: &str,
-    seq_ids: &[String],
+    min_id: i64,
+    max_id: i64,
 ) -> Result<u64, sqlx::Error> {
-    if seq_ids.is_empty() {
-        return Ok(0);
-    }
-
-    // Build placeholders for IN clause
-    let placeholders: Vec<&str> = seq_ids.iter().map(|_| "?").collect();
-    let query = format!(
-        "DELETE FROM orderbooks WHERE exchange = ? AND symbol = ? AND exchange_sequence_id IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut q = sqlx::query(&query).bind(exchange).bind(symbol);
-    for seq_id in seq_ids {
-        q = q.bind(seq_id);
-    }
-
-    let result = q.execute(db_pool).await?;
+    let result = sqlx::query("DELETE FROM orderbooks WHERE id BETWEEN ? AND ?")
+        .bind(min_id)
+        .bind(max_id)
+        .execute(db_pool)
+        .await?;
     Ok(result.rows_affected())
 }
 
-/// Delete trades for a specific exchange/symbol by their sequence IDs
-pub async fn delete_trades_by_seq_ids(
+/// Delete trades by ID range (inclusive)
+/// Much faster than IN clause with thousands of IDs since it uses the primary key index
+pub async fn delete_trades_by_id_range(
     db_pool: &SqlitePool,
-    exchange: &str,
-    symbol: &str,
-    seq_ids: &[String],
+    min_id: i64,
+    max_id: i64,
 ) -> Result<u64, sqlx::Error> {
-    if seq_ids.is_empty() {
-        return Ok(0);
-    }
-
-    // Build placeholders for IN clause
-    let placeholders: Vec<&str> = seq_ids.iter().map(|_| "?").collect();
-    let query = format!(
-        "DELETE FROM trades WHERE exchange = ? AND symbol = ? AND exchange_sequence_id IN ({})",
-        placeholders.join(", ")
-    );
-
-    let mut q = sqlx::query(&query).bind(exchange).bind(symbol);
-    for seq_id in seq_ids {
-        q = q.bind(seq_id);
-    }
-
-    let result = q.execute(db_pool).await?;
+    let result = sqlx::query("DELETE FROM trades WHERE id BETWEEN ? AND ?")
+        .bind(min_id)
+        .bind(max_id)
+        .execute(db_pool)
+        .await?;
     Ok(result.rows_affected())
 }
 

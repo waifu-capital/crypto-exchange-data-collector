@@ -2,6 +2,42 @@
 
 ## 2026-01-19
 
+### Fixed: Archive Timeout and Excessive "?" Logging
+
+**Files changed:** `src/db.rs`, `src/archive.rs`
+
+**Problem:** Archive operations timed out after 5 minutes, and logs were swamped with thousands of `?` characters from SQLx query logging.
+
+**Root cause:** The DELETE queries used IN clauses with 10,000 placeholders:
+```sql
+DELETE FROM orderbooks WHERE exchange = ? AND symbol = ? AND exchange_sequence_id IN (?, ?, ?, ... x10000)
+```
+
+This caused:
+- SQLx to log the massive query with 10,000 `?` characters
+- SQLx warnings about slow query performance
+- Queries taking so long they exceeded the 5-minute archive timeout
+
+**Solution:** Replaced IN-clause deletion with ID-range deletion. Since rows are fetched with `ORDER BY id LIMIT batch_size`, we track the min/max row IDs and delete with a simple range query:
+
+```sql
+DELETE FROM orderbooks WHERE id BETWEEN ? AND ?
+```
+
+**Changes:**
+1. Added `id: i64` field to `DbRow` struct
+2. Updated `fetch_orderbooks_batch` and `fetch_trades_batch` to SELECT the `id` column
+3. Replaced `delete_orderbooks_by_seq_ids` and `delete_trades_by_seq_ids` with `delete_orderbooks_by_id_range` and `delete_trades_by_id_range`
+4. Updated `archive.rs` to track min/max IDs from fetched batches and use range deletion
+
+**Benefits:**
+- DELETE query has only 2 placeholders instead of 10,000
+- No more excessive `?` logging from SQLx
+- Much faster deletion using the primary key index
+- Archive operations complete well within the 5-minute timeout
+
+---
+
 ### Fixed: WebSocket Connection Drops for Coinbase and OKX (PING/PONG Keepalive)
 
 **Files changed:**
