@@ -11,7 +11,7 @@ pub enum DataType {
 }
 
 impl DataType {
-    /// String representation for database/metrics
+    /// String representation for metrics/paths
     pub fn as_str(&self) -> &'static str {
         match self {
             DataType::Orderbook => "orderbook",
@@ -24,6 +24,14 @@ impl fmt::Display for DataType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.as_str())
     }
+}
+
+/// Key for identifying a Parquet writer (exchange + symbol + data type)
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct WriterKey {
+    pub exchange: String,
+    pub symbol: String,
+    pub data_type: DataType,
 }
 
 /// Market event data sent through the channel to the database worker.

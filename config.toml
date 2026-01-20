@@ -1,15 +1,11 @@
 # Crypto Exchange Data Collector Configuration
+# Direct Parquet Streaming Architecture (no SQLite intermediate storage)
+#
 # AWS credentials must be set via environment variables:
 #   AWS_ACCESS_KEY - AWS access key ID
 #   AWS_SECRET_KEY - AWS secret access key
 
 [collector]
-# Note: Per-market feeds are now configured in each [[markets]] section
-# (Legacy global feeds setting is deprecated)
-# How often to flush batched data to SQLite (seconds)
-batch_interval_secs = 5
-# How often to archive to S3 (seconds, 1 hour = 3600)
-archive_interval_secs = 3600
 # Prometheus metrics HTTP port
 metrics_port = 9090
 # How many days to keep log files
@@ -21,24 +17,17 @@ bucket = "crypto-exchange-data-collector"
 # Optional: identifier for this server (appears in S3 path)
 home_server_name = "cherry-wondrous-mongrel"
 
-[database]
-# SQLite database path (relative to working directory)
-path = "data/collector.db"
-
-[archive]
-# Local directory for temporary Parquet files before S3 upload
-dir = "data/archive"
-
 [storage]
 # Storage mode: "s3" (default), "local", or "both"
-# - s3: Upload to S3 only (delete local temp files after upload)
-# - local: Persist to local disk only (no S3, AWS credentials not required)
+# - s3: Upload to S3, delete local files after successful upload
+# - local: Keep files locally only (no S3, AWS credentials not required)
 # - both: Upload to S3 AND keep a local copy
 mode = "s3"
-# Directory for persistent local Parquet storage (hierarchical structure)
-# Only used when mode is "local" or "both"
-# Structure: {local_path}/{exchange}/{symbol}/{data_type}/{date}/{timestamp}.parquet
-local_path = "data/parquet"
+# Directory for Parquet files (streaming writes)
+# Structure: {data_dir}/{exchange}/{symbol}/{data_type}/{server}/{date}/{timestamp}.parquet
+data_dir = "data/parquet"
+# Directory for permanent local storage (only used when mode is "local" or "both")
+local_path = "data/archive"
 
 [websocket]
 # Timeout before considering a connection stale and reconnecting (seconds)

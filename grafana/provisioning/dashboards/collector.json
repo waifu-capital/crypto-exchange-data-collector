@@ -162,7 +162,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 18 },
       "id": 4,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -187,7 +187,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 18 },
       "id": 5,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -210,7 +210,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 20 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 26 },
       "id": 6,
       "options": {
         "colorMode": "background",
@@ -241,7 +241,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 20 },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 26 },
       "id": 7,
       "options": {
         "colorMode": "value",
@@ -271,7 +271,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 20 },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 26 },
       "id": 8,
       "options": {
         "colorMode": "background",
@@ -301,7 +301,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 20 },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 26 },
       "id": 9,
       "options": {
         "colorMode": "background",
@@ -322,7 +322,7 @@
       "type": "stat"
     },
     {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 30 },
       "id": 102,
       "title": "Latency",
       "type": "row"
@@ -339,7 +339,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 25 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 31 },
       "id": 10,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
@@ -358,39 +358,9 @@
       "type": "timeseries"
     },
     {
-      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
-      "fieldConfig": {
-        "defaults": {
-          "color": { "mode": "palette-classic" },
-          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "ms", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
-          "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 25 },
-      "id": 11,
-      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
-      "targets": [
-        {
-          "expr": "histogram_quantile(0.50, sum(rate(collector_db_write_seconds_bucket[5m])) by (le, operation))",
-          "legendFormat": "{{operation}} p50",
-          "refId": "A"
-        },
-        {
-          "expr": "histogram_quantile(0.95, sum(rate(collector_db_write_seconds_bucket[5m])) by (le, operation))",
-          "legendFormat": "{{operation}} p95",
-          "refId": "B"
-        }
-      ],
-      "title": "DB Write Latency (p50, p95)",
-      "type": "timeseries"
-    },
-    {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 33 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 39 },
       "id": 104,
-      "title": "Database & Archive",
+      "title": "Parquet & Upload",
       "type": "row"
     },
     {
@@ -398,24 +368,24 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "records/sec", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "rows/sec", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 20, "gradientMode": "opacity", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "smooth", "lineWidth": 2, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
           "mappings": [],
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }] },
           "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 34 },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 40 },
       "id": 15,
       "options": { "legend": { "calcs": ["mean"], "displayMode": "list", "placement": "bottom", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         {
-          "expr": "rate(collector_db_snapshots_written_total[1m])",
-          "legendFormat": "Records Written",
+          "expr": "rate(collector_parquet_rows_written_total[1m])",
+          "legendFormat": "Rows Written",
           "refId": "A"
         }
       ],
-      "title": "DB Writes/sec",
+      "title": "Parquet Rows Written/sec",
       "type": "timeseries"
     },
     {
@@ -423,23 +393,29 @@
       "fieldConfig": {
         "defaults": {
           "color": { "mode": "palette-classic" },
-          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
+          "custom": { "axisBorderShow": false, "axisCenteredZero": false, "axisColorMode": "text", "axisLabel": "rows", "axisPlacement": "auto", "barAlignment": 0, "drawStyle": "line", "fillOpacity": 10, "gradientMode": "none", "hideFrom": { "legend": false, "tooltip": false, "viz": false }, "insertNulls": false, "lineInterpolation": "linear", "lineWidth": 1, "pointSize": 5, "scaleDistribution": { "type": "linear" }, "showPoints": "never", "spanNulls": false, "stacking": { "group": "A", "mode": "none" }, "thresholdsStyle": { "mode": "off" } },
           "mappings": [],
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 800 }, { "color": "red", "value": 950 }] },
+          "unit": "short"
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 34 },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 40 },
       "id": 16,
-      "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
+      "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         {
-          "expr": "increase(collector_db_insert_errors_total[1h])",
-          "legendFormat": "{{error_type}}",
+          "expr": "collector_parquet_rows_buffered",
+          "legendFormat": "Rows Buffered",
           "refId": "A"
+        },
+        {
+          "expr": "collector_upload_queue_depth",
+          "legendFormat": "Upload Queue",
+          "refId": "B"
         }
       ],
-      "title": "DB Insert Errors (1h)",
+      "title": "Buffer & Queue Depth",
       "type": "timeseries"
     },
     {
@@ -452,7 +428,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 40 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 46 },
       "id": 17,
       "options": {
         "colorMode": "value",
@@ -464,12 +440,12 @@
       },
       "targets": [
         {
-          "expr": "collector_archives_completed_total",
-          "legendFormat": "Archives",
+          "expr": "sum(collector_parquet_files_rotated_total)",
+          "legendFormat": "Files",
           "refId": "A"
         }
       ],
-      "title": "Archives Completed",
+      "title": "Files Rotated",
       "type": "stat"
     },
     {
@@ -482,7 +458,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 40 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 46 },
       "id": 18,
       "options": {
         "colorMode": "value",
@@ -494,12 +470,12 @@
       },
       "targets": [
         {
-          "expr": "collector_snapshots_archived_total",
-          "legendFormat": "Records",
+          "expr": "collector_parquet_rows_written_total",
+          "legendFormat": "Rows",
           "refId": "A"
         }
       ],
-      "title": "Records Archived",
+      "title": "Total Rows Written",
       "type": "stat"
     },
     {
@@ -512,7 +488,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 40 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 46 },
       "id": 19,
       "options": {
         "colorMode": "background",
@@ -524,12 +500,72 @@
       },
       "targets": [
         {
-          "expr": "sum(collector_archive_failures_total)",
+          "expr": "collector_parquet_write_errors_total",
+          "legendFormat": "Errors",
+          "refId": "A"
+        }
+      ],
+      "title": "Parquet Write Errors",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 46 },
+      "id": 22,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "collector_s3_upload_failures_total",
           "legendFormat": "Failures",
           "refId": "A"
         }
       ],
-      "title": "Archive Failures",
+      "title": "S3 Upload Failures",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 1 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 46 },
+      "id": 23,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "collector_s3_upload_retries_total",
+          "legendFormat": "Retries",
+          "refId": "A"
+        }
+      ],
+      "title": "S3 Upload Retries",
       "type": "stat"
     },
     {
@@ -544,21 +580,26 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 12, "x": 12, "y": 40 },
+      "gridPos": { "h": 6, "w": 24, "x": 0, "y": 50 },
       "id": 20,
       "options": { "legend": { "calcs": ["mean", "max"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         {
-          "expr": "histogram_quantile(0.95, sum(rate(collector_s3_upload_seconds_bucket[5m])) by (le, status))",
-          "legendFormat": "{{status}} p95",
+          "expr": "histogram_quantile(0.50, sum(rate(collector_s3_upload_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p50",
           "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(collector_s3_upload_seconds_bucket[5m])) by (le))",
+          "legendFormat": "p95",
+          "refId": "B"
         }
       ],
-      "title": "S3 Upload Duration (p95)",
+      "title": "S3 Upload Duration (p50, p95)",
       "type": "timeseries"
     },
     {
-      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 44 },
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 56 },
       "id": 105,
       "title": "System",
       "type": "row"
@@ -574,7 +615,7 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 45 },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 57 },
       "id": 21,
       "options": {
         "colorMode": "value",
@@ -604,6 +645,6 @@
   "timezone": "browser",
   "title": "Crypto Exchange Data Collector",
   "uid": "crypto-collector",
-  "version": 1,
+  "version": 2,
   "weekStart": ""
 }

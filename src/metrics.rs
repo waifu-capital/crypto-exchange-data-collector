@@ -65,51 +65,43 @@ lazy_static! {
     ).expect("Failed to register WEBSOCKET_PONGS_RECEIVED");
 
     // ===================
-    // Database Metrics
+    // Parquet Writer Metrics
     // ===================
 
-    /// Current number of messages in the channel buffer
+    /// Total rows written to Parquet files
+    pub static ref PARQUET_ROWS_WRITTEN: Counter = register_counter!(
+        "collector_parquet_rows_written_total",
+        "Total rows written to Parquet files"
+    ).expect("Failed to register PARQUET_ROWS_WRITTEN");
+
+    /// Current rows buffered (not yet flushed to Parquet)
+    pub static ref PARQUET_ROWS_BUFFERED: Gauge = register_gauge!(
+        "collector_parquet_rows_buffered",
+        "Current rows buffered waiting to be written"
+    ).expect("Failed to register PARQUET_ROWS_BUFFERED");
+
+    /// Total Parquet files rotated (completed)
+    pub static ref PARQUET_FILES_ROTATED: CounterVec = register_counter_vec!(
+        "collector_parquet_files_rotated_total",
+        "Total Parquet files rotated",
+        &["exchange", "symbol"]
+    ).expect("Failed to register PARQUET_FILES_ROTATED");
+
+    /// Parquet write errors
+    pub static ref PARQUET_WRITE_ERRORS: Counter = register_counter!(
+        "collector_parquet_write_errors_total",
+        "Total Parquet write errors"
+    ).expect("Failed to register PARQUET_WRITE_ERRORS");
+
+    /// Current channel queue depth (messages waiting for parquet worker)
     pub static ref CHANNEL_QUEUE_DEPTH: Gauge = register_gauge!(
         "collector_channel_queue_depth",
         "Current number of messages waiting in channel buffer"
     ).expect("Failed to register CHANNEL_QUEUE_DEPTH");
 
-    /// Database batch write duration in seconds
-    pub static ref DB_WRITE_DURATION: HistogramVec = register_histogram_vec!(
-        "collector_db_write_seconds",
-        "Time spent writing batches to SQLite",
-        &["operation"],
-        vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0]
-    ).expect("Failed to register DB_WRITE_DURATION");
-
-    /// Total snapshots written to database
-    pub static ref DB_SNAPSHOTS_WRITTEN: Counter = register_counter!(
-        "collector_db_snapshots_written_total",
-        "Total snapshots successfully written to database"
-    ).expect("Failed to register DB_SNAPSHOTS_WRITTEN");
-
-    /// Database insert errors by type
-    pub static ref DB_INSERT_ERRORS: CounterVec = register_counter_vec!(
-        "collector_db_insert_errors_total",
-        "Database insert errors by type",
-        &["error_type"]  // "duplicate", "constraint", "io", "other"
-    ).expect("Failed to register DB_INSERT_ERRORS");
-
     // ===================
-    // Archive Metrics
+    // Upload Metrics
     // ===================
-
-    /// Total archive cycles completed
-    pub static ref ARCHIVES_COMPLETED: Counter = register_counter!(
-        "collector_archives_completed_total",
-        "Total archive cycles completed successfully"
-    ).expect("Failed to register ARCHIVES_COMPLETED");
-
-    /// Total snapshots archived
-    pub static ref SNAPSHOTS_ARCHIVED: Counter = register_counter!(
-        "collector_snapshots_archived_total",
-        "Total snapshots archived to Parquet/S3"
-    ).expect("Failed to register SNAPSHOTS_ARCHIVED");
 
     /// S3 upload duration in seconds
     pub static ref S3_UPLOAD_DURATION: HistogramVec = register_histogram_vec!(
@@ -130,6 +122,12 @@ lazy_static! {
         "collector_s3_upload_retries_total",
         "Total S3 upload retry attempts"
     ).expect("Failed to register S3_UPLOAD_RETRIES");
+
+    /// Current upload queue depth (files waiting for upload)
+    pub static ref UPLOAD_QUEUE_DEPTH: Gauge = register_gauge!(
+        "collector_upload_queue_depth",
+        "Current number of files waiting to be uploaded"
+    ).expect("Failed to register UPLOAD_QUEUE_DEPTH");
 
     // ===================
     // Parse Metrics
@@ -153,17 +151,6 @@ lazy_static! {
         &["exchange", "symbol", "data_type"],
         vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0]
     ).expect("Failed to register LATENCY_EXCHANGE_TO_COLLECTOR");
-
-    // ===================
-    // Archive Failure Metrics
-    // ===================
-
-    /// Archive failures by stage
-    pub static ref ARCHIVE_FAILURES: CounterVec = register_counter_vec!(
-        "collector_archive_failures_total",
-        "Archive failures by stage",
-        &["stage"]  // "fetch", "parquet", "upload", "verify_size", "verify_head", "timeout"
-    ).expect("Failed to register ARCHIVE_FAILURES");
 
     // ===================
     // Application Metrics

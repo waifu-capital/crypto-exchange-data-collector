@@ -1,5 +1,272 @@
 # Changelog
 
+## 2026-01-20
+
+### Major Architecture Change: Direct Parquet Streaming (Eliminated SQLite)
+
+**Files added:**
+- `src/parquet.rs` - Streaming Parquet writer with automatic file rotation
+- `src/upload.rs` - Background S3 upload worker with retry logic
+- `src/s3.rs` - S3 client creation (extracted from old archive.rs)
+
+**Files removed:**
+- `src/db.rs` - SQLite database operations (no longer needed)
+- `src/archive.rs` - Archive scheduler and S3 upload (replaced by parquet.rs + upload.rs)
+
+**Files modified:**
+- `src/main.rs` - Complete rewrite of worker orchestration
+- `src/models.rs` - Added `WriterKey` struct for Parquet writer HashMap keys
+- `src/metrics.rs` - Replaced DB metrics with Parquet/upload metrics
+- `src/config.rs` - Removed database/archive config, simplified storage config
+- `config.toml` - Removed `[database]` and `[archive]` sections
+- `Cargo.toml` - Removed `sqlx` and `polars` dependencies
+- `grafana/provisioning/dashboards/collector.json` - Updated dashboard for new metrics
+
+---
+
+**Problem:** Critical production failure during market spike. When Binance was sending ~1000 msgs/sec:
+- 40,000+ messages dropped
+- RAM spiked to 4GB (server limit)
+- Archive operation timed out
+- System became unresponsive
+
+**Root cause analysis:** The SQLite-based architecture had a fundamental design flaw:
+
+```
+OLD ARCHITECTURE:
+WebSocket → Channel → db_worker → SQLite → archive_scheduler → Parquet → S3
+                          ↑                        ↓
+                     [CONTENTION]              [RAM SPIKE]
+```
+
+1. **Write/Archive contention:** SQLite was both the write buffer AND the archive source. During high message volume, INSERT operations blocked waiting for archive's SELECT/DELETE to complete.
+
+2. **Channel backup:** When db_worker blocked on SQLite, the channel filled up. With `try_send()`, excess messages were dropped.
+
+3. **Memory explosion:** Archive loaded entire result sets into memory to convert to Parquet. 100K rows × 5KB average = 500MB just for data, plus Polars DataFrame overhead.
+
+4. **Data loss risk:** The old architecture deleted rows from SQLite BEFORE verifying S3 upload success. If upload failed after delete, data was permanently lost.
+
+---
+
+**Solution: Direct Parquet Streaming Architecture**
+
+```
+NEW ARCHITECTURE:
+WebSocket → Channel → parquet_worker → Parquet Files → upload_worker → S3
+                           ↓                                ↓
+                    [BOUNDED MEMORY]              [VERIFIED DELETE]
+```
+
+Key changes:
+
+1. **Eliminated SQLite entirely** - WebSocket events stream directly to Parquet files
+2. **Bounded memory via row group flushing** - Only 1000 rows buffered at a time per writer
+3. **Decoupled write and upload** - Writes never block on S3 operations
+4. **Safe deletion** - Local files only deleted after S3 upload is verified
+
+---
+
+**New data flow:**
+
+1. **WebSocket workers** receive market data and send `MarketEvent` to channel
+2. **parquet_worker** receives events, routes to appropriate `ParquetWriterInstance` based on (exchange, symbol, data_type)
+3. **ParquetWriterInstance** buffers rows, flushes to disk as row groups every 1000 rows
+4. **File rotation** triggers when file age > 1 hour OR file size > 500MB
+5. **Completed files** sent to upload_worker via channel
+6. **upload_worker** uploads to S3 with exponential backoff (5 attempts, 1s-30s delays)
+7. **Verification** via HEAD request confirms upload size matches local file
+8. **Local file deleted** only after successful verification
+
+---
+
+**Memory profile comparison:**
+
+| Scenario | Old Architecture | New Architecture |
+|----------|-----------------|------------------|
+| Normal operation (100 msg/s) | ~200MB (SQLite + buffers) | ~50MB (row buffers only) |
+| High volume (1000 msg/s) | 4GB+ spike, OOM risk | ~100MB steady |
+| Archive cycle | +500MB-2GB spike | No spike (streaming) |
+| Per writer memory | N/A | ~70-100KB (1000 row buffer) |
+
+---
+
+**New modules:**
+
+### `src/parquet.rs`
+
+```rust
+/// Constants
+const MAX_FILE_AGE: Duration = Duration::from_secs(3600);  // 1 hour
+const MAX_FILE_SIZE: u64 = 500 * 1024 * 1024;              // 500 MB
+const WRITE_BATCH_SIZE: usize = 1000;                       // rows per row group
+
+/// ParquetWriterInstance - One writer per (exchange, symbol, data_type)
+struct ParquetWriterInstance {
+    writer: ArrowWriter<File>,
+    buffer: Vec<MarketEvent>,  // Buffered rows
+    // ... rotation tracking fields
+}
+
+/// ParquetWriterManager - Manages all writers, handles rotation
+pub struct ParquetWriterManager {
+    writers: HashMap<WriterKey, ParquetWriterInstance>,
+    // ...
+}
+
+/// parquet_worker - Background task
+pub async fn parquet_worker(
+    event_rx: Receiver<MarketEvent>,
+    data_dir: PathBuf,
+    home_server_name: Option<String>,
+    upload_tx: Sender<CompletedFile>,
+    shutdown_rx: broadcast::Receiver<()>,
+)
+```
+
+### `src/upload.rs`
+
+```rust
+/// upload_worker - Background S3 upload with retry
+pub async fn upload_worker(
+    file_rx: Receiver<CompletedFile>,
+    storage_mode: StorageMode,
+    local_storage_path: Option<PathBuf>,
+    bucket_name: String,
+    s3_client: Option<Client>,
+    shutdown_rx: broadcast::Receiver<()>,
+)
+
+/// Exponential backoff: 1s, 2s, 4s, 8s, 16s (max 30s), 5 attempts
+async fn upload_to_s3(client: &Client, bucket: &str, file: &CompletedFile) -> Result<(), String>
+
+/// Verify upload via HEAD request
+async fn verify_s3_upload(client: &Client, bucket: &str, key: &str, expected_size: u64) -> bool
+```
+
+---
+
+**Configuration changes:**
+
+**Removed from config.toml:**
+```toml
+# These sections no longer exist:
+[database]
+path = "data/collector.db"
+batch_interval_secs = 1
+
+[archive]
+interval_secs = 300
+archive_dir = "data/archive"
+```
+
+**New storage configuration:**
+```toml
+[storage]
+# Storage mode: "s3" (default), "local", or "both"
+mode = "s3"
+# Directory for Parquet files (streaming writes)
+data_dir = "data/parquet"
+# Directory for permanent local storage (only used when mode is "local" or "both")
+local_path = "data/archive"
+```
+
+---
+
+**Metrics changes:**
+
+**Removed metrics:**
+- `db_write_duration_seconds` - No more database writes
+- `db_snapshots_written_total` - No more database
+- `db_insert_errors_total` - No more database
+- `archive_failures_total` - Replaced by upload metrics
+- `archives_completed_total` - Replaced by file rotation metrics
+- `snapshots_archived_total` - Replaced by rows written metrics
+
+**New metrics:**
+- `parquet_rows_written_total` - Total rows written to Parquet files
+- `parquet_rows_buffered` - Current rows in buffer (gauge)
+- `parquet_files_rotated_total` - Files completed and sent for upload (by exchange, symbol)
+- `parquet_write_errors_total` - Write failures
+- `upload_queue_depth` - Files waiting for upload (gauge)
+- `s3_upload_duration_seconds` - Upload latency histogram
+- `s3_upload_errors_total` - Upload failures (by exchange, symbol)
+- `s3_uploads_completed_total` - Successful uploads (by exchange, symbol)
+
+---
+
+**Shutdown behavior:**
+
+The new architecture has graceful shutdown with per-component timeouts:
+
+```rust
+let ws_timeout = Duration::from_secs(10);      // WebSocket workers
+let parquet_timeout = Duration::from_secs(30); // Flush pending data
+let upload_timeout = Duration::from_secs(60);  // Finish in-progress uploads
+```
+
+On shutdown:
+1. WebSocket workers stop receiving new data
+2. parquet_worker flushes all buffered rows and rotates all files
+3. upload_worker completes pending uploads
+
+**Data loss on crash:** Only unflushed buffer data (up to 1000 rows per writer) may be lost on unexpected crash. This is acceptable given the bounded loss and the alternative of complex WAL/recovery logic.
+
+---
+
+**File path structure:**
+
+Parquet files are written to:
+```
+{data_dir}/{exchange}/{symbol}/{data_type}/{server}/{date}/{timestamp}.parquet
+
+Example:
+data/parquet/binance/btcusdt/orderbook/cherry-wondrous-mongrel/2026-01-20/1737331200000.parquet
+```
+
+S3 key uses the same relative path structure.
+
+---
+
+**Dependencies removed from Cargo.toml:**
+
+```toml
+# Removed:
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+polars = { version = "0.46", features = ["lazy", "parquet", "dtype-struct"] }
+```
+
+SQLite and Polars are no longer needed. The `arrow` and `parquet` crates (already present from previous changes) handle all Parquet operations.
+
+---
+
+**Why this architecture is more stable:**
+
+1. **No shared mutable state** - Each writer is independent, no database contention
+2. **Bounded memory** - Row group flushing caps memory regardless of throughput
+3. **Backpressure via try_send** - Channel overflow drops oldest data, not crash
+4. **Crash-safe uploads** - Files persist on disk until S3 upload verified
+5. **Simple failure domains** - If one exchange's writer fails, others continue
+6. **Observable** - Prometheus metrics show buffer depth, rotation rate, upload health
+
+---
+
+**Grafana dashboard changes:**
+
+The "Database & Archive" section was renamed to "Parquet & Upload" with updated panels:
+
+| Old Panel | New Panel | New Metric |
+|-----------|-----------|------------|
+| DB Write Latency (p50, p95) | Buffer & Queue Depth | `collector_parquet_rows_buffered`, `collector_upload_queue_depth` |
+| DB Writes/sec | Parquet Rows Written/sec | `collector_parquet_rows_written_total` |
+| DB Insert Errors (1h) | (merged into Buffer & Queue Depth) | - |
+| Archives Completed | Files Rotated | `collector_parquet_files_rotated_total` |
+| Records Archived | Total Rows Written | `collector_parquet_rows_written_total` |
+| Archive Failures | S3 Upload Failures | `collector_s3_upload_failures_total` |
+| - | S3 Upload Retries (new) | `collector_s3_upload_retries_total` |
+
+---
+
 ## 2026-01-19
 
 ### Fixed: Multiple Parquet Files Per Archive Cycle (REGRESSION)

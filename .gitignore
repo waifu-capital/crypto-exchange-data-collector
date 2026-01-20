@@ -33,3 +33,4 @@ cdp_api_key.pem
 coinbase_key.pem
 coinbase_key_pkcs8.pem
 crypto_data/
+critical-failure.png

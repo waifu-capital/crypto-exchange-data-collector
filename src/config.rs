@@ -39,10 +39,6 @@ pub struct ConfigFile {
     #[serde(default)]
     pub aws: AwsConfig,
     #[serde(default)]
-    pub database: DatabaseConfig,
-    #[serde(default)]
-    pub archive: ArchiveConfig,
-    #[serde(default)]
     pub storage: StorageConfig,
     #[serde(default)]
     pub websocket: WebSocketConfig,
@@ -51,11 +47,6 @@ pub struct ConfigFile {
 
 #[derive(Debug, Deserialize, Default)]
 pub struct CollectorConfig {
-    // Note: Per-market feeds are now in MarketConfig, not here
-    #[serde(default = "default_batch_interval")]
-    pub batch_interval_secs: u64,
-    #[serde(default = "default_archive_interval")]
-    pub archive_interval_secs: u64,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
     #[serde(default = "default_log_retention")]
@@ -82,39 +73,14 @@ impl Default for AwsConfig {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct DatabaseConfig {
-    #[serde(default = "default_db_path")]
-    pub path: String,
-}
-
-impl Default for DatabaseConfig {
-    fn default() -> Self {
-        Self {
-            path: default_db_path(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ArchiveConfig {
-    #[serde(default = "default_archive_dir")]
-    pub dir: String,
-}
-
-impl Default for ArchiveConfig {
-    fn default() -> Self {
-        Self {
-            dir: default_archive_dir(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
 pub struct StorageConfig {
     /// Storage mode: "s3" (default), "local", or "both"
     #[serde(default)]
     pub mode: StorageMode,
-    /// Directory for persistent local Parquet storage (hierarchical structure)
+    /// Directory for Parquet files (both temp and permanent storage)
+    #[serde(default = "default_data_dir")]
+    pub data_dir: String,
+    /// Directory for permanent local Parquet storage (hierarchical structure)
     /// Only used when mode is "local" or "both"
     #[serde(default = "default_local_storage_path")]
     pub local_path: String,
@@ -124,13 +90,18 @@ impl Default for StorageConfig {
     fn default() -> Self {
         Self {
             mode: StorageMode::default(),
+            data_dir: default_data_dir(),
             local_path: default_local_storage_path(),
         }
     }
 }
 
-fn default_local_storage_path() -> String {
+fn default_data_dir() -> String {
     "data/parquet".to_string()
+}
+
+fn default_local_storage_path() -> String {
+    "data/archive".to_string()
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -168,12 +139,6 @@ fn default_market_feeds() -> Vec<String> {
 }
 
 // Default value functions
-fn default_batch_interval() -> u64 {
-    5
-}
-fn default_archive_interval() -> u64 {
-    3600
-}
 fn default_metrics_port() -> u16 {
     9090
 }
@@ -185,12 +150,6 @@ fn default_region() -> String {
 }
 fn default_bucket() -> String {
     "crypto-exchange-data-collector".to_string()
-}
-fn default_db_path() -> String {
-    "data/collector.db".to_string()
-}
-fn default_archive_dir() -> String {
-    "data/archive".to_string()
 }
 fn default_message_timeout() -> u64 {
     30
@@ -219,6 +178,7 @@ pub struct MarketPair {
 pub struct Config {
     // Storage settings
     pub storage_mode: StorageMode,
+    pub data_dir: PathBuf,
     pub local_storage_path: PathBuf,
     // AWS credentials (from env vars for security)
     // Optional when storage_mode is Local
@@ -233,12 +193,6 @@ pub struct Config {
     pub coinbase_api_secret: Option<String>,
     // Markets to collect (each MarketPair has its own feeds)
     pub market_pairs: Vec<MarketPair>,
-    // Paths
-    pub database_path: PathBuf,
-    pub archive_dir: PathBuf,
-    // Intervals
-    pub batch_interval_secs: u64,
-    pub archive_interval_secs: u64,
     // WebSocket settings
     pub ws_message_timeout_secs: u64,
     pub ws_initial_retry_delay_secs: u64,
@@ -348,15 +302,11 @@ impl Config {
 
         // Resolve paths relative to current directory
         let curr_dir = env::current_dir().expect("Failed to get current directory");
-        let database_path = curr_dir.join(&file.database.path);
-        let archive_dir = curr_dir.join(&file.archive.dir);
+        let data_dir = curr_dir.join(&file.storage.data_dir);
         let local_storage_path = curr_dir.join(&file.storage.local_path);
 
         // Ensure directories exist
-        if let Some(parent) = database_path.parent() {
-            std::fs::create_dir_all(parent).expect("Failed to create database directory");
-        }
-        std::fs::create_dir_all(&archive_dir).expect("Failed to create archive directory");
+        std::fs::create_dir_all(&data_dir).expect("Failed to create data directory");
 
         // Create local storage directory if using local or both mode
         if matches!(storage_mode, StorageMode::Local | StorageMode::Both) {
@@ -366,6 +316,7 @@ impl Config {
 
         Self {
             storage_mode,
+            data_dir,
             local_storage_path,
             aws_access_key,
             aws_secret_key,
@@ -375,10 +326,6 @@ impl Config {
             coinbase_api_key,
             coinbase_api_secret,
             market_pairs,
-            database_path,
-            archive_dir,
-            batch_interval_secs: file.collector.batch_interval_secs,
-            archive_interval_secs: file.collector.archive_interval_secs,
             ws_message_timeout_secs: file.websocket.message_timeout_secs,
             ws_initial_retry_delay_secs: file.websocket.initial_retry_delay_secs,
             ws_max_retry_delay_secs: file.websocket.max_retry_delay_secs,
@@ -407,28 +354,6 @@ impl Config {
                     pair.exchange, supported
                 );
             }
-        }
-
-        // WS timeout should be > batch interval to avoid false reconnects
-        if self.ws_message_timeout_secs < self.batch_interval_secs {
-            panic!(
-                "Configuration error: websocket.message_timeout_secs ({}) must be >= collector.batch_interval_secs ({}) to avoid false timeouts",
-                self.ws_message_timeout_secs, self.batch_interval_secs
-            );
-        }
-
-        // Archive interval should be reasonable (1 min to 24 hours)
-        if self.archive_interval_secs < 60 {
-            panic!(
-                "Configuration error: collector.archive_interval_secs ({}) must be at least 60 seconds",
-                self.archive_interval_secs
-            );
-        }
-        if self.archive_interval_secs > 86400 {
-            panic!(
-                "Configuration error: collector.archive_interval_secs ({}) must be at most 86400 seconds (24 hours)",
-                self.archive_interval_secs
-            );
         }
 
         // Retry delay should be < message timeout

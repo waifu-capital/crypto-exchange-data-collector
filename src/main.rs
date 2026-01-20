@@ -1,10 +1,11 @@
-mod archive;
 mod config;
-mod db;
 mod exchanges;
 mod http;
 mod metrics;
 mod models;
+mod parquet;
+mod s3;
+mod upload;
 mod utils;
 mod websocket;
 
@@ -15,13 +16,14 @@ use tracing::{info, warn};
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use crate::archive::{create_bucket_if_not_exists, create_s3_client, run_archive_scheduler};
 use crate::config::{Config, MarketPair};
-use crate::db::{create_pool, db_worker, init_database};
 use crate::exchanges::{create_exchange, CoinbaseCredentials, ExchangeConfig, FeedType};
 use crate::http::{run_http_server, run_liveness_probe};
 use crate::metrics::init_metrics;
 use crate::models::{new_connection_state, MarketEvent};
+use crate::parquet::{parquet_worker, CompletedFile};
+use crate::s3::{create_bucket_if_not_exists, create_s3_client};
+use crate::upload::upload_worker;
 use crate::utils::cleanup_old_logs;
 use crate::websocket::{websocket_worker, WsConfig};
 
@@ -96,9 +98,10 @@ async fn main() {
 
     info!(
         market_pairs = config.market_pairs.len(),
-        aws_region = %config.aws_region,
+        storage_mode = ?config.storage_mode,
+        data_dir = %config.data_dir.display(),
         log_retention_days = config.log_retention_days,
-        "Starting crypto exchange data collector"
+        "Starting crypto exchange data collector (direct Parquet streaming)"
     );
 
     // Log all configured market pairs with their feeds
@@ -112,22 +115,21 @@ async fn main() {
     }
 
     // Initialize AWS client (optional for local-only storage)
-    let client = create_s3_client(&config).await;
+    let s3_client = create_s3_client(&config).await;
 
     // Ensure S3 bucket exists (only if S3 client is available)
-    if let Some(ref s3_client) = client {
-        create_bucket_if_not_exists(s3_client, &config.bucket_name, &config.aws_region).await;
+    if let Some(ref client) = s3_client {
+        create_bucket_if_not_exists(client, &config.bucket_name, &config.aws_region).await;
     }
-
-    // Initialize database
-    let db_pool = create_pool(&config.database_path).await;
-    init_database(&db_pool).await;
 
     // Create channel for market events (sized for all market pairs * feeds)
     // Each (pair, feed) combination gets its own worker
     let total_workers: usize = config.market_pairs.iter().map(|p| p.feeds.len()).sum();
     let channel_size = 1000 * total_workers.max(1);
-    let (db_tx, db_rx) = channel::<MarketEvent>(channel_size);
+    let (event_tx, event_rx) = channel::<MarketEvent>(channel_size);
+
+    // Create channel for completed files to upload
+    let (upload_tx, upload_rx) = channel::<CompletedFile>(100);
 
     // Create shutdown broadcast channel
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
@@ -135,13 +137,24 @@ async fn main() {
     // Create shared connection state for health checks
     let conn_state = new_connection_state();
 
-    // Spawn database worker with shutdown receiver
-    let db_handle = {
-        let db_pool = db_pool.clone();
-        let batch_interval = config.batch_interval_secs;
+    // Spawn parquet worker
+    let parquet_handle = {
+        let data_dir = config.data_dir.clone();
+        let home_server_name = config.home_server_name.clone();
         let shutdown_rx = shutdown_tx.subscribe();
         tokio::spawn(async move {
-            db_worker(db_pool, db_rx, batch_interval, shutdown_rx).await;
+            parquet_worker(event_rx, data_dir, home_server_name, upload_tx, shutdown_rx).await;
+        })
+    };
+
+    // Spawn upload worker
+    let upload_handle = {
+        let storage_mode = config.storage_mode;
+        let local_storage_path = Some(config.local_storage_path.clone());
+        let bucket_name = config.bucket_name.clone();
+        let shutdown_rx = shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            upload_worker(upload_rx, storage_mode, local_storage_path, bucket_name, s3_client, shutdown_rx).await;
         })
     };
 
@@ -192,7 +205,7 @@ async fn main() {
                 )
             });
 
-            let websocket_tx = db_tx.clone();
+            let websocket_tx = event_tx.clone();
             let symbol = pair.symbol.clone();
             let feed_vec = vec![feed]; // Single feed per worker
             let ws_config = ws_config.clone();
@@ -218,8 +231,8 @@ async fn main() {
         }
     }
 
-    // Drop the original sender so DB worker knows when all WebSocket workers are done
-    drop(db_tx);
+    // Drop the original sender so parquet worker knows when all WebSocket workers are done
+    drop(event_tx);
 
     // Spawn liveness probe
     tokio::spawn(async move {
@@ -244,32 +257,6 @@ async fn main() {
         });
     }
 
-    // Spawn archive scheduler (archives ALL data from all exchanges/symbols)
-    let archive_handle = {
-        let db_pool = db_pool.clone();
-        let archive_dir = config.archive_dir;
-        let storage_mode = config.storage_mode;
-        let local_storage_path = config.local_storage_path;
-        let bucket_name = config.bucket_name;
-        let home_server_name = config.home_server_name;
-        let archive_interval_secs = config.archive_interval_secs;
-        let shutdown_rx = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            run_archive_scheduler(
-                db_pool,
-                archive_dir,
-                storage_mode,
-                local_storage_path,
-                bucket_name,
-                client,
-                home_server_name,
-                archive_interval_secs,
-                shutdown_rx,
-            )
-            .await;
-        })
-    };
-
     // Wait for shutdown signal (Ctrl+C / SIGTERM)
     tokio::signal::ctrl_c().await.ok();
     info!("Shutdown signal received, stopping workers...");
@@ -277,10 +264,10 @@ async fn main() {
     // Signal all workers to stop
     shutdown_tx.send(()).ok();
 
-    // Per-worker timeouts (prioritize data workers)
+    // Per-worker timeouts
     let ws_timeout = Duration::from_secs(10);
-    let db_timeout = Duration::from_secs(15);  // More time to flush pending data
-    let archive_timeout = Duration::from_secs(5);  // Least priority
+    let parquet_timeout = Duration::from_secs(30); // More time to flush pending data
+    let upload_timeout = Duration::from_secs(60);  // Upload may need time to finish
 
     // Wait for all WebSocket workers
     for (pair, feed, handle) in ws_handles {
@@ -308,20 +295,20 @@ async fn main() {
         }
     }
 
-    // Wait for DB and archive workers
+    // Wait for parquet and upload workers
     let (_, _) = tokio::join!(
         async {
-            match tokio::time::timeout(db_timeout, db_handle).await {
-                Ok(Ok(_)) => info!("DB worker stopped cleanly"),
-                Ok(Err(e)) => warn!(error = %e, "DB worker panicked"),
-                Err(_) => warn!(timeout_secs = db_timeout.as_secs(), "DB worker shutdown timed out"),
+            match tokio::time::timeout(parquet_timeout, parquet_handle).await {
+                Ok(Ok(_)) => info!("Parquet worker stopped cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "Parquet worker panicked"),
+                Err(_) => warn!(timeout_secs = parquet_timeout.as_secs(), "Parquet worker shutdown timed out"),
             }
         },
         async {
-            match tokio::time::timeout(archive_timeout, archive_handle).await {
-                Ok(Ok(_)) => info!("Archive worker stopped cleanly"),
-                Ok(Err(e)) => warn!(error = %e, "Archive worker panicked"),
-                Err(_) => warn!(timeout_secs = archive_timeout.as_secs(), "Archive worker shutdown timed out"),
+            match tokio::time::timeout(upload_timeout, upload_handle).await {
+                Ok(Ok(_)) => info!("Upload worker stopped cleanly"),
+                Ok(Err(e)) => warn!(error = %e, "Upload worker panicked"),
+                Err(_) => warn!(timeout_secs = upload_timeout.as_secs(), "Upload worker shutdown timed out"),
             }
         }
     );
