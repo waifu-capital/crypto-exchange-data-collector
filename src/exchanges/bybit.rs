@@ -208,6 +208,12 @@ impl Exchange for Bybit {
         // Connection times out after ~10 minutes without pings
         Some(Message::Text(r#"{"op":"ping"}"#.into()))
     }
+
+    fn ping_interval(&self) -> Option<std::time::Duration> {
+        // Bybit connection times out after ~10 minutes without pings
+        // Send ping every 20 seconds for safety margin
+        Some(std::time::Duration::from_secs(20))
+    }
 }
 
 #[cfg(test)]

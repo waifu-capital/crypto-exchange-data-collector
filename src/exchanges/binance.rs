@@ -207,6 +207,11 @@ impl Exchange for Binance {
         // No client-initiated pings needed
         None
     }
+
+    fn ping_interval(&self) -> Option<std::time::Duration> {
+        // Binance server initiates pings - no client ping timer needed
+        None
+    }
 }
 
 #[cfg(test)]

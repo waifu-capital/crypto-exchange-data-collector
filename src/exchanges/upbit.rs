@@ -147,6 +147,12 @@ impl Exchange for Upbit {
         // Currently disabled in config, return None for now
         None
     }
+
+    fn ping_interval(&self) -> Option<std::time::Duration> {
+        // Upbit ping/pong requirements not documented
+        // Server likely initiates pings - no client ping timer needed
+        None
+    }
 }
 
 #[cfg(test)]

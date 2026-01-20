@@ -2,6 +2,123 @@
 
 ## 2026-01-20
 
+### WebSocket Hardening: Eliminated Connection Flakiness
+
+**Files modified:**
+- `src/websocket.rs` - Major rewrite of message loop
+- `src/exchanges/mod.rs` - Added `ping_interval()` to Exchange trait
+- `src/exchanges/binance.rs` - Added `ping_interval()` returning `None`
+- `src/exchanges/coinbase.rs` - Added `ping_interval()` returning 30s
+- `src/exchanges/okx.rs` - Added `ping_interval()` returning 20s
+- `src/exchanges/bybit.rs` - Added `ping_interval()` returning 20s
+- `src/exchanges/upbit.rs` - Added `ping_interval()` returning `None`
+
+---
+
+**Problem:** WebSocket connections were flaky across all exchanges, with spurious disconnects and reconnects. Comparison with the stable `bayes-rust` codebase revealed several architectural issues.
+
+**Root cause analysis:**
+
+1. **`timeout()` wrapper on `read.next()` caused false disconnects** - The 180s timeout could fire spuriously due to `tokio::select!` scheduling, even when the connection was healthy.
+
+2. **Complex `select!` structure with competing branches** - The ping timer (20s) competed with message processing, causing unnecessary iterations and potential message delays for exchanges that don't need client pings.
+
+3. **Race condition between subscription and data timeout** - `last_data_received` was set at connection time, but data doesn't arrive until after subscription confirmation, creating a window where timeout could fire prematurely.
+
+4. **Unfair `select!` polling** - Without `biased`, tokio polls futures in random order, allowing the ping timer to starve message processing.
+
+---
+
+**Solution:**
+
+1. **Removed `timeout()` wrapper from `read.next()`**
+   - Rely on data timeout mechanism only (which already handles "alive but no data" case)
+   - Trust TCP keepalive and WebSocket ping/pong for connection health
+   - Matches the proven simple loop pattern from `bayes-rust`
+
+2. **Added `biased` to `tokio::select!`**
+   - Prefer message processing over ping timer
+   - Reduces latency and prevents ping timer from starving message reads
+
+3. **Made ping timer conditional based on exchange requirements**
+   - Added `ping_interval()` method to Exchange trait
+   - Exchanges that need client pings (OKX, Bybit, Coinbase) return `Some(Duration)`
+   - Exchanges where server initiates pings (Binance, Upbit) return `None`
+   - When `None`, use simple blocking `read.next().await` without `select!`
+
+4. **Fixed data timeout race condition**
+   - Changed `last_data_received` from `Instant` to `Option<Instant>`
+   - Set to `None` initially, only becomes `Some` when first data arrives
+   - Added 30-second grace period after subscription before checking timeout
+   - Separate logic for "never received data" vs "data stopped flowing"
+
+---
+
+**New Exchange trait method:**
+
+```rust
+/// Returns the ping interval if this exchange requires client-initiated pings.
+fn ping_interval(&self) -> Option<Duration> {
+    None  // Default: server initiates pings
+}
+```
+
+**Ping requirements by exchange:**
+
+| Exchange | `ping_interval()` | Notes |
+|----------|-------------------|-------|
+| Binance | `None` | Server sends pings every ~3 min |
+| Coinbase | `Some(30s)` | Client must ping within ~100s |
+| OKX | `Some(20s)` | Client must ping within 30s |
+| Bybit | `Some(20s)` | Client must ping within ~10 min |
+| Upbit | `None` | Server likely initiates pings |
+
+---
+
+**Message loop strategy:**
+
+```rust
+// For exchanges with client pings (OKX, Bybit, Coinbase):
+tokio::select! {
+    biased;  // Prefer messages over pings
+    result = read.next() => { process(result) }
+    _ = ping_timer.tick() => { send_ping() }
+}
+
+// For exchanges with server pings (Binance, Upbit):
+// Simple blocking read - no select needed
+let result = read.next().await;
+process(result);
+```
+
+---
+
+**Data timeout logic:**
+
+```rust
+match last_data_received {
+    Some(last) => {
+        // Have received data before - check if it stopped
+        if last.elapsed() > timeout * 3 { reconnect() }
+    }
+    None => {
+        // Never received data - check grace period
+        if subscription_sent.elapsed() > timeout * 3 { reconnect() }
+    }
+}
+```
+
+---
+
+**Impact:**
+- Eliminates spurious reconnects from timeout races
+- Reduces latency for message processing
+- Simplifies code path for exchanges that don't need client pings
+- Properly handles subscription grace period
+- Matches proven architecture from stable `bayes-rust` codebase
+
+---
+
 ### Major Architecture Change: Direct Parquet Streaming (Eliminated SQLite)
 
 **Files added:**

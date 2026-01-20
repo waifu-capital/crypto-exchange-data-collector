@@ -10,6 +10,7 @@ pub mod okx;
 pub mod upbit;
 
 use std::fmt;
+use std::time::Duration;
 
 use futures_util::stream::{SplitSink, SplitStream};
 use tokio::net::TcpStream;
@@ -133,6 +134,18 @@ pub trait Exchange: Send + Sync {
     /// - OKX: Client sends text "ping" (return Message::Text)
     /// - Bybit: Client sends JSON ping (return Message::Text)
     fn build_ping_message(&self) -> Option<Message>;
+
+    /// Returns the ping interval if this exchange requires client-initiated pings.
+    ///
+    /// Returns `Some(Duration)` if the client must send pings to keep the connection alive,
+    /// or `None` if the server initiates pings (client just responds).
+    ///
+    /// This is used to determine whether to run a ping timer in the message loop.
+    /// When `None`, we use a simpler loop without competing select! branches.
+    fn ping_interval(&self) -> Option<Duration> {
+        // Default: server initiates pings, no client ping needed
+        None
+    }
 }
 
 /// Coinbase API credentials for authenticated channels.

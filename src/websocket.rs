@@ -3,10 +3,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
 use tokio::sync::mpsc::Sender;
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, error, info, warn};
+
+/// Grace period after subscription before checking for data timeout.
+/// This allows time for subscription confirmation and first data message.
+const SUBSCRIPTION_GRACE_PERIOD: Duration = Duration::from_secs(30);
 
 use crate::exchanges::{Exchange, ExchangeMessage, FeedType};
 use crate::metrics::{
@@ -218,43 +222,23 @@ pub async fn websocket_worker(
                 }
 
                 // Track when we last received actual data (orderbook/trade), not control messages
-                let mut last_data_received = Instant::now();
+                // None until first data arrives - this allows a grace period for subscription
+                let mut last_data_received: Option<Instant> = None;
                 let mut data_timeout_warned = false;
+                let subscription_sent = Instant::now();
 
-                // Ping timer for keepalive (20 seconds for OKX's 30s timeout)
-                let ping_interval = Duration::from_secs(20);
-                let mut ping_timer = tokio::time::interval(ping_interval);
-                // Skip the first tick which fires immediately
-                ping_timer.tick().await;
+                // Get exchange-specific ping interval (None = server initiates pings)
+                let ping_interval = exchange.ping_interval();
+
+                // Create ping timer only if this exchange requires client-initiated pings
+                let mut ping_timer = ping_interval.map(|d| {
+                    let mut timer = tokio::time::interval(d);
+                    // Reset the timer to avoid immediate first tick
+                    timer.reset();
+                    timer
+                });
 
                 loop {
-                    // Check for data timeout (separate from message timeout)
-                    // This catches silent failures where connection is alive (heartbeats) but no data flows
-                    let data_elapsed = last_data_received.elapsed();
-                    if data_elapsed > message_timeout && !data_timeout_warned {
-                        warn!(
-                            exchange = exchange_name,
-                            symbol = %normalized_symbol,
-                            feed = feed_str,
-                            elapsed_secs = data_elapsed.as_secs(),
-                            "No data received - subscription may have failed"
-                        );
-                        data_timeout_warned = true;
-                    }
-                    // Reconnect if no data for 3x timeout (connection alive but subscription failed)
-                    if data_elapsed > message_timeout * 3 {
-                        error!(
-                            exchange = exchange_name,
-                            symbol = %normalized_symbol,
-                            feed = feed_str,
-                            elapsed_secs = data_elapsed.as_secs(),
-                            "Extended data timeout - reconnecting"
-                        );
-                        MESSAGE_TIMEOUTS
-                            .with_label_values(&[exchange_name, &normalized_symbol])
-                            .inc();
-                        break;
-                    }
                     // Check for shutdown signal
                     if shutdown_rx.try_recv().is_ok() {
                         info!(
@@ -280,36 +264,96 @@ pub async fn websocket_worker(
                         return;
                     }
 
-                    tokio::select! {
-                        // Ping timer for keepalive
-                        _ = ping_timer.tick() => {
-                            // Send exchange-specific ping for keepalive
-                            if let Some(ping_msg) = exchange.build_ping_message() {
-                                if let Err(e) = write.send(ping_msg).await {
-                                    error!(
-                                        exchange = exchange_name,
-                                        symbol = %normalized_symbol,
-                                        error = %e,
-                                        "Failed to send ping, reconnecting"
-                                    );
-                                    break;
-                                }
-                                WEBSOCKET_PINGS_SENT
-                                    .with_label_values(&[exchange_name, &normalized_symbol])
-                                    .inc();
-                                debug!(
+                    // Check for data timeout
+                    // Two cases: never received data (subscription failed) vs data stopped flowing
+                    let should_reconnect = match last_data_received {
+                        Some(last) => {
+                            // Have received data before - check if it stopped
+                            let elapsed = last.elapsed();
+                            if elapsed > message_timeout && !data_timeout_warned {
+                                warn!(
                                     exchange = exchange_name,
                                     symbol = %normalized_symbol,
-                                    "Sent keepalive ping"
+                                    feed = feed_str,
+                                    elapsed_secs = elapsed.as_secs(),
+                                    "No data received - connection may be stale"
                                 );
+                                data_timeout_warned = true;
                             }
-                            continue;
+                            // Reconnect if no data for 3x timeout
+                            elapsed > message_timeout * 3
                         }
+                        None => {
+                            // Never received data - check grace period
+                            let since_subscription = subscription_sent.elapsed();
+                            if since_subscription > SUBSCRIPTION_GRACE_PERIOD && !data_timeout_warned {
+                                warn!(
+                                    exchange = exchange_name,
+                                    symbol = %normalized_symbol,
+                                    feed = feed_str,
+                                    elapsed_secs = since_subscription.as_secs(),
+                                    "No data received after subscription - subscription may have failed"
+                                );
+                                data_timeout_warned = true;
+                            }
+                            // Reconnect if no data after extended grace period (3x normal timeout from subscription)
+                            since_subscription > message_timeout * 3
+                        }
+                    };
 
-                        // Message receive with timeout
-                        result = timeout(message_timeout, read.next()) => {
-                            match result {
-                        Ok(Some(Ok(msg))) => {
+                    if should_reconnect {
+                        error!(
+                            exchange = exchange_name,
+                            symbol = %normalized_symbol,
+                            feed = feed_str,
+                            "Data timeout - reconnecting"
+                        );
+                        MESSAGE_TIMEOUTS
+                            .with_label_values(&[exchange_name, &normalized_symbol])
+                            .inc();
+                        break;
+                    }
+
+                    // Use different loop strategies based on whether exchange needs client pings
+                    let msg_result = if let Some(ref mut timer) = ping_timer {
+                        // Exchange requires client-initiated pings - use select! with ping timer
+                        tokio::select! {
+                            biased;  // Prefer message processing over ping timer
+
+                            result = read.next() => result,
+
+                            _ = timer.tick() => {
+                                // Send exchange-specific ping for keepalive
+                                if let Some(ping_msg) = exchange.build_ping_message() {
+                                    if let Err(e) = write.send(ping_msg).await {
+                                        error!(
+                                            exchange = exchange_name,
+                                            symbol = %normalized_symbol,
+                                            error = %e,
+                                            "Failed to send ping, reconnecting"
+                                        );
+                                        break;
+                                    }
+                                    WEBSOCKET_PINGS_SENT
+                                        .with_label_values(&[exchange_name, &normalized_symbol])
+                                        .inc();
+                                    debug!(
+                                        exchange = exchange_name,
+                                        symbol = %normalized_symbol,
+                                        "Sent keepalive ping"
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                    } else {
+                        // Server initiates pings - simple blocking read (like bayes-rust)
+                        read.next().await
+                    };
+
+                    // Process the message
+                    match msg_result {
+                        Some(Ok(msg)) => {
                             if msg.is_text() {
                                 let text = match msg.into_text() {
                                     Ok(t) => t,
@@ -374,7 +418,7 @@ pub async fn websocket_worker(
                                         );
                                         parse_tracker.record_success();
                                         // Reset data timeout - we received actual data
-                                        last_data_received = Instant::now();
+                                        last_data_received = Some(Instant::now());
                                         data_timeout_warned = false;
                                     }
                                     Ok(ExchangeMessage::Trade {
@@ -420,7 +464,7 @@ pub async fn websocket_worker(
                                         );
                                         parse_tracker.record_success();
                                         // Reset data timeout - we received actual data
-                                        last_data_received = Instant::now();
+                                        last_data_received = Some(Instant::now());
                                         data_timeout_warned = false;
                                     }
                                     Ok(ExchangeMessage::Ping(data)) => {
@@ -488,7 +532,7 @@ pub async fn websocket_worker(
                                 debug!(exchange = exchange_name, ?msg, "Received other frame");
                             }
                         }
-                        Ok(Some(Err(e))) => {
+                        Some(Err(e)) => {
                             error!(
                                 exchange = exchange_name,
                                 error = %e,
@@ -499,7 +543,7 @@ pub async fn websocket_worker(
                                 .set(0.0);
                             break;
                         }
-                        Ok(None) => {
+                        None => {
                             info!(
                                 exchange = exchange_name,
                                 symbol = %normalized_symbol,
@@ -509,23 +553,6 @@ pub async fn websocket_worker(
                                 .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
                             break;
-                        }
-                        Err(_) => {
-                            error!(
-                                exchange = exchange_name,
-                                symbol = %normalized_symbol,
-                                timeout_secs = message_timeout.as_secs(),
-                                "Message timeout - connection may be stale, reconnecting"
-                            );
-                            MESSAGE_TIMEOUTS
-                                .with_label_values(&[exchange_name, &normalized_symbol])
-                                .inc();
-                            WEBSOCKET_CONNECTED
-                                .with_label_values(&[exchange_name, &normalized_symbol])
-                                .set(0.0);
-                            break;
-                        }
-                    }
                         }
                     }
                 }
