@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
 /// OKX orderbook channel types.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum OkxBookChannel {
     /// 400 levels, 100ms updates
@@ -46,6 +47,7 @@ impl Okx {
     }
 
     /// Creates an OKX exchange with a specific book channel.
+    #[allow(dead_code)]
     pub fn with_book_channel(book_channel: OkxBookChannel) -> Self {
         Self { book_channel }
     }

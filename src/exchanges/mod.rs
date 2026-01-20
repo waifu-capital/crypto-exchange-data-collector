@@ -17,9 +17,11 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
 /// Type alias for WebSocket write half
+#[allow(dead_code)]
 pub type WsSink = SplitSink<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Message>;
 
 /// Type alias for WebSocket read half
+#[allow(dead_code)]
 pub type WsStream = SplitStream<WebSocketStream<MaybeTlsStream<TcpStream>>>;
 
 /// Feed types supported by exchanges
@@ -59,6 +61,7 @@ pub enum ExchangeMessage {
         data: String,
     },
     /// Ping frame that needs a pong response
+    #[allow(dead_code)]
     Ping(Vec<u8>),
     /// Pong frame (response to our ping)
     Pong,
@@ -69,23 +72,14 @@ pub enum ExchangeMessage {
 /// Error type for exchange operations
 #[derive(Debug)]
 pub enum ExchangeError {
-    /// WebSocket connection error
-    Connection(String),
     /// Message parsing error
     Parse(String),
-    /// Subscription error
-    Subscribe(String),
-    /// Generic error
-    Other(String),
 }
 
 impl fmt::Display for ExchangeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Connection(msg) => write!(f, "Connection error: {}", msg),
             Self::Parse(msg) => write!(f, "Parse error: {}", msg),
-            Self::Subscribe(msg) => write!(f, "Subscribe error: {}", msg),
-            Self::Other(msg) => write!(f, "Error: {}", msg),
         }
     }
 }

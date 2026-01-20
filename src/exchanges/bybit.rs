@@ -8,6 +8,7 @@ use tokio_tungstenite::tungstenite::Message;
 use super::{Exchange, ExchangeError, ExchangeMessage, FeedType};
 
 /// Bybit market type.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum BybitMarket {
     /// Spot market
@@ -29,6 +30,7 @@ impl BybitMarket {
 }
 
 /// Bybit orderbook depth levels.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy)]
 pub enum BybitDepth {
     /// 1 level, 10ms updates
@@ -59,6 +61,7 @@ impl Bybit {
     }
 
     /// Creates a Bybit exchange with custom settings.
+    #[allow(dead_code)]
     pub fn with_config(market: BybitMarket, depth: BybitDepth) -> Self {
         Self { market, depth }
     }
