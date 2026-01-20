@@ -2,6 +2,60 @@
 
 ## 2026-01-20
 
+### Added: System Resource Monitoring Dashboard
+
+**Files modified/created:**
+- `docker-compose.yml` - Added Node Exporter service
+- `prometheus.yml` - Added Node Exporter scrape target
+- `grafana/provisioning/dashboards/system.json` - New system resources dashboard
+
+---
+
+**Purpose:** Add visibility into host system resources (CPU, memory, disk, network) alongside application metrics.
+
+**Changes:**
+
+1. **Node Exporter service in docker-compose.yml:**
+   ```yaml
+   node-exporter:
+     image: prom/node-exporter:latest
+     container_name: node-exporter
+     restart: unless-stopped
+     volumes:
+       - /proc:/host/proc:ro
+       - /sys:/host/sys:ro
+       - /:/rootfs:ro
+     command:
+       - '--path.procfs=/host/proc'
+       - '--path.sysfs=/host/sys'
+       - '--path.rootfs=/rootfs'
+       - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+     ports:
+       - "9100:9100"
+   ```
+
+2. **Prometheus scrape config:**
+   ```yaml
+   - job_name: 'node-exporter'
+     static_configs:
+       - targets: ['node-exporter:9100']
+   ```
+
+3. **New Grafana dashboard panels:**
+
+   | Panel | Metric | Type |
+   |-------|--------|------|
+   | CPU Usage | `node_cpu_seconds_total` | Gauge + Timeseries by mode |
+   | Memory Usage | `node_memory_*` | Gauge + Stacked area |
+   | Disk Free | `node_filesystem_*` | Gauge + Bar gauge by mount |
+   | Network I/O | `node_network_*_bytes_total` | Bytes/sec + Packets/sec |
+   | Load Average | `node_load1`, `node_load5`, `node_load15` | Timeseries |
+   | System Uptime | `node_time_seconds - node_boot_time_seconds` | Stat |
+
+**Note:** The existing "Channel Queue Depth" panel was kept as `collector_channel_queue_depth` metric is still actively used.
+
+---
+
 ### WebSocket Hardening: Eliminated Connection Flakiness
 
 **Files modified:**
