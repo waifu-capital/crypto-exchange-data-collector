@@ -2,6 +2,30 @@
 
 ## 2026-01-21
 
+### Docs: Added Important Rules to CLAUDE.md
+
+**Files modified:**
+- `CLAUDE.md` - Added rules 5, 6, and 7
+
+Added three new important rules:
+- **Rule 5: Apply expert domain knowledge** - Use deep expertise relevant to the domain (networking, cryptography, concurrency, etc.)
+- **Rule 6: Present multiple implementation options** - For non-trivial changes, present 2-3 approaches with pros/cons and recommendation
+- **Rule 7: Ensure code quality and linting** - Verify clippy, tests, and build pass before committing
+
+---
+
+### Chore: Fix All Clippy Warnings
+
+**Files modified:**
+- `src/parquet.rs` - Collapsed if statements, use `.is_multiple_of()`, use `inspect_err`
+- `src/upload.rs` - Collapsed if statements
+- `src/utils.rs` - Collapsed if statements
+- `src/websocket.rs` - Collapsed if statements, use `.is_multiple_of()`, added `#[allow(clippy::too_many_arguments)]`
+
+Applied clippy auto-fixes and manual fixes to resolve all warnings. Code now passes `cargo clippy` with zero warnings.
+
+---
+
 ### Feature: Add Coinbase Heartbeats Channel Subscription
 
 **Files modified:**

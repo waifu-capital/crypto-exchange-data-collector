@@ -30,6 +30,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
    ```
 
+5. **Apply expert domain knowledge** - When working on code, apply deep expertise relevant to the domain. For example:
+   - Networking code: understand TCP/IP, WebSocket protocols, keepalive mechanisms, connection timeouts
+   - Cryptography: understand security implications, proper key handling, timing attacks
+   - Concurrency: understand async runtimes, race conditions, deadlocks, fair scheduling
+   - Database: understand transactions, indexing, query optimization
+   - Always consult official documentation and RFCs when dealing with protocols.
+
+6. **Present multiple implementation options** - For non-trivial changes, always present 2-3 implementation approaches with:
+   - Brief description of each approach
+   - Pros and cons of each
+   - Your recommendation with reasoning
+
+   This demonstrates thorough analysis and lets the user make informed decisions. Skip this only for trivial fixes (typos, obvious bugs).
+
+7. **Ensure code quality and linting** - Before committing, verify the code passes all quality checks:
+   - **Rust**: `cargo build` (no errors), `cargo test` (all pass), `cargo clippy` (no warnings)
+   - **Python**: `ruff check` (no errors), `black --check` (formatted), `pytest` (all pass)
+   - **TypeScript/JavaScript**: `npm run build`, `npm run lint`, `npm test`
+   - Fix any issues before committing. Never commit code with linting errors or failing tests.
+
 ## Build & Test Commands
 
 ```bash

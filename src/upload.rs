@@ -219,17 +219,16 @@ async fn process_file(
     }
 
     // Copy to local storage if needed (for Both mode, file is already in data_dir)
-    if matches!(storage_mode, StorageMode::Local | StorageMode::Both) {
-        if let Some(local_path) = local_storage_path {
+    if matches!(storage_mode, StorageMode::Local | StorageMode::Both)
+        && let Some(local_path) = local_storage_path {
             let dest_path = local_path.join(&file.relative_path);
 
             // Create parent directories
-            if let Some(parent) = dest_path.parent() {
-                if let Err(e) = std::fs::create_dir_all(parent) {
+            if let Some(parent) = dest_path.parent()
+                && let Err(e) = std::fs::create_dir_all(parent) {
                     error!(error = %e, path = %parent.display(), "Failed to create local directory");
                     local_success = false;
                 }
-            }
 
             // Copy file if not already in the right location
             if local_success && file.path != dest_path {
@@ -245,7 +244,6 @@ async fn process_file(
                 }
             }
         }
-    }
 
     // Clean up source file based on storage mode and success
     let should_delete_source = match storage_mode {

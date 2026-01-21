@@ -139,6 +139,7 @@ async fn set_connection_status(
 ///
 /// This is a generic worker that works with any exchange implementing the `Exchange` trait.
 /// It handles connection management, message parsing, and forwards data to the database channel.
+#[allow(clippy::too_many_arguments)]
 pub async fn websocket_worker(
     exchange: Box<dyn Exchange>,
     db_tx: Sender<MarketEvent>,
@@ -371,7 +372,7 @@ pub async fn websocket_worker(
                                 };
 
                                 // Sample log ~0.1% of messages at debug level
-                                if rand::random::<u32>() % 1000 == 0 {
+                                if rand::random::<u32>().is_multiple_of(1000) {
                                     let preview_len = text.len().min(80);
                                     debug!(
                                         exchange = exchange_name,
@@ -566,9 +567,9 @@ pub async fn websocket_worker(
                     // Backup ping check after processing each message
                     // This handles edge cases where select! doesn't pick the timer often enough
                     // during sustained high message volume (belt-and-suspenders approach)
-                    if let Some(interval) = ping_interval {
-                        if last_ping_sent.elapsed() >= interval {
-                            if let Some(ping_msg) = exchange.build_ping_message() {
+                    if let Some(interval) = ping_interval
+                        && last_ping_sent.elapsed() >= interval
+                            && let Some(ping_msg) = exchange.build_ping_message() {
                                 if let Err(e) = write.send(ping_msg).await {
                                     error!(
                                         exchange = exchange_name,
@@ -588,8 +589,6 @@ pub async fn websocket_worker(
                                 );
                                 last_ping_sent = Instant::now();
                             }
-                        }
-                    }
                 }
             }
             Err(e) => {
@@ -643,6 +642,7 @@ fn update_last_message_timestamp(exchange: &str, symbol: &str) {
 }
 
 /// Save a market event to the channel for database processing
+#[allow(clippy::too_many_arguments)]
 fn save_event(
     db_tx: &Sender<MarketEvent>,
     exchange: &str,

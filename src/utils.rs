@@ -31,14 +31,13 @@ pub fn cleanup_old_logs(logs_dir: &str, retention_days: u64) {
             Err(_) => continue,
         };
 
-        if let Ok(age) = now.duration_since(modified) {
-            if age > retention_duration {
+        if let Ok(age) = now.duration_since(modified)
+            && age > retention_duration {
                 if let Err(e) = fs::remove_file(&path) {
                     warn!(error = %e, path = %path.display(), "Failed to delete old log file");
                 } else {
                     info!(path = %path.display(), "Deleted old log file");
                 }
             }
-        }
     }
 }

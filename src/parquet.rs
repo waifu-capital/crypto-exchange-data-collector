@@ -142,13 +142,11 @@ impl ParquetWriterInstance {
 
         // Check size (approximate based on rows written)
         // We check actual file size periodically via metadata
-        if self.rows_written > 0 && self.rows_written % 10000 == 0 {
-            if let Ok(metadata) = std::fs::metadata(&self.file_path) {
-                if metadata.len() > MAX_FILE_SIZE {
+        if self.rows_written > 0 && self.rows_written.is_multiple_of(10000)
+            && let Ok(metadata) = std::fs::metadata(&self.file_path)
+                && metadata.len() > MAX_FILE_SIZE {
                     return true;
                 }
-            }
-        }
 
         false
     }
@@ -263,13 +261,12 @@ impl ParquetWriterManager {
         };
 
         // Check if we need to rotate the existing writer
-        if let Some(writer) = self.writers.get(&key) {
-            if writer.should_rotate() {
+        if let Some(writer) = self.writers.get(&key)
+            && writer.should_rotate() {
                 // Remove and close the writer
                 let writer = self.writers.remove(&key).unwrap();
                 self.finalize_writer(writer).await;
             }
-        }
 
         // Get or create writer
         let writer = if let Some(w) = self.writers.get_mut(&key) {
@@ -300,9 +297,8 @@ impl ParquetWriterManager {
 
         // Flush if buffer is full
         if writer.buffer.len() >= WRITE_BATCH_SIZE {
-            writer.flush_buffer().map_err(|e| {
+            writer.flush_buffer().inspect_err(|_| {
                 PARQUET_WRITE_ERRORS.inc();
-                e
             })?;
         }
 
