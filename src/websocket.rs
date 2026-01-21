@@ -73,9 +73,13 @@ impl ExponentialBackoff {
 /// Diagnostics for disconnect events.
 /// Used to understand why a connection was closed.
 struct DisconnectDiagnostics {
-    secs_since_data: u64,
+    /// None = never received data (distinguishes from "just received")
+    secs_since_data: Option<u64>,
     secs_since_ping: u64,
-    secs_since_pong: u64,
+    /// None = never received pong
+    secs_since_pong: Option<u64>,
+    /// Time since any frame was received (for connection liveness)
+    secs_since_any_frame: u64,
 }
 
 impl DisconnectDiagnostics {
@@ -84,15 +88,13 @@ impl DisconnectDiagnostics {
         last_data_received: Option<Instant>,
         last_ping_sent: Instant,
         last_pong_received: Option<Instant>,
+        last_any_message_received: Instant,
     ) -> Self {
         Self {
-            secs_since_data: last_data_received
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0),
+            secs_since_data: last_data_received.map(|t| t.elapsed().as_secs()),
             secs_since_ping: last_ping_sent.elapsed().as_secs(),
-            secs_since_pong: last_pong_received
-                .map(|t| t.elapsed().as_secs())
-                .unwrap_or(0),
+            secs_since_pong: last_pong_received.map(|t| t.elapsed().as_secs()),
+            secs_since_any_frame: last_any_message_received.elapsed().as_secs(),
         }
     }
 }
@@ -174,6 +176,15 @@ async fn set_connection_status(
 /// that may close connections based on TCP-level idle detection.
 const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
 const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Watchdog interval for detecting dead connections.
+/// This triggers periodic liveness checks even when read() is blocking.
+const WATCHDOG_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Base timeout for declaring a connection dead (no frames received).
+/// Set to 90s to accommodate server-ping venues (Binance) where markets can go quiet.
+/// For client-ping venues, actual timeout = max(90s, 2 * ping_interval).
+const BASE_CONNECTION_DEAD_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Connect to a WebSocket URL with TCP keepalive enabled.
 ///
@@ -337,6 +348,7 @@ pub async fn websocket_worker(
 
                 // Send subscription messages
                 let subscribe_msgs = exchange.build_subscribe_messages(&symbol, &feeds);
+                let mut subscription_ok = true;
                 for msg in subscribe_msgs {
                     debug!(
                         exchange = exchange_name,
@@ -347,10 +359,21 @@ pub async fn websocket_worker(
                         error!(
                             exchange = exchange_name,
                             error = %e,
-                            "Failed to send subscription message"
+                            "Failed to send subscription message - aborting connection"
                         );
+                        subscription_ok = false;
                         break;
                     }
+                }
+
+                // Skip message loop if subscription failed - go straight to reconnect
+                if !subscription_ok {
+                    WEBSOCKET_CONNECTED
+                        .with_label_values(&[exchange_name, &normalized_symbol])
+                        .set(0.0);
+                    set_connection_status(&conn_state, exchange_name, &normalized_symbol, feed_str, false).await;
+                    // Fall through to reconnect section at bottom of outer loop
+                    continue;
                 }
 
                 // Track when we last received actual data (orderbook/trade), not control messages
@@ -370,15 +393,34 @@ pub async fn websocket_worker(
                 // Track when we last received a pong (for disconnect diagnostics)
                 let mut last_pong_received: Option<Instant> = None;
 
-                // Create ping timer only if this exchange requires client-initiated pings
-                let mut ping_timer = ping_interval.map(|d| {
-                    let mut timer = tokio::time::interval(d);
-                    // Reset the timer to avoid immediate first tick
-                    timer.reset();
-                    timer
-                });
+                // Track when we last received ANY frame (for connection liveness/watchdog)
+                let mut last_any_message_received = Instant::now();
 
-                loop {
+                // Create ping timer only if this exchange requires client-initiated pings
+                // Use if-let instead of .map() because we need to .await the first tick
+                let mut ping_timer = if let Some(d) = ping_interval {
+                    let mut timer = tokio::time::interval(d);
+                    // Consume immediate first tick to avoid sending ping right after connect
+                    timer.tick().await;
+                    Some(timer)
+                } else {
+                    None
+                };
+
+                // Derive connection dead timeout from ping interval
+                // Must be >= 2x ping interval to avoid false positives during normal ping/pong cycle
+                let connection_dead_timeout = if let Some(ping_dur) = ping_interval {
+                    let doubled = ping_dur.checked_add(ping_dur).unwrap_or(ping_dur);
+                    BASE_CONNECTION_DEAD_TIMEOUT.max(doubled)
+                } else {
+                    BASE_CONNECTION_DEAD_TIMEOUT
+                };
+
+                // Create watchdog timer for detecting dead connections (even when read() blocks)
+                let mut watchdog_timer = tokio::time::interval(WATCHDOG_INTERVAL);
+                watchdog_timer.tick().await; // Consume immediate first tick
+
+                'msg: loop {
                     // Check for shutdown signal
                     if shutdown_rx.try_recv().is_ok() {
                         info!(
@@ -446,12 +488,13 @@ pub async fn websocket_worker(
                             exchange = exchange_name,
                             symbol = %normalized_symbol,
                             feed = feed_str,
+                            break_reason = "data_timeout",
                             "Data timeout - reconnecting"
                         );
                         MESSAGE_TIMEOUTS
                             .with_label_values(&[exchange_name, &normalized_symbol])
                             .inc();
-                        break;
+                        break 'msg;
                     }
 
                     // Use different strategies based on whether exchange needs client pings
@@ -471,9 +514,10 @@ pub async fn websocket_worker(
                                             exchange = exchange_name,
                                             symbol = %normalized_symbol,
                                             error = %e,
+                                            break_reason = "ping_send_failed",
                                             "Failed to send ping, reconnecting"
                                         );
-                                        break;
+                                        break 'msg;
                                     }
                                     WEBSOCKET_PINGS_SENT
                                         .with_label_values(&[exchange_name, &normalized_symbol])
@@ -487,193 +531,273 @@ pub async fn websocket_worker(
                                 }
                                 continue;
                             }
+                            _ = watchdog_timer.tick() => {
+                                // Check connection liveness even when ping timer exists
+                                if last_any_message_received.elapsed() > connection_dead_timeout {
+                                    error!(
+                                        exchange = exchange_name,
+                                        symbol = %normalized_symbol,
+                                        elapsed_secs = last_any_message_received.elapsed().as_secs(),
+                                        timeout_secs = connection_dead_timeout.as_secs(),
+                                        break_reason = "dead_timeout",
+                                        "Connection appears dead - no frames received"
+                                    );
+                                    break 'msg;
+                                }
+                                continue;
+                            }
                         }
                     } else {
-                        // Server initiates pings - simple blocking read (no timeout wrapper needed)
-                        read.next().await
+                        // Server initiates pings but still need watchdog to detect dead connections
+                        tokio::select! {
+                            result = read.next() => result,
+                            _ = watchdog_timer.tick() => {
+                                if last_any_message_received.elapsed() > connection_dead_timeout {
+                                    error!(
+                                        exchange = exchange_name,
+                                        symbol = %normalized_symbol,
+                                        elapsed_secs = last_any_message_received.elapsed().as_secs(),
+                                        timeout_secs = connection_dead_timeout.as_secs(),
+                                        break_reason = "dead_timeout",
+                                        "Connection appears dead - no frames received"
+                                    );
+                                    break 'msg;
+                                }
+                                continue;
+                            }
+                        }
                     };
 
                     // Process the message
                     match msg_result {
                         Some(Ok(msg)) => {
-                            if msg.is_text() {
-                                let text = match msg.into_text() {
-                                    Ok(t) => t,
-                                    Err(e) => {
-                                        error!(error = %e, "Failed to extract text from message");
-                                        continue;
-                                    }
-                                };
+                            // Update connection liveness for ALL frame types (once, before match)
+                            last_any_message_received = Instant::now();
 
-                                // Sample log ~0.1% of messages at debug level
-                                if rand::random::<u32>().is_multiple_of(1000) {
-                                    let preview_len = text.len().min(80);
+                            // Use match for proper Close frame handling (RFC 6455)
+                            match msg {
+                                Message::Text(text) => {
+                                    // Sample log ~0.1% of messages at debug level
+                                    if rand::random::<u32>().is_multiple_of(1000) {
+                                        let preview_len = text.len().min(80);
+                                        debug!(
+                                            exchange = exchange_name,
+                                            preview = &text[..preview_len],
+                                            "Received message"
+                                        );
+                                    }
+
+                                    // Parse message using exchange-specific logic
+                                    match exchange.parse_message(&text) {
+                                        Ok(ExchangeMessage::Orderbook {
+                                            symbol: _sym,
+                                            sequence_id,
+                                            timestamp_exchange_us,
+                                            data,
+                                        }) => {
+                                            // Use same timestamp for collector and latency calculation
+                                            let collector_time_us = now_micros();
+                                            MESSAGES_RECEIVED
+                                                .with_label_values(&[
+                                                    exchange_name,
+                                                    &normalized_symbol,
+                                                    "orderbook",
+                                                ])
+                                                .inc();
+                                            update_last_message_timestamp(
+                                                exchange_name,
+                                                &normalized_symbol,
+                                            );
+
+                                            // Record latency in ms (only positive values, clock skew can cause negative)
+                                            if timestamp_exchange_us > 0 {
+                                                let latency_us = collector_time_us - timestamp_exchange_us;
+                                                if latency_us > 0 {
+                                                    // Report latency in milliseconds for readability
+                                                    LATENCY_EXCHANGE_TO_COLLECTOR
+                                                        .with_label_values(&[exchange_name, &normalized_symbol, "orderbook"])
+                                                        .observe((latency_us / 1000) as f64);
+                                                }
+                                            }
+
+                                            save_event(
+                                                &db_tx,
+                                                exchange_name,
+                                                &normalized_symbol,
+                                                DataType::Orderbook,
+                                                &sequence_id,
+                                                collector_time_us,
+                                                timestamp_exchange_us,
+                                                &data,
+                                            );
+                                            parse_tracker.record_success();
+                                            // Reset data timeout - we received actual data
+                                            last_data_received = Some(Instant::now());
+                                            data_timeout_warned = false;
+                                        }
+                                        Ok(ExchangeMessage::Trade {
+                                            symbol: _sym,
+                                            sequence_id,
+                                            timestamp_exchange_us,
+                                            data,
+                                        }) => {
+                                            // Use same timestamp for collector and latency calculation
+                                            let collector_time_us = now_micros();
+                                            MESSAGES_RECEIVED
+                                                .with_label_values(&[
+                                                    exchange_name,
+                                                    &normalized_symbol,
+                                                    "trade",
+                                                ])
+                                                .inc();
+                                            update_last_message_timestamp(
+                                                exchange_name,
+                                                &normalized_symbol,
+                                            );
+
+                                            // Record latency in ms (only positive values, clock skew can cause negative)
+                                            if timestamp_exchange_us > 0 {
+                                                let latency_us = collector_time_us - timestamp_exchange_us;
+                                                if latency_us > 0 {
+                                                    // Report latency in milliseconds for readability
+                                                    LATENCY_EXCHANGE_TO_COLLECTOR
+                                                        .with_label_values(&[exchange_name, &normalized_symbol, "trade"])
+                                                        .observe((latency_us / 1000) as f64);
+                                                }
+                                            }
+
+                                            save_event(
+                                                &db_tx,
+                                                exchange_name,
+                                                &normalized_symbol,
+                                                DataType::Trade,
+                                                &sequence_id,
+                                                collector_time_us,
+                                                timestamp_exchange_us,
+                                                &data,
+                                            );
+                                            parse_tracker.record_success();
+                                            // Reset data timeout - we received actual data
+                                            last_data_received = Some(Instant::now());
+                                            data_timeout_warned = false;
+                                        }
+                                        Ok(ExchangeMessage::Ping(data)) => {
+                                            debug!(
+                                                exchange = exchange_name,
+                                                "Received app-level ping, sending pong"
+                                            );
+                                            if let Err(e) = write.send(Message::Pong(data.into())).await {
+                                                error!(
+                                                    error = %e,
+                                                    break_reason = "pong_send_failed",
+                                                    "Failed to send pong"
+                                                );
+                                                break 'msg;
+                                            }
+                                        }
+                                        Ok(ExchangeMessage::Pong) => {
+                                            debug!(exchange = exchange_name, symbol = %normalized_symbol, "Received app-level pong");
+                                            WEBSOCKET_PONGS_RECEIVED
+                                                .with_label_values(&[exchange_name, &normalized_symbol])
+                                                .inc();
+                                            last_pong_received = Some(Instant::now());
+                                        }
+                                        Ok(ExchangeMessage::Other(other)) => {
+                                            // Subscription confirmations, heartbeats, etc.
+                                            debug!(
+                                                exchange = exchange_name,
+                                                message = %other.chars().take(100).collect::<String>(),
+                                                "Received other message"
+                                            );
+                                        }
+                                        Err(e) => {
+                                            if parse_tracker.record_error() {
+                                                error!(
+                                                    exchange = exchange_name,
+                                                    error_rate = "50%+",
+                                                    break_reason = "circuit_breaker",
+                                                    "Circuit breaker tripped - too many parse errors, reconnecting"
+                                                );
+                                                PARSE_CIRCUIT_BREAKS.with_label_values(&[exchange_name]).inc();
+                                                break 'msg;
+                                            }
+                                            warn!(
+                                                exchange = exchange_name,
+                                                error = %e,
+                                                "Failed to parse message"
+                                            );
+                                        }
+                                    }
+                                }
+                                Message::Binary(data) => {
+                                    // Some exchanges send binary messages (e.g., OKX compressed)
                                     debug!(
                                         exchange = exchange_name,
-                                        preview = &text[..preview_len],
-                                        "Received message"
+                                        len = data.len(),
+                                        "Received binary message"
                                     );
                                 }
-
-                                // Parse message using exchange-specific logic
-                                match exchange.parse_message(&text) {
-                                    Ok(ExchangeMessage::Orderbook {
-                                        symbol: _sym,
-                                        sequence_id,
-                                        timestamp_exchange_us,
-                                        data,
-                                    }) => {
-                                        // Use same timestamp for collector and latency calculation
-                                        let collector_time_us = now_micros();
-                                        MESSAGES_RECEIVED
-                                            .with_label_values(&[
-                                                exchange_name,
-                                                &normalized_symbol,
-                                                "orderbook",
-                                            ])
-                                            .inc();
-                                        update_last_message_timestamp(
-                                            exchange_name,
-                                            &normalized_symbol,
-                                        );
-
-                                        // Record latency in ms (only positive values, clock skew can cause negative)
-                                        if timestamp_exchange_us > 0 {
-                                            let latency_us = collector_time_us - timestamp_exchange_us;
-                                            if latency_us > 0 {
-                                                // Report latency in milliseconds for readability
-                                                LATENCY_EXCHANGE_TO_COLLECTOR
-                                                    .with_label_values(&[exchange_name, &normalized_symbol, "orderbook"])
-                                                    .observe((latency_us / 1000) as f64);
-                                            }
-                                        }
-
-                                        save_event(
-                                            &db_tx,
-                                            exchange_name,
-                                            &normalized_symbol,
-                                            DataType::Orderbook,
-                                            &sequence_id,
-                                            collector_time_us,
-                                            timestamp_exchange_us,
-                                            &data,
-                                        );
-                                        parse_tracker.record_success();
-                                        // Reset data timeout - we received actual data
-                                        last_data_received = Some(Instant::now());
-                                        data_timeout_warned = false;
-                                    }
-                                    Ok(ExchangeMessage::Trade {
-                                        symbol: _sym,
-                                        sequence_id,
-                                        timestamp_exchange_us,
-                                        data,
-                                    }) => {
-                                        // Use same timestamp for collector and latency calculation
-                                        let collector_time_us = now_micros();
-                                        MESSAGES_RECEIVED
-                                            .with_label_values(&[
-                                                exchange_name,
-                                                &normalized_symbol,
-                                                "trade",
-                                            ])
-                                            .inc();
-                                        update_last_message_timestamp(
-                                            exchange_name,
-                                            &normalized_symbol,
-                                        );
-
-                                        // Record latency in ms (only positive values, clock skew can cause negative)
-                                        if timestamp_exchange_us > 0 {
-                                            let latency_us = collector_time_us - timestamp_exchange_us;
-                                            if latency_us > 0 {
-                                                // Report latency in milliseconds for readability
-                                                LATENCY_EXCHANGE_TO_COLLECTOR
-                                                    .with_label_values(&[exchange_name, &normalized_symbol, "trade"])
-                                                    .observe((latency_us / 1000) as f64);
-                                            }
-                                        }
-
-                                        save_event(
-                                            &db_tx,
-                                            exchange_name,
-                                            &normalized_symbol,
-                                            DataType::Trade,
-                                            &sequence_id,
-                                            collector_time_us,
-                                            timestamp_exchange_us,
-                                            &data,
-                                        );
-                                        parse_tracker.record_success();
-                                        // Reset data timeout - we received actual data
-                                        last_data_received = Some(Instant::now());
-                                        data_timeout_warned = false;
-                                    }
-                                    Ok(ExchangeMessage::Ping(data)) => {
-                                        debug!(
-                                            exchange = exchange_name,
-                                            "Received ping, sending pong"
-                                        );
-                                        if let Err(e) = write.send(Message::Pong(data.into())).await {
-                                            error!(error = %e, "Failed to send pong");
-                                            break;
-                                        }
-                                    }
-                                    Ok(ExchangeMessage::Pong) => {
-                                        debug!(exchange = exchange_name, symbol = %normalized_symbol, "Received app-level pong");
-                                        WEBSOCKET_PONGS_RECEIVED
-                                            .with_label_values(&[exchange_name, &normalized_symbol])
-                                            .inc();
-                                        last_pong_received = Some(Instant::now());
-                                    }
-                                    Ok(ExchangeMessage::Other(other)) => {
-                                        // Subscription confirmations, heartbeats, etc.
-                                        debug!(
-                                            exchange = exchange_name,
-                                            message = %other.chars().take(100).collect::<String>(),
-                                            "Received other message"
-                                        );
-                                    }
-                                    Err(e) => {
-                                        if parse_tracker.record_error() {
-                                            error!(
-                                                exchange = exchange_name,
-                                                error_rate = "50%+",
-                                                "Circuit breaker tripped - too many parse errors, reconnecting"
-                                            );
-                                            PARSE_CIRCUIT_BREAKS.with_label_values(&[exchange_name]).inc();
-                                            break;  // Exit message loop to trigger reconnect
-                                        }
-                                        warn!(
-                                            exchange = exchange_name,
+                                Message::Ping(data) => {
+                                    debug!(exchange = exchange_name, "Received ping frame");
+                                    if let Err(e) = write.send(Message::Pong(data)).await {
+                                        error!(
                                             error = %e,
-                                            "Failed to parse message"
+                                            break_reason = "pong_send_failed",
+                                            "Failed to send pong frame"
                                         );
+                                        break 'msg;
                                     }
+                                    debug!(exchange = exchange_name, "Sent pong frame");
                                 }
-                            } else if msg.is_ping() {
-                                debug!(exchange = exchange_name, "Received ping frame");
-                                let pong = Message::Pong(msg.into_data());
-                                if let Err(e) = write.send(pong).await {
-                                    error!(error = %e, "Failed to send pong frame");
-                                    break;
+                                Message::Pong(_) => {
+                                    debug!(exchange = exchange_name, symbol = %normalized_symbol, "Received protocol pong frame");
+                                    WEBSOCKET_PONGS_RECEIVED
+                                        .with_label_values(&[exchange_name, &normalized_symbol])
+                                        .inc();
+                                    last_pong_received = Some(Instant::now());
                                 }
-                                debug!(exchange = exchange_name, "Sent pong frame");
-                            } else if msg.is_pong() {
-                                debug!(exchange = exchange_name, symbol = %normalized_symbol, "Received protocol pong frame");
-                                WEBSOCKET_PONGS_RECEIVED
-                                    .with_label_values(&[exchange_name, &normalized_symbol])
-                                    .inc();
-                                last_pong_received = Some(Instant::now());
-                            } else if msg.is_binary() {
-                                // Some exchanges send binary messages (e.g., OKX compressed)
-                                debug!(
-                                    exchange = exchange_name,
-                                    len = msg.len(),
-                                    "Received binary message"
-                                );
-                            } else {
-                                debug!(exchange = exchange_name, ?msg, "Received other frame");
+                                Message::Close(close_frame) => {
+                                    // RFC 6455: Log close reason and echo Close back
+                                    let (code_debug, code_u16, reason) = close_frame
+                                        .as_ref()
+                                        .map(|f| {
+                                            let code_u16: u16 = f.code.into();
+                                            // Truncate reason to avoid log spam from verbose servers
+                                            let reason = if f.reason.len() > 100 {
+                                                format!("{}...", &f.reason[..100])
+                                            } else {
+                                                f.reason.to_string()
+                                            };
+                                            (Some(f.code), Some(code_u16), reason)
+                                        })
+                                        .unwrap_or((None, None, String::new()));
+                                    info!(
+                                        exchange = exchange_name,
+                                        symbol = %normalized_symbol,
+                                        close_code = ?code_debug,
+                                        close_code_u16 = ?code_u16,
+                                        close_reason = %reason,
+                                        break_reason = "close_frame",
+                                        "Received WebSocket Close frame from server"
+                                    );
+                                    // Echo close frame back per RFC 6455 (with timeout to avoid hanging)
+                                    match tokio::time::timeout(
+                                        Duration::from_secs(2),
+                                        write.send(Message::Close(close_frame))
+                                    ).await {
+                                        Ok(Ok(_)) => {}  // Sent successfully
+                                        Ok(Err(e)) => debug!(error = %e, "Close echo send failed"),
+                                        Err(_) => debug!("Close echo timed out"),
+                                    }
+                                    WEBSOCKET_CONNECTED
+                                        .with_label_values(&[exchange_name, &normalized_symbol])
+                                        .set(0.0);
+                                    break 'msg;
+                                }
+                                Message::Frame(_) => {
+                                    // Raw frame - shouldn't happen in normal operation
+                                    debug!(exchange = exchange_name, "Received raw frame");
+                                }
                             }
                         }
                         Some(Err(e)) => {
@@ -681,39 +805,45 @@ pub async fn websocket_worker(
                                 last_data_received,
                                 last_ping_sent,
                                 last_pong_received,
+                                last_any_message_received,
                             );
                             error!(
                                 exchange = exchange_name,
                                 symbol = %normalized_symbol,
                                 error = %e,
-                                secs_since_data = diag.secs_since_data,
+                                secs_since_data = ?diag.secs_since_data,
                                 secs_since_ping = diag.secs_since_ping,
-                                secs_since_pong = diag.secs_since_pong,
+                                secs_since_pong = ?diag.secs_since_pong,
+                                secs_since_any_frame = diag.secs_since_any_frame,
+                                break_reason = "tungstenite_error",
                                 "WebSocket error - connection diagnostics"
                             );
                             WEBSOCKET_CONNECTED
                                 .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
-                            break;
+                            break 'msg;
                         }
                         None => {
                             let diag = DisconnectDiagnostics::from_state(
                                 last_data_received,
                                 last_ping_sent,
                                 last_pong_received,
+                                last_any_message_received,
                             );
                             info!(
                                 exchange = exchange_name,
                                 symbol = %normalized_symbol,
-                                secs_since_data = diag.secs_since_data,
+                                secs_since_data = ?diag.secs_since_data,
                                 secs_since_ping = diag.secs_since_ping,
-                                secs_since_pong = diag.secs_since_pong,
+                                secs_since_pong = ?diag.secs_since_pong,
+                                secs_since_any_frame = diag.secs_since_any_frame,
+                                break_reason = "stream_ended",
                                 "WebSocket stream ended - connection diagnostics"
                             );
                             WEBSOCKET_CONNECTED
                                 .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
-                            break;
+                            break 'msg;
                         }
                     }
 
@@ -728,9 +858,10 @@ pub async fn websocket_worker(
                                         exchange = exchange_name,
                                         symbol = %normalized_symbol,
                                         error = %e,
-                                        "Failed to send ping, reconnecting"
+                                        break_reason = "ping_send_failed",
+                                        "Failed to send backup ping, reconnecting"
                                     );
-                                    break;
+                                    break 'msg;
                                 }
                                 WEBSOCKET_PINGS_SENT
                                     .with_label_values(&[exchange_name, &normalized_symbol])

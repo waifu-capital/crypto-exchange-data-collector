@@ -2,6 +2,69 @@
 
 ## 2026-01-21
 
+### Fix: Comprehensive WebSocket Disconnect Improvements
+
+**Files modified:**
+- `src/websocket.rs` - Major refactoring of message handling and connection liveness
+
+**Problems addressed:**
+
+1. **Close frame not handled (RFC 6455 violation)**: Previous code used if-else chain that couldn't pattern match on Close frames to extract close codes/reasons.
+
+2. **Blocking read without watchdog**: When `ping_interval == None`, `read.next().await` blocked forever if connection was half-dead.
+
+3. **Subscription failure created zombie sessions**: Breaking from subscription for-loop continued into message loop with broken subscription.
+
+4. **No connection liveness tracking**: Only tracked data messages, not general frame receipt.
+
+5. **Immediate first ping on interval creation**: Using `interval.reset()` in a closure (can't await there).
+
+6. **Diagnostics hid "never received" state**: `u64` couldn't distinguish 0 from "never".
+
+**Fixes:**
+
+1. **Close frame handling with match statement**:
+   - Converted if-else chain to `match msg { ... }` for proper Close variant handling
+   - Logs close code (human-readable and numeric) and reason
+   - Echoes Close frame back per RFC 6455 with 2-second timeout
+   - Close codes reveal disconnect cause: 1000=normal, 1001=going away, 1008=policy violation
+
+2. **Watchdog timer for connection liveness**:
+   - Added `WATCHDOG_INTERVAL` (5s) for periodic liveness checks
+   - Added `BASE_CONNECTION_DEAD_TIMEOUT` (90s) for declaring connections dead
+   - Derives actual timeout as `max(90s, 2 * ping_interval)` to avoid false positives
+   - Both select! branches (with/without ping_timer) now include watchdog
+
+3. **Subscription failure abort**:
+   - Added `subscription_ok` flag tracking subscription success
+   - If subscription fails, skips message loop entirely and triggers reconnect
+   - Prevents "connected but unsubscribed" zombie sessions
+
+4. **Connection liveness tracking**:
+   - Added `last_any_message_received` tracking ANY frame type
+   - Updated once at top of `Some(Ok(msg))` before match (not in each arm)
+   - Watchdog uses this to detect half-dead connections
+
+5. **Ping timer initialization fix**:
+   - Changed from `.map()` with `.reset()` to `if let` with `.tick().await`
+   - First tick consumed immediately to prevent ping right after connect
+
+6. **Improved DisconnectDiagnostics**:
+   - Changed `secs_since_data` and `secs_since_pong` to `Option<u64>`
+   - Added `secs_since_any_frame` field
+   - None distinguishes "never received" from "just received"
+
+7. **Break reason logging**:
+   - Added `break_reason` field to all break points
+   - Values: `close_frame`, `stream_ended`, `data_timeout`, `dead_timeout`, `tungstenite_error`, `ping_send_failed`, `pong_send_failed`, `circuit_breaker`
+   - Makes it trivial to grep logs for dominant disconnect causes
+
+8. **Labeled message loop**:
+   - Changed `loop {` to `'msg: loop {`
+   - All breaks use `break 'msg;` for reliable exit from correct loop
+
+---
+
 ### Fix: TCP Keepalive Not Actually Being Enabled (SO_KEEPALIVE)
 
 **Files modified:**
