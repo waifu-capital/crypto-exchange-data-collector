@@ -116,12 +116,12 @@
       },
       "targets": [
         {
-          "expr": "ceil(sum(increase(collector_websocket_reconnects_total[$__range])))",
+          "expr": "sum(collector_websocket_reconnects_total)",
           "legendFormat": "Total",
           "refId": "A"
         }
       ],
-      "title": "Reconnects (Total)",
+      "title": "Reconnects (Since Start)",
       "type": "stat"
     },
     {
