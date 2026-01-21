@@ -155,6 +155,25 @@ impl Exchange for Coinbase {
         let mut messages = Vec::new();
         let product_id = symbol.to_uppercase();
 
+        // Always subscribe to heartbeats channel for keepalive
+        // Coinbase channels close within 60-90 seconds without updates
+        // Heartbeats are sent every second, keeping the connection alive
+        let heartbeat_msg = if let Some(jwt) = self.generate_jwt() {
+            serde_json::json!({
+                "type": "subscribe",
+                "product_ids": [&product_id],
+                "channel": "heartbeats",
+                "jwt": jwt
+            })
+        } else {
+            serde_json::json!({
+                "type": "subscribe",
+                "product_ids": [&product_id],
+                "channel": "heartbeats"
+            })
+        };
+        messages.push(heartbeat_msg.to_string());
+
         for feed in feeds {
             match feed {
                 FeedType::Orderbook => {
@@ -268,7 +287,7 @@ impl Exchange for Coinbase {
                 })
             }
 
-            "subscriptions" => Ok(ExchangeMessage::Other(msg.to_string())),
+            "subscriptions" | "heartbeats" => Ok(ExchangeMessage::Other(msg.to_string())),
 
             "" => {
                 // Might be old Exchange API format or error/heartbeat
@@ -464,18 +483,24 @@ mod tests {
     fn test_unauthenticated_subscribe() {
         let coinbase = Coinbase::new();
         let messages = coinbase.build_subscribe_messages("BTC-USD", &[FeedType::Trades]);
-        assert_eq!(messages.len(), 1);
-        let msg: Value = serde_json::from_str(&messages[0]).unwrap();
-        assert_eq!(msg["type"], "subscribe");
-        assert_eq!(msg["channel"], "market_trades");
-        assert!(msg.get("jwt").is_none());
+        // Should have 2 messages: heartbeats + market_trades
+        assert_eq!(messages.len(), 2);
+        let heartbeat_msg: Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(heartbeat_msg["type"], "subscribe");
+        assert_eq!(heartbeat_msg["channel"], "heartbeats");
+        let trades_msg: Value = serde_json::from_str(&messages[1]).unwrap();
+        assert_eq!(trades_msg["type"], "subscribe");
+        assert_eq!(trades_msg["channel"], "market_trades");
+        assert!(trades_msg.get("jwt").is_none());
     }
 
     #[test]
     fn test_orderbook_requires_auth() {
         let coinbase = Coinbase::new();
-        // Without auth, orderbook should not produce a message (just a warning)
+        // Without auth, orderbook should not produce a message (just heartbeats)
         let messages = coinbase.build_subscribe_messages("BTC-USD", &[FeedType::Orderbook]);
-        assert_eq!(messages.len(), 0);
+        assert_eq!(messages.len(), 1);
+        let msg: Value = serde_json::from_str(&messages[0]).unwrap();
+        assert_eq!(msg["channel"], "heartbeats");
     }
 }

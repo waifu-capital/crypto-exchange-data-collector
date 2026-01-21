@@ -2,6 +2,19 @@
 
 ## 2026-01-21
 
+### Feature: Add Coinbase Heartbeats Channel Subscription
+
+**Files modified:**
+- `src/exchanges/coinbase.rs` - Added heartbeats channel subscription
+
+**Problem:** Coinbase WebSocket channels close within 60-90 seconds if no updates are sent. This is separate from WebSocket protocol-level ping/pong and particularly affects illiquid trading pairs.
+
+**Solution:** Subscribe to the `heartbeats` channel alongside other channel subscriptions. Coinbase sends a heartbeat message every second per subscribed product, keeping the connection alive even when no market data is flowing.
+
+**Reference:** [Coinbase WebSocket Channels Documentation](https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-channels)
+
+---
+
 ### Docs: Added Commit Message Format Rule
 
 **Files modified:**
