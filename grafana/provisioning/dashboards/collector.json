@@ -81,18 +81,48 @@
         },
         "overrides": []
       },
-      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 5 },
+      "gridPos": { "h": 6, "w": 9, "x": 12, "y": 5 },
       "id": 3,
       "options": { "legend": { "calcs": ["sum"], "displayMode": "table", "placement": "right", "showLegend": true }, "tooltip": { "mode": "multi", "sort": "desc" } },
       "targets": [
         {
-          "expr": "increase(collector_websocket_reconnects_total[$__range])",
+          "expr": "increase(collector_websocket_reconnects_total[5m])",
           "legendFormat": "{{exchange}} / {{symbol}}",
           "refId": "A"
         }
       ],
-      "title": "Reconnects",
+      "title": "Reconnects (5m windows)",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "mappings": [],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 5 }, { "color": "red", "value": 20 }] }
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 6, "w": 3, "x": 21, "y": 5 },
+      "id": 32,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        {
+          "expr": "ceil(sum(increase(collector_websocket_reconnects_total[$__range])))",
+          "legendFormat": "Total",
+          "refId": "A"
+        }
+      ],
+      "title": "Reconnects (Total)",
+      "type": "stat"
     },
     {
       "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },

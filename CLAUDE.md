@@ -50,6 +50,15 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
    - **TypeScript/JavaScript**: `npm run build`, `npm run lint`, `npm test`
    - Fix any issues before committing. Never commit code with linting errors or failing tests.
 
+8. **Write clean, elegant, DRY code** - After making changes, review the surrounding code and ensure:
+   - **DRY (Don't Repeat Yourself)**: Extract duplicated logic into helper functions
+   - **Readability**: Code should be easy to read and understand at a glance
+   - **Simplicity**: Prefer simple solutions over clever ones; reduce complexity where possible
+   - **Comments**: Add clear comments for non-obvious logic. If code is convoluted and can't be simplified, explain WHY with comments
+   - **Consistency**: Follow existing patterns and naming conventions in the codebase
+
+   Good code reads like well-written prose. If you have to read something twice to understand it, it needs refactoring or comments.
+
 ## Build & Test Commands
 
 ```bash

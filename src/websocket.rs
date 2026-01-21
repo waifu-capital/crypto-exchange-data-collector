@@ -63,6 +63,33 @@ impl ExponentialBackoff {
     }
 }
 
+/// Diagnostics for disconnect events.
+/// Used to understand why a connection was closed.
+struct DisconnectDiagnostics {
+    secs_since_data: u64,
+    secs_since_ping: u64,
+    secs_since_pong: u64,
+}
+
+impl DisconnectDiagnostics {
+    /// Calculate diagnostics from connection state
+    fn from_state(
+        last_data_received: Option<Instant>,
+        last_ping_sent: Instant,
+        last_pong_received: Option<Instant>,
+    ) -> Self {
+        Self {
+            secs_since_data: last_data_received
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0),
+            secs_since_ping: last_ping_sent.elapsed().as_secs(),
+            secs_since_pong: last_pong_received
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0),
+        }
+    }
+}
+
 /// Tracks parse error rate for circuit breaker functionality.
 /// If error rate exceeds threshold, triggers a reconnect.
 struct ParseErrorTracker {
@@ -546,21 +573,18 @@ pub async fn websocket_worker(
                             }
                         }
                         Some(Err(e)) => {
-                            // Detailed disconnect diagnostics
-                            let since_data = last_data_received
-                                .map(|t| t.elapsed().as_secs())
-                                .unwrap_or(0);
-                            let since_ping = last_ping_sent.elapsed().as_secs();
-                            let since_pong = last_pong_received
-                                .map(|t| t.elapsed().as_secs())
-                                .unwrap_or(0);
+                            let diag = DisconnectDiagnostics::from_state(
+                                last_data_received,
+                                last_ping_sent,
+                                last_pong_received,
+                            );
                             error!(
                                 exchange = exchange_name,
                                 symbol = %normalized_symbol,
                                 error = %e,
-                                secs_since_data = since_data,
-                                secs_since_ping = since_ping,
-                                secs_since_pong = since_pong,
+                                secs_since_data = diag.secs_since_data,
+                                secs_since_ping = diag.secs_since_ping,
+                                secs_since_pong = diag.secs_since_pong,
                                 "WebSocket error - connection diagnostics"
                             );
                             WEBSOCKET_CONNECTED
@@ -569,20 +593,17 @@ pub async fn websocket_worker(
                             break;
                         }
                         None => {
-                            // Detailed disconnect diagnostics
-                            let since_data = last_data_received
-                                .map(|t| t.elapsed().as_secs())
-                                .unwrap_or(0);
-                            let since_ping = last_ping_sent.elapsed().as_secs();
-                            let since_pong = last_pong_received
-                                .map(|t| t.elapsed().as_secs())
-                                .unwrap_or(0);
+                            let diag = DisconnectDiagnostics::from_state(
+                                last_data_received,
+                                last_ping_sent,
+                                last_pong_received,
+                            );
                             info!(
                                 exchange = exchange_name,
                                 symbol = %normalized_symbol,
-                                secs_since_data = since_data,
-                                secs_since_ping = since_ping,
-                                secs_since_pong = since_pong,
+                                secs_since_data = diag.secs_since_data,
+                                secs_since_ping = diag.secs_since_ping,
+                                secs_since_pong = diag.secs_since_pong,
                                 "WebSocket stream ended - connection diagnostics"
                             );
                             WEBSOCKET_CONNECTED

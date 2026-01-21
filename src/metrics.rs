@@ -175,3 +175,59 @@ pub fn init_metrics() {
 
     APP_START_TIMESTAMP.set(start_time);
 }
+
+/// Normalize symbol to lowercase without separators (matches all exchange implementations)
+fn normalize_symbol(symbol: &str) -> String {
+    symbol.to_lowercase().replace(['-', '_', '/'], "")
+}
+
+/// Pre-initialize metric labels for all configured market pairs.
+/// This ensures counters exist from startup with value 0, so Prometheus
+/// increase() calculations work correctly for the first increment.
+///
+/// We use .get() to access each counter, which creates it if it doesn't exist.
+/// Counters are initialized to 0 by the prometheus library.
+pub fn init_metric_labels(market_pairs: &[(String, String)]) {
+    for (exchange, symbol) in market_pairs {
+        let normalized = normalize_symbol(symbol);
+
+        // Initialize connection status (0 = disconnected at startup)
+        WEBSOCKET_CONNECTED
+            .with_label_values(&[exchange, &normalized])
+            .set(0.0);
+
+        // Initialize counters by accessing them (creates with value 0)
+        // Using .get() ensures the metric is registered and scrapeable
+        let _ = WEBSOCKET_RECONNECTS
+            .with_label_values(&[exchange, &normalized])
+            .get();
+
+        let _ = WEBSOCKET_PINGS_SENT
+            .with_label_values(&[exchange, &normalized])
+            .get();
+
+        let _ = WEBSOCKET_PONGS_RECEIVED
+            .with_label_values(&[exchange, &normalized])
+            .get();
+
+        // Initialize message counters for each data type
+        for data_type in &["orderbook", "trade"] {
+            let _ = MESSAGES_RECEIVED
+                .with_label_values(&[exchange, &normalized, data_type])
+                .get();
+        }
+
+        let _ = MESSAGE_TIMEOUTS
+            .with_label_values(&[exchange, &normalized])
+            .get();
+
+        let _ = PARQUET_FILES_ROTATED
+            .with_label_values(&[exchange, &normalized])
+            .get();
+    }
+
+    tracing::info!(
+        pairs = market_pairs.len(),
+        "Pre-initialized metric labels for all market pairs"
+    );
+}

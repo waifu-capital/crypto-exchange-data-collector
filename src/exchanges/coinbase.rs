@@ -384,8 +384,9 @@ impl Exchange for Coinbase {
 
     fn ping_interval(&self) -> Option<std::time::Duration> {
         // Coinbase connection times out after ~100 seconds without client pings
-        // Send ping every 30 seconds for safety margin
-        Some(std::time::Duration::from_secs(30))
+        // Send ping every 20 seconds for more aggressive keepalive
+        // (Previous 30s interval meant first ping came too late for some connections)
+        Some(std::time::Duration::from_secs(20))
     }
 }
 

@@ -2,6 +2,81 @@
 
 ## 2026-01-21
 
+### Fix: First Reconnect Shows 0 in Grafana
+
+**Files modified:**
+- `src/metrics.rs` - Change from `.reset()` to `.get()` for counter initialization
+- `grafana/provisioning/dashboards/collector.json` - Add `ceil()` to query
+
+**Problem:** First reconnect still showed 0 in Grafana despite metric initialization.
+
+**Root causes:**
+1. `.reset()` might not properly register the metric for Prometheus scraping
+2. `increase()` uses extrapolation which can produce fractional values (e.g., 0.7) that display as 0
+
+**Fixes:**
+1. Changed counter initialization from `.reset()` to `.get()` - this accesses/creates the counter and ensures it's registered
+2. Added `ceil()` to the stat panel query: `ceil(sum(increase(...)))` - rounds up fractional reconnects
+
+---
+
+### Fix: Reduce Coinbase Ping Interval from 30s to 20s
+
+**Files modified:**
+- `src/exchanges/coinbase.rs` - Reduce `ping_interval()` from 30s to 20s
+
+**Problem:** Coinbase connection died at 29 seconds - just before the first ping would have been sent at 30 seconds. Diagnostic log showed:
+```
+secs_since_data: 1, secs_since_ping: 29, secs_since_pong: 29
+```
+
+**Fix:** Reduced ping interval to 20 seconds so first ping arrives sooner, providing earlier keepalive signal to prevent premature connection resets.
+
+---
+
+### Fix: Grafana Dashboard Reconnects Overcounting
+
+**Files modified:**
+- `grafana/provisioning/dashboards/collector.json` - Fix reconnects queries
+- `src/metrics.rs` - Add `init_metric_labels()` function
+- `src/main.rs` - Call metric initialization after config load
+
+**Issues fixed:**
+
+1. **Reconnects panel massively overstated count**
+   - Old query: `increase(collector_websocket_reconnects_total[$__range])`
+   - Problem: Using `$__range` with `increase()` in a timeseries shows cumulative increase at each point. The legend "sum" then added all these values, e.g., 1+2+3+4+5 = 15 instead of 5.
+   - Fix: Changed to `increase(...[5m])` for the timeseries graph
+
+2. **Added "Reconnects (Total)" stat panel**
+   - New panel showing accurate total: `sum(increase(collector_websocket_reconnects_total[$__range]))`
+   - Color thresholds: green (0-4), yellow (5-19), red (20+)
+
+3. **First reconnect showed as 0**
+   - Problem: Prometheus counters with labels weren't created until first increment. `increase()` couldn't calculate change from non-existent to 1.
+   - Fix: Pre-initialize all metric label combinations to 0 at startup via `init_metric_labels()`
+
+---
+
+### Refactor: DRY Disconnect Diagnostics
+
+**Files modified:**
+- `src/websocket.rs` - Extract `DisconnectDiagnostics` struct
+
+**Changes:**
+
+The disconnect diagnostics code was duplicated in two places (error case and stream-ended case). Extracted into a `DisconnectDiagnostics` struct with a `from_state()` constructor for cleaner, DRY code.
+
+```rust
+struct DisconnectDiagnostics {
+    secs_since_data: u64,
+    secs_since_ping: u64,
+    secs_since_pong: u64,
+}
+```
+
+---
+
 ### Feature: OKX Stability Improvements
 
 **Files modified:**

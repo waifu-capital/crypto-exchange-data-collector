@@ -19,7 +19,7 @@ use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, Env
 use crate::config::{Config, MarketPair};
 use crate::exchanges::{create_exchange, CoinbaseCredentials, ExchangeConfig, FeedType};
 use crate::http::{run_http_server, run_liveness_probe};
-use crate::metrics::init_metrics;
+use crate::metrics::{init_metric_labels, init_metrics};
 use crate::models::{new_connection_state, MarketEvent};
 use crate::parquet::{parquet_worker, CompletedFile};
 use crate::s3::{create_bucket_if_not_exists, create_s3_client};
@@ -92,6 +92,15 @@ async fn main() {
 
     // Load configuration from TOML
     let config = Config::from_toml();
+
+    // Pre-initialize metric labels for all market pairs
+    // This ensures counters exist from startup, fixing Prometheus increase() edge cases
+    let market_pairs: Vec<(String, String)> = config
+        .market_pairs
+        .iter()
+        .map(|p| (p.exchange.clone(), p.symbol.clone()))
+        .collect();
+    init_metric_labels(&market_pairs);
 
     // Clean up old log files on startup
     cleanup_old_logs("logs", config.log_retention_days);
