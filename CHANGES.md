@@ -2,6 +2,37 @@
 
 ## 2026-01-21
 
+### Fix: TCP Keepalive Not Actually Being Enabled (SO_KEEPALIVE)
+
+**Files modified:**
+- `src/websocket.rs` - Rewrite `connect_with_tcp_keepalive()` to properly enable SO_KEEPALIVE
+
+**Problem:** Despite implementing TCP keepalive, connections were still being reset:
+```
+secs_since_data: 1, secs_since_ping: 9, secs_since_pong: 9
+error: "Connection reset without closing handshake"
+```
+
+**Root cause:** The previous implementation using `socket2::set_tcp_keepalive()` only set timing parameters but may not have enabled `SO_KEEPALIVE` itself. Additionally, socket options may not persist through the `socket2` → `std::net::TcpStream` → `tokio::net::TcpStream` → TLS conversion pipeline.
+
+**Fix:** Two-step approach:
+1. Use `tokio::net::TcpSocket::set_keepalive(true)` BEFORE connecting - this properly enables SO_KEEPALIVE
+2. After connecting, use socket2 to set TCP_KEEPIDLE and TCP_KEEPINTVL timing via raw fd
+
+```rust
+// Step 1: Enable SO_KEEPALIVE before connecting
+let socket = TcpSocket::new_v4()?;
+socket.set_keepalive(true)?;  // This actually enables SO_KEEPALIVE!
+let stream = socket.connect(addr).await?;
+
+// Step 2: Configure timing via socket2 (after connecting)
+let socket2_socket = unsafe { Socket::from_raw_fd(stream.as_raw_fd()) };
+socket2_socket.set_tcp_keepalive(&keepalive)?;
+std::mem::forget(socket2_socket);  // Don't close the fd
+```
+
+---
+
 ### Feature: TCP Keepalive for WebSocket Connections
 
 **Files modified:**

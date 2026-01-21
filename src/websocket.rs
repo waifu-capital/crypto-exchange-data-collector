@@ -1,10 +1,12 @@
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
-use socket2::{Domain, Socket, TcpKeepalive, Type};
-use tokio::net::TcpStream;
+use socket2::{Socket, TcpKeepalive};
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
 use tokio_native_tls::TlsConnector;
@@ -181,6 +183,11 @@ const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
 /// TCP keepalive sends probe packets at the TCP layer, which network infrastructure
 /// (GCP NAT, firewalls, load balancers) recognizes to keep the connection alive.
 /// WebSocket-level pings are not always sufficient because they operate at a higher layer.
+///
+/// Implementation notes:
+/// - Uses `TcpSocket::set_keepalive(true)` to enable SO_KEEPALIVE before connecting
+/// - After connecting, uses socket2 to set TCP_KEEPIDLE and TCP_KEEPINTVL timing
+/// - This two-step approach ensures keepalive is properly enabled AND configured
 async fn connect_with_tcp_keepalive(
     url_str: &str,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error + Send + Sync>> {
@@ -197,40 +204,44 @@ async fn connect_with_tcp_keepalive(
         .next()
         .ok_or("DNS resolution failed")?;
 
-    // Create socket with TCP keepalive
-    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+    // Create tokio TcpSocket - this gives us control over socket options before connecting
+    let socket = if addr.is_ipv4() {
+        TcpSocket::new_v4()?
+    } else {
+        TcpSocket::new_v6()?
+    };
 
-    // Configure TCP keepalive
-    let keepalive = TcpKeepalive::new()
-        .with_time(TCP_KEEPALIVE_TIME)
-        .with_interval(TCP_KEEPALIVE_INTERVAL);
-    socket.set_tcp_keepalive(&keepalive)?;
+    // Enable SO_KEEPALIVE BEFORE connecting - this is the critical step
+    // TcpSocket::set_keepalive() properly sets the SO_KEEPALIVE socket option
+    socket.set_keepalive(true)?;
 
-    // Set non-blocking before connect for async operation
-    socket.set_nonblocking(true)?;
+    // Connect to the server
+    let stream = socket.connect(addr).await?;
 
-    // Initiate connection (non-blocking returns WouldBlock/InProgress)
-    // On Unix, EINPROGRESS (36) is returned; on Windows, it's WSAEWOULDBLOCK
-    match socket.connect(&addr.into()) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-        Err(e) if e.raw_os_error() == Some(36) => {} // EINPROGRESS on macOS/Linux
-        Err(e) if e.raw_os_error() == Some(115) => {} // EINPROGRESS on Linux
-        Err(e) => return Err(e.into()),
+    // Now configure TCP keepalive timing via socket2
+    // We need to do this AFTER connecting because we need the raw fd
+    #[cfg(unix)]
+    {
+        let raw_fd = stream.as_raw_fd();
+        // SAFETY: We're borrowing the fd to configure socket options, then forgetting
+        // the Socket wrapper so it doesn't close the fd when dropped
+        let socket2_socket = unsafe { Socket::from_raw_fd(raw_fd) };
+        let keepalive = TcpKeepalive::new()
+            .with_time(TCP_KEEPALIVE_TIME)
+            .with_interval(TCP_KEEPALIVE_INTERVAL);
+        if let Err(e) = socket2_socket.set_tcp_keepalive(&keepalive) {
+            // Non-fatal: SO_KEEPALIVE is already enabled, timing will use system defaults
+            debug!(error = %e, "Failed to set TCP keepalive timing (using system defaults)");
+        }
+        // Don't let socket2 close the fd - we just borrowed it
+        std::mem::forget(socket2_socket);
     }
-
-    // Convert to tokio TcpStream and wait for connection to complete
-    let std_stream: std::net::TcpStream = socket.into();
-    let stream = TcpStream::from_std(std_stream)?;
-
-    // Poll until connected (tokio handles this via writable())
-    stream.writable().await?;
 
     debug!(
         url = %url_str,
         keepalive_time_secs = TCP_KEEPALIVE_TIME.as_secs(),
         keepalive_interval_secs = TCP_KEEPALIVE_INTERVAL.as_secs(),
-        "TCP socket connected with keepalive enabled"
+        "TCP socket connected with SO_KEEPALIVE enabled"
     );
 
     // Build the WebSocket request
