@@ -10,6 +10,26 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 3. **Never revert previous fixes without explicit justification** - Before undoing a previous change (especially one documented in CHANGES.md), carefully review WHY that change was made. If reverting, document the specific reason why the original fix was wrong or circumstances have changed.
 
+4. **Write detailed commit messages** - Every commit must follow this format:
+   - First line: conventional commit type and short summary (e.g., `fix: resolve ping starvation in WebSocket select! loop`)
+   - Empty line
+   - Detailed body explaining WHAT changed and WHY, using bullet points for multiple changes
+   - End with `Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>`
+
+   Example:
+   ```
+   fix: resolve ping starvation in WebSocket select! loop
+
+   Remove `biased` keyword from tokio::select! that was causing ping timer
+   to be starved under high message volume. Add backup ping check after
+   each message for sustained load scenarios.
+
+   This fixes OKX and Coinbase "Connection reset without closing handshake"
+   errors caused by missing keepalive pings.
+
+   Co-Authored-By: Claude Opus 4.5 <noreply@anthropic.com>
+   ```
+
 ## Build & Test Commands
 
 ```bash

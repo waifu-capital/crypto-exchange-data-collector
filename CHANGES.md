@@ -2,6 +2,15 @@
 
 ## 2026-01-21
 
+### Docs: Added Commit Message Format Rule
+
+**Files modified:**
+- `CLAUDE.md` - Added rule #4 for detailed commit messages
+
+Added requirement for conventional commit format with descriptive body explaining what changed and why, plus Co-Authored-By attribution. This ensures consistent commit history that's easy to understand.
+
+---
+
 ### Fixed: WebSocket Ping Starvation Under High Message Volume
 
 **Files modified:**
