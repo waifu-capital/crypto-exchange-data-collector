@@ -2,6 +2,34 @@
 
 ## 2026-01-21
 
+### Feature: TCP Keepalive for WebSocket Connections
+
+**Files modified:**
+- `Cargo.toml` - Add `socket2`, `url`, `native-tls`, `tokio-native-tls` dependencies
+- `src/websocket.rs` - Add `connect_with_tcp_keepalive()` function
+
+**Problem:** WebSocket connections were being reset despite WebSocket-level pings working correctly:
+```
+secs_since_data: 0, secs_since_ping: 6-11, secs_since_pong: 5-11
+error: "Connection reset without closing handshake"
+```
+
+This indicates network infrastructure (GCP NAT, firewalls, load balancers) was closing connections based on TCP-level idle detection, not recognizing WebSocket pings which operate at a higher layer.
+
+**Solution:** Enable TCP keepalive at the socket level **before** upgrading to WebSocket:
+- Created `connect_with_tcp_keepalive()` function that replaces `connect_async()`
+- Configures TCP keepalive with 15-second intervals using `socket2` crate
+- Properly handles TLS (wss://) connections via `native-tls`
+- TCP keepalive probes are recognized by network infrastructure to prevent idle connection termination
+
+**TCP Keepalive Parameters:**
+| Parameter | Value | Purpose |
+|-----------|-------|---------|
+| `TCP_KEEPIDLE` | 15s | Time before first probe |
+| `TCP_KEEPINTVL` | 15s | Interval between probes |
+
+---
+
 ### Fix: First Reconnect Shows 0 in Grafana
 
 **Files modified:**

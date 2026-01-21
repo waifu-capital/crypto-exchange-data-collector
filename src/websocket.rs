@@ -1,11 +1,16 @@
+use std::net::SocketAddr;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use futures_util::{SinkExt, StreamExt};
 use rand::Rng;
+use socket2::{Domain, Socket, TcpKeepalive, Type};
+use tokio::net::TcpStream;
 use tokio::sync::mpsc::Sender;
 use tokio::time::sleep;
-use tokio_tungstenite::connect_async;
+use tokio_native_tls::TlsConnector;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{client_async, MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, info, warn};
 
 /// Grace period after subscription before checking for data timeout.
@@ -162,6 +167,94 @@ async fn set_connection_status(
     conn_state.write().await.insert(key, connected);
 }
 
+/// TCP keepalive configuration
+/// These values are designed to satisfy network infrastructure (GCP NAT, firewalls, load balancers)
+/// that may close connections based on TCP-level idle detection.
+const TCP_KEEPALIVE_TIME: Duration = Duration::from_secs(15);
+const TCP_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Connect to a WebSocket URL with TCP keepalive enabled.
+///
+/// This is a replacement for `connect_async()` that configures TCP keepalive
+/// on the underlying socket before establishing the WebSocket connection.
+///
+/// TCP keepalive sends probe packets at the TCP layer, which network infrastructure
+/// (GCP NAT, firewalls, load balancers) recognizes to keep the connection alive.
+/// WebSocket-level pings are not always sufficient because they operate at a higher layer.
+async fn connect_with_tcp_keepalive(
+    url_str: &str,
+) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, Box<dyn std::error::Error + Send + Sync>> {
+    // Parse the URL
+    let url = url::Url::parse(url_str)?;
+    let host = url.host_str().ok_or("URL has no host")?;
+    let port = url.port_or_known_default().ok_or("URL has no port")?;
+    let is_tls = url.scheme() == "wss";
+
+    // Resolve DNS
+    let addr_str = format!("{}:{}", host, port);
+    let addr: SocketAddr = tokio::net::lookup_host(&addr_str)
+        .await?
+        .next()
+        .ok_or("DNS resolution failed")?;
+
+    // Create socket with TCP keepalive
+    let socket = Socket::new(Domain::for_address(addr), Type::STREAM, None)?;
+
+    // Configure TCP keepalive
+    let keepalive = TcpKeepalive::new()
+        .with_time(TCP_KEEPALIVE_TIME)
+        .with_interval(TCP_KEEPALIVE_INTERVAL);
+    socket.set_tcp_keepalive(&keepalive)?;
+
+    // Set non-blocking before connect for async operation
+    socket.set_nonblocking(true)?;
+
+    // Initiate connection (non-blocking returns WouldBlock/InProgress)
+    // On Unix, EINPROGRESS (36) is returned; on Windows, it's WSAEWOULDBLOCK
+    match socket.connect(&addr.into()) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) if e.raw_os_error() == Some(36) => {} // EINPROGRESS on macOS/Linux
+        Err(e) if e.raw_os_error() == Some(115) => {} // EINPROGRESS on Linux
+        Err(e) => return Err(e.into()),
+    }
+
+    // Convert to tokio TcpStream and wait for connection to complete
+    let std_stream: std::net::TcpStream = socket.into();
+    let stream = TcpStream::from_std(std_stream)?;
+
+    // Poll until connected (tokio handles this via writable())
+    stream.writable().await?;
+
+    debug!(
+        url = %url_str,
+        keepalive_time_secs = TCP_KEEPALIVE_TIME.as_secs(),
+        keepalive_interval_secs = TCP_KEEPALIVE_INTERVAL.as_secs(),
+        "TCP socket connected with keepalive enabled"
+    );
+
+    // Build the WebSocket request
+    let request = url_str.into_client_request()?;
+
+    // Wrap in TLS if needed and upgrade to WebSocket
+    if is_tls {
+        // Create native TLS connector
+        let tls_connector = native_tls::TlsConnector::new()?;
+        let tls_connector = TlsConnector::from(tls_connector);
+
+        // Perform TLS handshake
+        let tls_stream = tls_connector.connect(host, stream).await?;
+
+        // Upgrade to WebSocket
+        let (ws_stream, _response) = client_async(request, MaybeTlsStream::NativeTls(tls_stream)).await?;
+        Ok(ws_stream)
+    } else {
+        // Plain TCP - upgrade to WebSocket directly
+        let (ws_stream, _response) = client_async(request, MaybeTlsStream::Plain(stream)).await?;
+        Ok(ws_stream)
+    }
+}
+
 /// WebSocket worker that connects to an exchange and streams market data.
 ///
 /// This is a generic worker that works with any exchange implementing the `Exchange` trait.
@@ -215,13 +308,13 @@ pub async fn websocket_worker(
             break;
         }
 
-        match connect_async(&url).await {
-            Ok((ws_stream, _)) => {
+        match connect_with_tcp_keepalive(&url).await {
+            Ok(ws_stream) => {
                 info!(
                     exchange = exchange_name,
                     symbol = %normalized_symbol,
                     feed = feed_str,
-                    "Connected to WebSocket"
+                    "Connected to WebSocket with TCP keepalive"
                 );
                 WEBSOCKET_CONNECTED
                     .with_label_values(&[exchange_name, &normalized_symbol])

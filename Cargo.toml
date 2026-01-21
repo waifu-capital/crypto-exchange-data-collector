@@ -29,3 +29,9 @@ jsonwebtoken = "9"
 prometheus = "0.13"
 lazy_static = "1.5"
 axum = "0.8"
+
+# TCP socket options
+socket2 = "0.5"
+url = "2"
+native-tls = "0.2"
+tokio-native-tls = "0.3"
