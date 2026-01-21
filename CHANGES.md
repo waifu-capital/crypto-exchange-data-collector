@@ -2,6 +2,19 @@
 
 ## 2026-01-21
 
+### Feature: Add OKX Notice Event Handling
+
+**Files modified:**
+- `src/exchanges/okx.rs` - Handle notice events in `parse_message()`
+
+OKX sends `event=notice` messages 30-60 seconds before service upgrades disconnect connections. This change logs these warnings so we have visibility into OKX-initiated disconnects vs other connection issues.
+
+**Note:** Our ping implementation (fixed 20-second interval) was verified to be correct and actually more conservative than OKX's documented idle-based approach.
+
+**Reference:** [OKX WebSocket Overview](https://www.okx.com/docs-v5/en/#overview-websocket-overview)
+
+---
+
 ### Docs: Added Important Rules to CLAUDE.md
 
 **Files modified:**

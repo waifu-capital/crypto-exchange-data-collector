@@ -112,8 +112,19 @@ impl Exchange for Okx {
         let json: Value =
             serde_json::from_str(msg).map_err(|e| ExchangeError::Parse(e.to_string()))?;
 
-        // Check for event messages (subscription confirmations)
-        if json.get("event").is_some() {
+        // Check for event messages (subscription confirmations, notices, errors)
+        if let Some(event) = json.get("event").and_then(|v| v.as_str()) {
+            // Handle notice events (e.g., upcoming disconnection for service upgrade)
+            // OKX sends these 30-60 seconds before disconnecting
+            if event == "notice" {
+                let code = json.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let msg_text = json.get("msg").and_then(|v| v.as_str()).unwrap_or("");
+                tracing::warn!(
+                    code = code,
+                    message = msg_text,
+                    "OKX notice: connection may be disconnected soon"
+                );
+            }
             return Ok(ExchangeMessage::Other(msg.to_string()));
         }
 
