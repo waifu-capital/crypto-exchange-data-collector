@@ -1,5 +1,57 @@
 # Changelog
 
+## 2026-01-21
+
+### Fixed: WebSocket Ping Starvation Under High Message Volume
+
+**Files modified:**
+- `src/websocket.rs` - Fixed ping timer starvation in select! loop
+
+---
+
+**Problem:** OKX and Coinbase connections were frequently dropping with "Connection reset without closing handshake" errors. The servers were closing connections because keepalive pings weren't being sent.
+
+**Root cause:** The `biased` keyword in `tokio::select!` caused the ping timer branch to never be selected when messages were continuously arriving. For high-volume streams (orderbook updates every 100ms), `read.next()` was always ready first, so the ping timer was starved indefinitely.
+
+```rust
+// BROKEN: biased causes ping timer to never fire under load
+tokio::select! {
+    biased;  // Always polls read.next() first
+    result = read.next() => result,
+    _ = timer.tick() => { send_ping(); }  // Never reached!
+}
+```
+
+**Solution:**
+
+1. **Removed `biased` keyword** - Allows fair scheduling so ping timer can occasionally "win"
+2. **Added post-message ping check** - Backup for sustained high message volume
+
+```rust
+// FIXED: Fair scheduling + backup check
+tokio::select! {
+    // NO biased - fair scheduling
+    result = read.next() => result,
+    _ = timer.tick() => { send_ping(); continue; }
+}
+
+// After processing each message, backup check
+if last_ping_sent.elapsed() >= ping_interval {
+    send_ping();
+}
+```
+
+**Why not use timeout() wrapper?**
+
+A previous fix (2026-01-20) removed `timeout()` from `read.next()` because it caused false disconnects. This fix does NOT reintroduce timeout - it uses fair scheduling and backup checks instead.
+
+**Impact:**
+- OKX/Coinbase connections should remain stable
+- Pings sent reliably even under high message load
+- No false disconnects from spurious timeouts
+
+---
+
 ## 2026-01-20
 
 ### Added: System Resource Monitoring Dashboard

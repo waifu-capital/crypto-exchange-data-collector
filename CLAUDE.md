@@ -2,6 +2,14 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Important Rules
+
+1. **Read this file first** - At the start of every conversation, read CLAUDE.md to ensure you follow all guidelines and understand the codebase conventions.
+
+2. **Document all changes in CHANGES.md** - After making any code changes, add a dated entry to CHANGES.md describing: what changed, why, and how. Follow the existing format in that file.
+
+3. **Never revert previous fixes without explicit justification** - Before undoing a previous change (especially one documented in CHANGES.md), carefully review WHY that change was made. If reverting, document the specific reason why the original fix was wrong or circumstances have changed.
+
 ## Build & Test Commands
 
 ```bash

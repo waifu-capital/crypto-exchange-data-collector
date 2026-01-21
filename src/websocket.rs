@@ -230,6 +230,11 @@ pub async fn websocket_worker(
                 // Get exchange-specific ping interval (None = server initiates pings)
                 let ping_interval = exchange.ping_interval();
 
+                // Track when we last sent a ping (for exchanges requiring client pings)
+                // This is used as a backup check after each message in case select! doesn't
+                // pick the timer often enough during sustained high message volume
+                let mut last_ping_sent = Instant::now();
+
                 // Create ping timer only if this exchange requires client-initiated pings
                 let mut ping_timer = ping_interval.map(|d| {
                     let mut timer = tokio::time::interval(d);
@@ -314,14 +319,15 @@ pub async fn websocket_worker(
                         break;
                     }
 
-                    // Use different loop strategies based on whether exchange needs client pings
+                    // Use different strategies based on whether exchange needs client pings
+                    // NOTE: We deliberately do NOT use `biased` in select! because it caused
+                    // the ping timer to be starved under high message volume, leading to
+                    // "Connection reset without closing handshake" errors on OKX/Coinbase.
                     let msg_result = if let Some(ref mut timer) = ping_timer {
-                        // Exchange requires client-initiated pings - use select! with ping timer
+                        // Exchange requires client-initiated pings - use select! to handle both
+                        // Without `biased`, tokio fairly schedules between read and timer
                         tokio::select! {
-                            biased;  // Prefer message processing over ping timer
-
                             result = read.next() => result,
-
                             _ = timer.tick() => {
                                 // Send exchange-specific ping for keepalive
                                 if let Some(ping_msg) = exchange.build_ping_message() {
@@ -342,12 +348,13 @@ pub async fn websocket_worker(
                                         symbol = %normalized_symbol,
                                         "Sent keepalive ping"
                                     );
+                                    last_ping_sent = Instant::now();
                                 }
                                 continue;
                             }
                         }
                     } else {
-                        // Server initiates pings - simple blocking read (like bayes-rust)
+                        // Server initiates pings - simple blocking read (no timeout wrapper needed)
                         read.next().await
                     };
 
@@ -553,6 +560,34 @@ pub async fn websocket_worker(
                                 .with_label_values(&[exchange_name, &normalized_symbol])
                                 .set(0.0);
                             break;
+                        }
+                    }
+
+                    // Backup ping check after processing each message
+                    // This handles edge cases where select! doesn't pick the timer often enough
+                    // during sustained high message volume (belt-and-suspenders approach)
+                    if let Some(interval) = ping_interval {
+                        if last_ping_sent.elapsed() >= interval {
+                            if let Some(ping_msg) = exchange.build_ping_message() {
+                                if let Err(e) = write.send(ping_msg).await {
+                                    error!(
+                                        exchange = exchange_name,
+                                        symbol = %normalized_symbol,
+                                        error = %e,
+                                        "Failed to send ping, reconnecting"
+                                    );
+                                    break;
+                                }
+                                WEBSOCKET_PINGS_SENT
+                                    .with_label_values(&[exchange_name, &normalized_symbol])
+                                    .inc();
+                                debug!(
+                                    exchange = exchange_name,
+                                    symbol = %normalized_symbol,
+                                    "Sent backup keepalive ping"
+                                );
+                                last_ping_sent = Instant::now();
+                            }
                         }
                     }
                 }
