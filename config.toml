@@ -91,6 +91,9 @@ feeds = ["orderbook", "trades"]
 # Default uses global websocket.message_timeout_secs (180s, reconnect after 9 min).
 # With 200s, reconnect happens after 10 minutes of no data.
 data_timeout_secs = 200
+# Use AWS-hosted endpoint for potentially better stability
+# Alternative: wss://ws.okx.com:8443/ws/v5/public (default)
+base_url = "wss://wsaws.okx.com:8443/ws/v5/public"
 
 # this doesn't work
 # you can only use it if you are in a specific region? https://global-docs.upbit.com/reference/websocket-orderbook

@@ -2,6 +2,30 @@
 
 ## 2026-01-21
 
+### Feature: OKX Stability Improvements
+
+**Files modified:**
+- `config.toml` - Add AWS endpoint for OKX
+- `src/exchanges/okx.rs` - Reduce ping interval from 20s to 15s
+- `src/websocket.rs` - Add detailed disconnect diagnostics
+
+**Changes:**
+
+1. **AWS Endpoint**: Use `wss://wsaws.okx.com:8443/ws/v5/public` instead of default endpoint. This undocumented AWS-hosted endpoint is used by several trading libraries and may provide better routing.
+
+2. **More Aggressive Ping**: Reduced OKX ping interval from 20s to 15s for more frequent keepalive.
+
+3. **Disconnect Diagnostics**: Added detailed logging when WebSocket errors occur, including:
+   - Seconds since last data received
+   - Seconds since last ping sent
+   - Seconds since last pong received
+
+This helps identify whether disconnects are due to ping issues, data timeouts, or server-side problems.
+
+**Investigation context:** User reported 19 OKX reconnects/hour despite ping/pong ratio being 1:1. Bybit (also using client pings) had 0 reconnects, suggesting the issue is specific to OKX/network routing rather than our ping implementation.
+
+---
+
 ### Feature: Add OKX Notice Event Handling
 
 **Files modified:**

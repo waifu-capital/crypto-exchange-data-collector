@@ -236,6 +236,9 @@ pub async fn websocket_worker(
                 // pick the timer often enough during sustained high message volume
                 let mut last_ping_sent = Instant::now();
 
+                // Track when we last received a pong (for disconnect diagnostics)
+                let mut last_pong_received: Option<Instant> = None;
+
                 // Create ping timer only if this exchange requires client-initiated pings
                 let mut ping_timer = ping_interval.map(|d| {
                     let mut timer = tokio::time::interval(d);
@@ -490,6 +493,7 @@ pub async fn websocket_worker(
                                         WEBSOCKET_PONGS_RECEIVED
                                             .with_label_values(&[exchange_name, &normalized_symbol])
                                             .inc();
+                                        last_pong_received = Some(Instant::now());
                                     }
                                     Ok(ExchangeMessage::Other(other)) => {
                                         // Subscription confirmations, heartbeats, etc.
@@ -529,6 +533,7 @@ pub async fn websocket_worker(
                                 WEBSOCKET_PONGS_RECEIVED
                                     .with_label_values(&[exchange_name, &normalized_symbol])
                                     .inc();
+                                last_pong_received = Some(Instant::now());
                             } else if msg.is_binary() {
                                 // Some exchanges send binary messages (e.g., OKX compressed)
                                 debug!(
@@ -541,10 +546,22 @@ pub async fn websocket_worker(
                             }
                         }
                         Some(Err(e)) => {
+                            // Detailed disconnect diagnostics
+                            let since_data = last_data_received
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
+                            let since_ping = last_ping_sent.elapsed().as_secs();
+                            let since_pong = last_pong_received
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
                             error!(
                                 exchange = exchange_name,
+                                symbol = %normalized_symbol,
                                 error = %e,
-                                "WebSocket error"
+                                secs_since_data = since_data,
+                                secs_since_ping = since_ping,
+                                secs_since_pong = since_pong,
+                                "WebSocket error - connection diagnostics"
                             );
                             WEBSOCKET_CONNECTED
                                 .with_label_values(&[exchange_name, &normalized_symbol])
@@ -552,10 +569,21 @@ pub async fn websocket_worker(
                             break;
                         }
                         None => {
+                            // Detailed disconnect diagnostics
+                            let since_data = last_data_received
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
+                            let since_ping = last_ping_sent.elapsed().as_secs();
+                            let since_pong = last_pong_received
+                                .map(|t| t.elapsed().as_secs())
+                                .unwrap_or(0);
                             info!(
                                 exchange = exchange_name,
                                 symbol = %normalized_symbol,
-                                "WebSocket stream ended"
+                                secs_since_data = since_data,
+                                secs_since_ping = since_ping,
+                                secs_since_pong = since_pong,
+                                "WebSocket stream ended - connection diagnostics"
                             );
                             WEBSOCKET_CONNECTED
                                 .with_label_values(&[exchange_name, &normalized_symbol])

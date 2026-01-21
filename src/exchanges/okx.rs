@@ -211,8 +211,8 @@ impl Exchange for Okx {
 
     fn ping_interval(&self) -> Option<std::time::Duration> {
         // OKX connection times out after 30 seconds without client pings
-        // Send ping every 20 seconds for safety margin
-        Some(std::time::Duration::from_secs(20))
+        // Send ping every 15 seconds for more aggressive keepalive
+        Some(std::time::Duration::from_secs(15))
     }
 }
 
