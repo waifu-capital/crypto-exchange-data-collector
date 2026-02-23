@@ -5,6 +5,7 @@
 
 pub mod binance;
 pub mod bybit;
+pub mod chainlink;
 pub mod coinbase;
 pub mod okx;
 pub mod upbit;
@@ -32,6 +33,8 @@ pub enum FeedType {
     Orderbook,
     /// Trade executions
     Trades,
+    /// Oracle/reference price feeds (e.g., Chainlink via Polymarket RTDS)
+    Price,
 }
 
 impl FeedType {
@@ -40,6 +43,7 @@ impl FeedType {
         match self {
             FeedType::Orderbook => "orderbook",
             FeedType::Trades => "trades",
+            FeedType::Price => "price",
         }
     }
 }
@@ -59,6 +63,13 @@ pub enum ExchangeMessage {
         symbol: String,
         sequence_id: String,
         timestamp_exchange_us: i64, // Exchange event time in microseconds
+        data: String,
+    },
+    /// Oracle/reference price update (e.g., Chainlink via RTDS)
+    Price {
+        symbol: String,
+        sequence_id: String,
+        timestamp_exchange_us: i64, // Oracle observation time in microseconds
         data: String,
     },
     /// Ping frame that needs a pong response
@@ -201,13 +212,20 @@ pub fn create_exchange(name: &str, config: &ExchangeConfig) -> Option<Box<dyn Ex
         "upbit" => Some(Box::new(upbit::Upbit::new())),
         "okx" => Some(Box::new(okx::Okx::new())),
         "bybit" => Some(Box::new(bybit::Bybit::new())),
+        "chainlink" => {
+            if let Some(base_url) = &config.binance_base_url {
+                Some(Box::new(chainlink::Chainlink::with_base_url(base_url.clone())))
+            } else {
+                Some(Box::new(chainlink::Chainlink::new()))
+            }
+        }
         _ => None,
     }
 }
 
 /// Returns a list of all supported exchange names.
 pub fn supported_exchanges() -> &'static [&'static str] {
-    &["binance", "coinbase", "upbit", "okx", "bybit"]
+    &["binance", "coinbase", "upbit", "okx", "bybit", "chainlink"]
 }
 
 #[cfg(test)]
@@ -282,6 +300,12 @@ mod smoke_tests {
                             data_messages += 1;
                             if data_messages <= 3 {
                                 println!("  [{}] Trade for {}", data_messages, symbol);
+                            }
+                        }
+                        Ok(ExchangeMessage::Price { symbol, .. }) => {
+                            data_messages += 1;
+                            if data_messages <= 3 {
+                                println!("  [{}] Price for {}", data_messages, symbol);
                             }
                         }
                         Ok(ExchangeMessage::Other(_)) => {
@@ -373,6 +397,18 @@ mod smoke_tests {
         assert!(
             result.is_ok(),
             "Bybit smoke test failed: {:?}",
+            result.err()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore] // Run with: cargo test -- --ignored
+    async fn live_chainlink_smoke_test() {
+        let exchange = chainlink::Chainlink::new();
+        let result = run_smoke_test(&exchange, "btc/usd", 5).await;
+        assert!(
+            result.is_ok(),
+            "Chainlink RTDS smoke test failed: {:?}",
             result.err()
         );
     }

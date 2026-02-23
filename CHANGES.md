@@ -1,5 +1,36 @@
 # Changelog
 
+## 2026-02-23
+
+### Feature: Chainlink RTDS Price Feed Collector
+
+**Files added:**
+- `src/exchanges/chainlink.rs` - Chainlink RTDS exchange implementation (Exchange trait)
+
+**Files modified:**
+- `src/exchanges/mod.rs` - Added `FeedType::Price`, `ExchangeMessage::Price`, registered chainlink in factory
+- `src/models.rs` - Added `DataType::Price` variant
+- `src/main.rs` - Added `"price"` to `parse_feeds()`
+- `src/websocket.rs` - Added `ExchangeMessage::Price` handler (metrics, latency, save_event)
+- `src/exchanges/{binance,bybit,coinbase,okx,upbit}.rs` - Handle new `FeedType::Price` variant in match arms
+- `config.toml` - Added `[[markets]]` section for chainlink with 4 symbols
+
+**What:** Streams Chainlink Data Streams oracle prices for BTC/USD, ETH/USD, SOL/USD, and XRP/USD via Polymarket's unauthenticated RTDS (Real-Time Data Socket) WebSocket relay at `wss://ws-live-data.polymarket.com`.
+
+**Why:** These are the settlement oracle prices for Polymarket's crypto up/down prediction markets. Collecting them alongside exchange data enables latency analysis between oracle observation time and local receipt, using the existing `timestamp_exchange` / `timestamp_collector` schema columns.
+
+**How:** Implemented as a standard `Exchange` trait plugin following the OKX pattern (text "ping" keepalive, JSON subscribe, single URL for all symbols). Each symbol gets its own WebSocket worker. Uses 5-second ping interval and 10-second data staleness timeout (the RTDS stream is known to freeze after ~20 minutes while ping/pong continues).
+
+**Data stored per row:**
+- `exchange` = `"chainlink"`, `symbol` = normalized (e.g., `"btcusd"`)
+- `timestamp_exchange` = Chainlink oracle observation time (microseconds)
+- `timestamp_collector` = local wall-clock receipt time (microseconds)
+- `data` = full raw JSON (preserves RTDS envelope timestamp for offline analysis)
+
+**Usage:** Already enabled in `config.toml`. Data stored at `data/parquet/chainlink/{symbol}/price/...`.
+
+---
+
 ## 2026-01-21
 
 ### Fix: Comprehensive WebSocket Disconnect Improvements

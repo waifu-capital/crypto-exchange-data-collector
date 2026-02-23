@@ -96,6 +96,7 @@ impl Exchange for Bybit {
                 FeedType::Trades => {
                     args.push(format!("publicTrade.{}", api_symbol));
                 }
+                _ => {} // Unsupported feed types silently skipped
             }
         }
 
@@ -136,21 +137,14 @@ impl Exchange for Bybit {
             let sequence_id = data
                 .and_then(|d| d.get("u"))
                 .map(|v| v.to_string())
-                .or_else(|| {
-                    data.and_then(|d| d.get("seq"))
-                        .map(|v| v.to_string())
-                })
+                .or_else(|| data.and_then(|d| d.get("seq")).map(|v| v.to_string()))
                 .unwrap_or_else(|| {
                     json.get("ts")
                         .map(|v| v.to_string())
                         .unwrap_or_else(|| "0".to_string())
                 });
             // ts = message timestamp in milliseconds, convert to μs
-            let timestamp_exchange_us = json
-                .get("ts")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                * 1000;
+            let timestamp_exchange_us = json.get("ts").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
 
             return Ok(ExchangeMessage::Orderbook {
                 symbol,

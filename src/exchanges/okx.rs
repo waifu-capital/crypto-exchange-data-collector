@@ -89,6 +89,7 @@ impl Exchange for Okx {
                         "instId": api_symbol
                     }));
                 }
+                _ => {} // Unsupported feed types silently skipped
             }
         }
 
@@ -117,7 +118,10 @@ impl Exchange for Okx {
             // Handle notice events (e.g., upcoming disconnection for service upgrade)
             // OKX sends these 30-60 seconds before disconnecting
             if event == "notice" {
-                let code = json.get("code").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let code = json
+                    .get("code")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown");
                 let msg_text = json.get("msg").and_then(|v| v.as_str()).unwrap_or("");
                 tracing::warn!(
                     code = code,

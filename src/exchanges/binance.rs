@@ -78,14 +78,15 @@ impl Exchange for Binance {
         // Build stream names for each feed type
         let streams: Vec<String> = feeds
             .iter()
-            .map(|feed| match feed {
-                FeedType::Orderbook => format!(
+            .filter_map(|feed| match feed {
+                FeedType::Orderbook => Some(format!(
                     "{}@depth{}@{}ms",
                     symbol.to_lowercase(),
                     self.depth_levels,
                     self.update_speed_ms
-                ),
-                FeedType::Trades => format!("{}@trade", symbol.to_lowercase()),
+                )),
+                FeedType::Trades => Some(format!("{}@trade", symbol.to_lowercase())),
+                _ => None, // Unsupported feed types silently skipped
             })
             .collect();
 
@@ -125,11 +126,7 @@ impl Exchange for Binance {
                 .to_string();
             let sequence_id = json["lastUpdateId"].to_string();
             // E = event time in milliseconds, convert to microseconds
-            let timestamp_exchange_us = json
-                .get("E")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-                * 1000;
+            let timestamp_exchange_us = json.get("E").and_then(|v| v.as_i64()).unwrap_or(0) * 1000;
 
             return Ok(ExchangeMessage::Orderbook {
                 symbol,
@@ -243,7 +240,11 @@ mod tests {
         let msg = r#"{"lastUpdateId":160,"E":1672515782136,"bids":[["0.0024","10"]],"asks":[["0.0026","100"]]}"#;
         let result = binance.parse_message(msg).unwrap();
         match result {
-            ExchangeMessage::Orderbook { sequence_id, timestamp_exchange_us, .. } => {
+            ExchangeMessage::Orderbook {
+                sequence_id,
+                timestamp_exchange_us,
+                ..
+            } => {
                 assert_eq!(sequence_id, "160");
                 assert_eq!(timestamp_exchange_us, 1672515782136000); // microseconds
             }

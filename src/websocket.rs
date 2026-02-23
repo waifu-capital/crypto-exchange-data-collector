@@ -681,6 +681,48 @@ pub async fn websocket_worker(
                                             last_data_received = Some(Instant::now());
                                             data_timeout_warned = false;
                                         }
+                                        Ok(ExchangeMessage::Price {
+                                            symbol: _sym,
+                                            sequence_id,
+                                            timestamp_exchange_us,
+                                            data,
+                                        }) => {
+                                            let collector_time_us = now_micros();
+                                            MESSAGES_RECEIVED
+                                                .with_label_values(&[
+                                                    exchange_name,
+                                                    &normalized_symbol,
+                                                    "price",
+                                                ])
+                                                .inc();
+                                            update_last_message_timestamp(
+                                                exchange_name,
+                                                &normalized_symbol,
+                                            );
+
+                                            if timestamp_exchange_us > 0 {
+                                                let latency_us = collector_time_us - timestamp_exchange_us;
+                                                if latency_us > 0 {
+                                                    LATENCY_EXCHANGE_TO_COLLECTOR
+                                                        .with_label_values(&[exchange_name, &normalized_symbol, "price"])
+                                                        .observe((latency_us / 1000) as f64);
+                                                }
+                                            }
+
+                                            save_event(
+                                                &db_tx,
+                                                exchange_name,
+                                                &normalized_symbol,
+                                                DataType::Price,
+                                                &sequence_id,
+                                                collector_time_us,
+                                                timestamp_exchange_us,
+                                                &data,
+                                            );
+                                            parse_tracker.record_success();
+                                            last_data_received = Some(Instant::now());
+                                            data_timeout_warned = false;
+                                        }
                                         Ok(ExchangeMessage::Ping(data)) => {
                                             debug!(
                                                 exchange = exchange_name,
