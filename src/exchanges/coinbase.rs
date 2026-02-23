@@ -75,10 +75,7 @@ impl Coinbase {
             }
         };
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .ok()?
-            .as_secs();
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
 
         let claims = CoinbaseClaims {
             iss: "cdp".to_string(),
@@ -213,6 +210,7 @@ impl Exchange for Coinbase {
                     };
                     messages.push(msg.to_string());
                 }
+                _ => {} // Unsupported feed types silently skipped
             }
         }
 
@@ -225,7 +223,10 @@ impl Exchange for Coinbase {
 
         // Check for channel field (Advanced Trade API format)
         let channel = json.get("channel").and_then(|v| v.as_str()).unwrap_or("");
-        let msg_type = json.get("type").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let msg_type = json
+            .get("type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
 
         // Handle Advanced Trade API format
         match channel {
@@ -276,7 +277,9 @@ impl Exchange for Coinbase {
                     .unwrap_or("0")
                     .to_string();
 
-                let timestamp_str = first_trade.and_then(|t| t.get("time")).and_then(|v| v.as_str());
+                let timestamp_str = first_trade
+                    .and_then(|t| t.get("time"))
+                    .and_then(|v| v.as_str());
                 let timestamp_exchange_us = parse_iso8601_to_micros(timestamp_str);
 
                 Ok(ExchangeMessage::Trade {

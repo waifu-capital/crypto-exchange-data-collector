@@ -8,6 +8,8 @@ use tokio::sync::RwLock;
 pub enum DataType {
     Orderbook,
     Trade,
+    /// Oracle/reference price feed (e.g., Chainlink via Polymarket RTDS)
+    Price,
 }
 
 impl DataType {
@@ -16,6 +18,7 @@ impl DataType {
         match self {
             DataType::Orderbook => "orderbook",
             DataType::Trade => "trade",
+            DataType::Price => "price",
         }
     }
 }
@@ -37,13 +40,13 @@ pub struct WriterKey {
 /// Market event data sent through the channel to the database worker.
 /// Replaces the old SnapshotData name which was misleading for trades.
 pub struct MarketEvent {
-    pub exchange: String,              // "binance", "coinbase", "bybit", etc.
-    pub symbol: String,                // "btcusdt", "BTC-USD", etc.
-    pub data_type: DataType,           // Orderbook or Trade (was String)
-    pub exchange_sequence_id: String,  // Exchange-specific ID for deduplication
-    pub timestamp_collector: i64,      // Microseconds since Unix epoch (our receipt time)
-    pub timestamp_exchange: i64,       // Microseconds since Unix epoch (exchange event time)
-    pub data: String,                  // JSON payload
+    pub exchange: String,             // "binance", "coinbase", "bybit", etc.
+    pub symbol: String,               // "btcusdt", "BTC-USD", etc.
+    pub data_type: DataType,          // Orderbook or Trade (was String)
+    pub exchange_sequence_id: String, // Exchange-specific ID for deduplication
+    pub timestamp_collector: i64,     // Microseconds since Unix epoch (our receipt time)
+    pub timestamp_exchange: i64,      // Microseconds since Unix epoch (exchange event time)
+    pub data: String,                 // JSON payload
 }
 
 /// Shared state for WebSocket connection status

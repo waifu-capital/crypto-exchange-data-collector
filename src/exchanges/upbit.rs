@@ -45,6 +45,7 @@ impl Exchange for Upbit {
             let type_name = match feed {
                 FeedType::Orderbook => "orderbook",
                 FeedType::Trades => "trade",
+                _ => continue, // Unsupported feed types silently skipped
             };
 
             // Upbit uses array format for subscription
@@ -173,7 +174,11 @@ mod tests {
         let msg = r#"{"ty":"orderbook","cd":"KRW-BTC","tms":1672515782136,"tas":12.345,"tbs":23.456,"obu":[{"ap":50000000,"as":0.1,"bp":49999000,"bs":0.2}]}"#;
         let result = upbit.parse_message(msg).unwrap();
         match result {
-            ExchangeMessage::Orderbook { symbol, timestamp_exchange_us, .. } => {
+            ExchangeMessage::Orderbook {
+                symbol,
+                timestamp_exchange_us,
+                ..
+            } => {
                 assert_eq!(symbol, "KRW-BTC");
                 assert_eq!(timestamp_exchange_us, 1672515782136000); // microseconds
             }

@@ -64,6 +64,7 @@ fn parse_feeds(feeds: &[String]) -> Vec<FeedType> {
         .filter_map(|f| match f.as_str() {
             "orderbook" => Some(FeedType::Orderbook),
             "trades" | "trade" => Some(FeedType::Trades),
+            "price" | "prices" => Some(FeedType::Price),
             _ => {
                 tracing::warn!(feed = %f, "Unknown feed type, skipping");
                 None
@@ -209,7 +210,7 @@ async fn main() {
             };
             let exchange = create_exchange(&pair.exchange, &exchange_config).unwrap_or_else(|| {
                 panic!(
-                    "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit",
+                    "Unknown exchange: {}. Supported: binance, coinbase, upbit, okx, bybit, chainlink",
                     pair.exchange
                 )
             });
