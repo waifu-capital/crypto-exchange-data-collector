@@ -6,15 +6,75 @@ A production-grade Rust application for collecting real-time market data from mu
 
 ### Multi-Exchange Support
 
-Collect orderbook and trade data from 5 major exchanges simultaneously:
+Collect orderbook, trade, and oracle price data from 6 sources simultaneously:
 
-| Exchange | Orderbook | Trades | Symbol Format |
-|----------|-----------|--------|---------------|
-| Binance | `@depth20@100ms` | `@trade` | `btcusdt` |
-| Coinbase | `level2` | `matches` | `BTC-USD` |
-| Upbit | `orderbook` | `trade` | `KRW-BTC` |
-| OKX | `books` | `trades` | `BTC-USDT` |
-| Bybit | `orderbook.50` | `publicTrade` | `BTCUSDT` |
+| Exchange | Orderbook | Trades | Price | Symbol Format |
+|----------|-----------|--------|-------|---------------|
+| Binance | `@depth20@100ms` | `@trade` | | `btcusdt` |
+| Coinbase | `level2` | `matches` | | `BTC-USD` |
+| Upbit | `orderbook` | `trade` | | `KRW-BTC` |
+| OKX | `books` | `trades` | | `BTC-USDT` |
+| Bybit | `orderbook.50` | `publicTrade` | | `BTCUSDT` |
+| Chainlink (RTDS) | | | `crypto_prices_chainlink` | `btc/usd` |
+
+### Chainlink Oracle Price Feed (via Polymarket RTDS)
+
+In addition to exchange data, the collector streams Chainlink Data Streams oracle prices via Polymarket's unauthenticated RTDS (Real-Time Data Socket) WebSocket relay.
+
+| Source | Feed | Symbol Format |
+|--------|------|---------------|
+| Chainlink (via Polymarket RTDS) | `price` | `btc/usd` |
+
+These are the settlement oracle prices for Polymarket's crypto up/down prediction markets.
+
+#### RTDS Data Format
+
+Each RTDS price update contains two `timestamp` fields at different nesting levels:
+
+```json
+{
+  "connection_id": "ZPQ1vcxjrPECIzg=",
+  "payload": {
+    "full_accuracy_value": "66167300006959260000000",
+    "symbol": "btc/usd",
+    "timestamp": 1771856319000,
+    "value": 66167.30000695927
+  },
+  "timestamp": 1771856320113,
+  "topic": "crypto_prices_chainlink",
+  "type": "update"
+}
+```
+
+| JSON Field | Meaning | Stored As |
+|------------|---------|-----------|
+| `payload.timestamp` (1771856319000 ms) | When the **Chainlink oracle observed** the price | `timestamp_exchange` (converted to microseconds) |
+| Top-level `timestamp` (1771856320113 ms) | When the **RTDS server** enveloped/sent the message | `exchange_sequence_id` (for ordering) + preserved in raw JSON |
+
+The difference between them is the **feed lag** -- the relay delay from Chainlink to Polymarket's RTDS server. In the example above: `1771856320113 - 1771856319000 = 1,113 ms`.
+
+#### Latency Decomposition
+
+Even though only two timestamp columns are stored explicitly, you can reconstruct the full three-component latency decomposition offline from each row:
+
+```
+  payload.timestamp        top-level timestamp      timestamp_collector
+  (oracle observation)     (RTDS envelope)          (local receipt)
+       |                        |                        |
+       |<--- feed_lag ~1.1s --->|<--- transport ~0.4s -->|
+       |                                                 |
+       |<-------------- age ~1.5s --------------------->|
+```
+
+- **age** = `timestamp_collector - timestamp_exchange` (end-to-end latency, tracked by `collector_latency_exchange_to_collector_ms` histogram)
+- **feed_lag** = `exchange_sequence_id - payload.timestamp` (Chainlink-to-RTDS relay, from raw JSON)
+- **transport** = `age - feed_lag` (network hop from RTDS to you)
+
+The payload also includes a `full_accuracy_value` field -- the full 256-bit Chainlink price as a decimal string, higher precision than the `value` float. This is preserved in the raw JSON for free.
+
+#### Known Issue: Stream Freeze
+
+The RTDS stream freezes after ~20 minutes while the WebSocket connection stays alive (ping/pong continues). The `data_timeout_secs = 10` setting in `config.toml` forces reconnection on staleness.
 
 ### Single Process, Multiple Markets
 
